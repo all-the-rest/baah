@@ -105,11 +105,13 @@ der Browser darf direkt mit ihnen sprechen:
 
 | Provider | Direkt aus dem Browser |
 |---|---|
-| OpenAI (Chat Completions + Responses) | ✅ |
+| OpenAI | ⚠️ **unbestätigt** — Inferenz-Endpunkte senden im Fehlerpfad kein CORS; wird im Onboarding real getestet |
 | Anthropic | ✅ — **nur** mit `anthropic-dangerous-direct-browser-access: true` |
 | Google (Generative Language) | ✅ |
 | OpenRouter | ✅ |
 | Groq, xAI, Mistral, Cerebras, Together, DeepSeek | ✅ |
+| Vercel AI Gateway | ✅ — Ausweg für blockende Provider, aber ein Dritter sieht den Traffic |
+| OpenCode Zen | ⛔ nicht browser-fähig |
 | Beliebige OpenAI-kompatible `baseURL` | ❓ zur Laufzeit geprüft, mit klarer Fehlermeldung |
 
 ### 8. Oberfläche

@@ -563,25 +563,42 @@ aufrufbar.
 Die entscheidende Frage war: darf der Browser direkt mit dem Provider sprechen?
 Nicht geraten, sondern **gemessen** — Preflight und Response-Header (§14.4):
 
-| Provider | `access-control-allow-origin` | Browser-direkt? |
-|---|---|---|
-| **OpenAI** (Chat Completions + Responses) | `*` | ✅ ja (nicht vertraglich garantiert) |
-| **Anthropic** | `*` — **nur mit Spezial-Header** | ⚠️ ja, siehe unten |
-| **Google** (Generative Language) | echot die Origin, erlaubt `x-goog-api-key` | ✅ ja |
-| **OpenRouter** | `*` | ✅ ja |
-| **Groq**, **xAI**, **Mistral**, **Cerebras**, **Together**, **DeepSeek** | `*` bzw. Origin-Echo | ✅ ja |
-| **models.dev** (Modellkatalog) | `*` | ✅ ja |
-| Beliebige OpenAI-kompatible `baseURL` | betreiberabhängig | ❓ **zur Laufzeit prüfen** |
+| Provider | Preflight | Fehlerpfad (401) | Browser-direkt? |
+|---|---|---|---|
+| **OpenAI** | ✅ | ❌ **kein ACAO** auf `/v1/chat/completions` und `/v1/responses` (nur `/v1/models` hat `*`) | ⚠️ **unbestätigt** — siehe unten |
+| **Anthropic** | ✅ mit Header | ✅ `*` **nur mit** Header | ✅ ja, Header ist Pflicht |
+| **Google** (Generative Language) | ✅ | ✅ (Origin-Echo) | ✅ ja |
+| **OpenRouter** | ✅ | ✅ `*` | ✅ ja |
+| **Groq**, **xAI**, **Mistral**, **Cerebras**, **Together**, **DeepSeek** | ✅ | ✅ `*` | ✅ ja |
+| **Vercel AI Gateway** | ✅ | ✅ `*` | ✅ ja (siehe Vorbehalt) |
+| **OpenCode Zen** | ❌ | ❌ kein ACAO | ⛔ **nicht möglich** |
+| **models.dev** (Modellkatalog) | — | — | ✅ ja |
+| Beliebige OpenAI-kompatible `baseURL` | betreiberabhängig | — | ❓ **zur Laufzeit prüfen** |
 
-Damit ist die Sorge „wir brauchen doch einen Proxy" **widerlegt** — für eine
-breite Provider-Liste. Das ist die Grundlage dafür, dass §2 (browser-only)
-überhaupt tragfähig ist.
+**OpenAI ist der Sonderfall — und ich hatte das zuerst zu optimistisch
+hingeschrieben.** Gemessen (eigener Test, nicht übernommen):
 
-**Anthropic ist der Sonderfall:** Die API erlaubt Browser-Aufrufe **nur**, wenn
-bei jedem Request der Header `anthropic-dangerous-direct-browser-access: true`
-mitgeht. Ohne ihn kommt eine 401 **ohne** CORS-Header — der Browser blockt.
-Wichtig: Das AI SDK setzt diesen Header **nicht** selbst, er muss explizit
-konfiguriert werden:
+```
+GET  /v1/models             → 401 + access-control-allow-origin: *
+POST /v1/chat/completions   → 401 + (kein ACAO)
+POST /v1/responses          → 401 + (kein ACAO)
+```
+
+Der Preflight geht durch, aber die **Inferenz-Endpunkte senden auf dem
+Fehlerpfad keine CORS-Header**. Im Browser heißt das: statt einer lesbaren 401
+sieht der Nutzer ein undurchsichtiges `TypeError: Failed to fetch`. Ob der
+**Erfolgspfad** (200, gestreamt) ACAO sendet, ist **ungetestet** — dafür
+braucht es einen echten Key.
+
+Konsequenz für das Design: **OpenAI wird nicht als „funktioniert" beworben,
+sondern über den Verbindungstest im Onboarding geprüft.** Und die
+Fehlerbehandlung muss den CORS-Fall abfangen und als „der Provider blockt
+Browser-Aufrufe (oder der Key ist falsch)" erklären — nicht als App-Bug.
+
+**Anthropic ist der andere Sonderfall, und der Befund ist eindeutig:**
+Ohne `anthropic-dangerous-direct-browser-access: true` → 401 **ohne** ACAO
+(Browser blockt). Mit dem Header → 401 **mit** `*`. Das AI SDK setzt den Header
+**nicht** selbst:
 
 ```ts
 createAnthropic({
@@ -590,10 +607,12 @@ createAnthropic({
 })
 ```
 
-**OpenAI ist „funktioniert heute, aber nicht zugesichert":** Es gab einen
-dokumentierten ~12-Stunden-Ausfall, in dem der Preflight geblockt wurde. Die
-App muss einen CORS-Fehlschlag als *Provider-Problem* erklären können, nicht als
-App-Bug.
+**OpenCode Zen ist nicht nutzbar** (Preflight 404, Fehlerpfad ohne ACAO). Nicht
+darum herum designen.
+
+**Vercel AI Gateway** funktioniert (auch im Fehlerpfad) und wäre der
+Ausweg für Provider, die blocken. Der Vorbehalt gehört in die UI: es ist ein
+Dritter, der den gesamten Traffic sieht. Optional, nie Voreinstellung.
 
 Weitere Konsequenzen:
 
@@ -601,14 +620,12 @@ Weitere Konsequenzen:
   Umgebungsvariablen; ohne `apiKey` wirft es `LoadAPIKeyError` beim ersten
   Aufruf. Diese Fehlermeldung gehört in der UI zu „bitte API-Key hinterlegen".
 - **`dangerouslyAllowBrowser` gibt es im AI SDK nicht** (das ist ein Flag der
-  Vendor-SDKs). Es gibt also nichts „einzuschalten" — die Verantwortung ist rein
-  organisatorisch und gehört ins Onboarding (§8.1).
-- **Telemetrie explizit aus:** `telemetry: { isEnabled: false }` setzen. Ohne
-  registrierte Integration sendet das SDK zwar nichts, aber die Option ist
-  laut Doku default-aktiv und würde nach einem späteren Upgrade stillschweigend
-  Daten schicken.
-- **Generische `baseURL` wird unterstützt, aber zur Laufzeit validiert** — mit
-  klarer Fehlermeldung „dieser Endpunkt erlaubt keine Browser-Aufrufe".
+  Vendor-SDKs) — es gibt nichts „einzuschalten".
+- **Telemetrie explizit aus:** `telemetry: { isEnabled: false }`. Ohne
+  registrierte Integration sendet das SDK nichts, aber die Option gilt laut
+  Doku als default-aktiv, sobald eine Integration registriert ist.
+- **Jeder Provider wird im Onboarding real getestet**, nicht nur ausgewählt.
+
 
 
 
@@ -1005,6 +1022,43 @@ Zeitfenster, kein Zustand. Er rechtfertigt keinen Umbau des Loops in den SW
 (Tool-Ausführung braucht Main-Thread-Gesten und UI), wohl aber zwei Dinge, die
 auch für sich lohnen: **Offline-App-Shell + Single-Writer + PWA-Install**
 (Phase 2) und ein **begrenztes Relay-Experiment** (Phase 6).
+
+### 14.7 Nachtrag aus dem Gegencheck
+
+Ein zusätzlicher Recherche-Agent hat den AI-SDK-Strang unabhängig geprüft. Er
+hat einen **Fehler in meiner Matrix gefunden** (§9: OpenAI sendet auf dem
+Fehlerpfad kein ACAO — ich hatte das zu optimistisch als „✅" geführt) und
+mehrere Punkte ergänzt, die sonst später Zeit gekostet hätten:
+
+**Harte Verifikation, die Vertrauen verdient:**
+
+- **Browser-Bundle real gebaut:** `esbuild --bundle --platform=browser` über
+  `ai` + `@ai-sdk/react` + vier Provider → **exit 0, keine Warnungen, null
+  `node:*`-Imports**. Damit ist „läuft im Browser" nicht mehr plausibel, sondern
+  belegt — und `vite-plugin-node-polyfills` ist **nicht** nötig (und wäre ein
+  Geruch).
+- `@ai-sdk/provider-utils` exportiert offiziell `isBrowserRuntime()`.
+
+**Praktische Fallen, die neu sind:**
+
+| Fund | Konsequenz |
+|---|---|
+| `@opencode-ai/models/snapshot` ist **6,35 MB** statisches ESM | Nur per dynamischem `import()` laden, sonst dominiert es den Bundle. |
+| `@ai-sdk/code-mode` ist **Node-only** („not available in browser or edge runtimes") | Unser Code-Mode-Tool ist damit ein Eigenbau — oder gestrichen. |
+| `@ai-sdk/mcp` Haupt-Entry ist browser-safe, **`/mcp-stdio` nicht** | Für die spätere MCP-Phase: nur HTTP/SSE importieren. |
+| **Subagenten haben laut Doku keine Tool-Approvals** | Unser Permission-Modell darf sich nicht darauf verlassen, dass ein Subagent nachfragen kann — die Policy muss **vor** dem Start greifen. |
+| `execute` darf ein **Async-Generator** sein → vorläufige Tool-Ergebnisse | Genau richtig für Subagent-Fortschritt im UI. |
+| `pruneMessages({messages, reasoning, toolCalls, emptyMessages})` ist eingebaut | Mechanische Kompaktierung ist gratis; nur die Zusammenfassung ist unsere Arbeit. |
+| `experimental_sandbox` an `execute` ist **host-provided** | Kein Browser-Sandbox — nicht darauf planen. |
+| `HarnessAgent` / `@ai-sdk/harness-*` existieren, sind aber experimentell und sandbox-orientiert | Nicht der richtige Weg für uns. |
+
+**Reuse-Shortlist (verifiziert, browser-safe):** `shiki@4.4.3` (Highlighting,
+Browser-Entry), `streamdown@2.6.0` (streaming-sicheres Markdown — passt genau zu
+unseren Deltas), `react-markdown@10.1.0`, `gpt-tokenizer@4.0.0` bzw.
+`js-tiktoken@1.0.21` (Token-Zählung für die Kostenanzeige), `diff@9.0.0`
+(Diff-Vorschau für Approval-Cards), `picomatch@4.0.7`, `ignore@7.0.10`,
+`idb@8.0.3`.
+
 
 
 
