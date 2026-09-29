@@ -12,14 +12,94 @@ importers:
         specifier: ^7.0.2
         version: 7.0.2
 
-  apps/web:
+  packages/baah-core:
+    dependencies:
+      ai:
+        specifier: ^7.0.122
+        version: 7.0.122(zod@4.6.5)
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.2
+        version: 5.0.2(vite@8.3.1)
+
+  packages/baah-tools/edit:
+    dependencies:
+      '@all-the.rest/baah-core':
+        specifier: workspace:*
+        version: link:../../baah-core
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.2
+        version: 5.0.2(vite@8.3.1)
+
+  packages/baah-tools/list:
+    dependencies:
+      '@all-the.rest/baah-core':
+        specifier: workspace:*
+        version: link:../../baah-core
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.2
+        version: 5.0.2(vite@8.3.1)
+
+  packages/baah-tools/read:
+    dependencies:
+      '@all-the.rest/baah-core':
+        specifier: workspace:*
+        version: link:../../baah-core
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.2
+        version: 5.0.2(vite@8.3.1)
+
+  packages/baah-tools/write:
+    dependencies:
+      '@all-the.rest/baah-core':
+        specifier: workspace:*
+        version: link:../../baah-core
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.2
+        version: 5.0.2(vite@8.3.1)
+
+  packages/baah-web:
     dependencies:
       '@ai-sdk/react':
         specifier: ^4.0.125
         version: 4.0.125(react@19.3.0)(zod@4.6.5)
-      '@ohw/core':
+      '@all-the.rest/baah-core':
         specifier: workspace:*
-        version: link:../../packages/core
+        version: link:../baah-core
       ai:
         specifier: ^7.0.122
         version: 7.0.122(zod@4.6.5)
@@ -57,86 +137,6 @@ importers:
       vite:
         specifier: ^8.3.1
         version: 8.3.1(jiti@2.7.0)
-      vitest:
-        specifier: ^5.0.2
-        version: 5.0.2(vite@8.3.1)
-
-  packages/core:
-    dependencies:
-      ai:
-        specifier: ^7.0.122
-        version: 7.0.122(zod@4.6.5)
-      zod:
-        specifier: ^4.6.5
-        version: 4.6.5
-    devDependencies:
-      typescript:
-        specifier: ^7.0.2
-        version: 7.0.2
-      vitest:
-        specifier: ^5.0.2
-        version: 5.0.2(vite@8.3.1)
-
-  packages/tools/edit:
-    dependencies:
-      '@ohw/core':
-        specifier: workspace:*
-        version: link:../../core
-      zod:
-        specifier: ^4.6.5
-        version: 4.6.5
-    devDependencies:
-      typescript:
-        specifier: ^7.0.2
-        version: 7.0.2
-      vitest:
-        specifier: ^5.0.2
-        version: 5.0.2(vite@8.3.1)
-
-  packages/tools/list:
-    dependencies:
-      '@ohw/core':
-        specifier: workspace:*
-        version: link:../../core
-      zod:
-        specifier: ^4.6.5
-        version: 4.6.5
-    devDependencies:
-      typescript:
-        specifier: ^7.0.2
-        version: 7.0.2
-      vitest:
-        specifier: ^5.0.2
-        version: 5.0.2(vite@8.3.1)
-
-  packages/tools/read:
-    dependencies:
-      '@ohw/core':
-        specifier: workspace:*
-        version: link:../../core
-      zod:
-        specifier: ^4.6.5
-        version: 4.6.5
-    devDependencies:
-      typescript:
-        specifier: ^7.0.2
-        version: 7.0.2
-      vitest:
-        specifier: ^5.0.2
-        version: 5.0.2(vite@8.3.1)
-
-  packages/tools/write:
-    dependencies:
-      '@ohw/core':
-        specifier: workspace:*
-        version: link:../../core
-      zod:
-        specifier: ^4.6.5
-        version: 4.6.5
-    devDependencies:
-      typescript:
-        specifier: ^7.0.2
-        version: 7.0.2
       vitest:
         specifier: ^5.0.2
         version: 5.0.2(vite@8.3.1)

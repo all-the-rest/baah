@@ -1,5 +1,5 @@
 {
-  "name": "opencode-harness-web",
+  "name": "@all-the.rest/baah",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -8,9 +8,9 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "pnpm --filter @ohw/web dev",
+    "dev": "pnpm --filter @all-the.rest/baah-web dev",
     "build": "pnpm -r build",
-    "preview": "pnpm --filter @ohw/web preview",
+    "preview": "pnpm --filter @all-the.rest/baah-web preview",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "check": "pnpm typecheck && pnpm test"

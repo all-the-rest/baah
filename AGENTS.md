@@ -1,4 +1,4 @@
-# AGENTS.md — Regeln für `opencode-harness-web`
+# AGENTS.md — Regeln für `baah`
 
 Diese Datei ist die **verbindliche Regelbasis** für Menschen und Agenten, die in
 diesem Repo arbeiten. Das *Was* (Ziel, Architektur, Phasen) steht in
@@ -39,7 +39,7 @@ Konkrete Konsequenzen — jede verletzt diese Regel:
 - **Keine Node-Builtins importieren.** Kein `node:fs`, `node:path`,
   `node:child_process`, `node:crypto`, `Buffer`, `process`. Ziel-Runtime ist
   ausschließlich der Browser (Main Thread + Web Worker).
-  - Pfad-Arithmetik: eigene Utility in `@ohw/core` (POSIX-Semantik, `/`-separiert),
+  - Pfad-Arithmetik: eigene Utility in `@all-the.rest/baah-core` (POSIX-Semantik, `/`-separiert),
     nicht `node:path`.
   - Hashing/Zufall: `crypto.subtle` / `crypto.randomUUID()`.
 - **Kein Server-Proxy für LLM-Calls.** Der Browser spricht direkt mit dem
@@ -50,7 +50,7 @@ Konkrete Konsequenzen — jede verletzt diese Regel:
   Nutzers.
 - **Kein SSR/RSC.** Reine SPA (Vite). Bibliotheken, die einen Node-Runtime
   voraussetzen, werden nicht eingebaut.
-- `@ohw/core` muss **Node-frei** sein und in einem Web Worker laufen können.
+- `@all-the.rest/baah-core` muss **Node-frei** sein und in einem Web Worker laufen können.
   Neue Core-Module dürfen keine DOM-Annahmen machen, wo es vermeidbar ist
   (damit sie in Worker + Vitest laufen).
 
@@ -64,7 +64,7 @@ Konkrete Konsequenzen — jede verletzt diese Regel:
 | Styling | **Tailwind CSS v4** + **daisyUI v5** (Theme `dark` als Default) |
 | LLM-Layer | **Vercel AI SDK** (`ai` + `@ai-sdk/react`) |
 | Validierung | **zod** an allen externen Grenzen |
-| Tests | **vitest** (Unit, `@ohw/core`), Playwright für E2E (ab Phase 4) |
+| Tests | **vitest** (Unit, `@all-the.rest/baah-core`), Playwright für E2E (ab Phase 4) |
 
 Versionen werden **nicht geraten**: vor dem Hinzufügen einer Dependency die
 aktuelle Version prüfen (`npm view <pkg> version`) und im jeweiligen
@@ -126,15 +126,15 @@ AGENTS.md                diese Regeln
   Abhängigkeiten zeigen **nie** zurück. `core` kennt weder React noch DOM-UI,
   noch die konkreten Tools.
 - **Ein Tool = ein Package.** Konvention:
-  - Verzeichnis `packages/tools/<id>/`, Paketname `@ohw/tool-<id>`.
+  - Verzeichnis `packages/tools/<id>/`, Paketname `@all-the.rest/baah-tool-<id>`.
   - `src/index.ts` exportiert die Definition als benannten Export
     (`export const readTool`) **und** als `default`.
-  - Das Tool ist ein `ToolDefinition` aus `@ohw/core` (`defineTool({...})`):
+  - Das Tool ist ein `ToolDefinition` aus `@all-the.rest/baah-core` (`defineTool({...})`):
     `id`, `description`, `access`, `inputSchema` (zod), `execute`.
   - `inputSchema` ist die **einzige** Quelle der Parameter-Wahrheit — sie geht
     an das Modell (AI SDK) *und* an die Validierung. Kein zweites Schema.
   - Eigene Tests unter `test/<id>.test.ts`, immer gegen
-    `createMemoryWorkspace()` aus `@ohw/core` — **kein** Browser und kein DOM
+    `createMemoryWorkspace()` aus `@all-the.rest/baah-core` — **kein** Browser und kein DOM
     nötig, damit die Verifikation in CI läuft.
   - Ein Tool greift **nie** direkt auf IndexedDB oder UI zu, nur über den
     `ToolContext`.
@@ -169,7 +169,7 @@ pnpm check        # = pnpm typecheck && pnpm test
 ```
 
 - `pnpm typecheck` muss fehlerfrei durchlaufen (alle Workspace-Packages).
-- Neue Engine-Logik in `@ohw/core` braucht Unit-Tests (vitest). Ein Feature
+- Neue Engine-Logik in `@all-the.rest/baah-core` braucht Unit-Tests (vitest). Ein Feature
   ohne Test ist nicht fertig.
 - „Fertig“ heißt: Befehl ausgeführt und Ausgabe gesehen — **nicht** „sollte
   laufen“. Ergebnisse immer mit dem tatsächlichen Output belegen.

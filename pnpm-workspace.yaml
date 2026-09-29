@@ -1,7 +1,8 @@
 packages:
-  - apps/*
-  - packages/*
-  - packages/tools/*
+  - packages/baah-web
+
+  - packages/baah-core
+  - packages/baah-tools/*
 
 minimumReleaseAgeExclude:
   - '@ai-sdk/gateway@4.0.100'

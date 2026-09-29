@@ -6,9 +6,8 @@ hinterlegen — und man hat einen Agenten, der Dateien liest, schreibt und sucht
 Kommandos ausführt, Subagenten startet und den Verlauf über Reloads hinweg
 behält.
 
-> **Status:** Phase 0 abgeschlossen (Fundament + Recherche), Phase 1 beginnt.
-> Der Rename auf `baah` / `@all-the.rest/*` läuft nach Abschluss der Recherche;
-> bis dahin heißen die Packages noch `@ohw/*` (siehe [`Plan.md`](Plan.md) §0).
+> **Status:** Fundament + Recherche abgeschlossen, Umsetzung läuft.
+> Siehe [`Plan.md`](Plan.md) für Architektur, Roadmap und die belegte Recherche.
 
 ---
 

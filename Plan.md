@@ -1,4 +1,4 @@
-# Plan.md — `opencode-harness-web`
+# Plan.md — `baah`
 
 > **Status:** Entwurf v1 (Phase 0 abgeschlossen, Recherche läuft).
 > Abschnitte mit ⏳ werden aus der laufenden Recherche belegt, nicht geraten.
@@ -20,13 +20,9 @@
 | Verzeichnis | `/projects/baah-harness` |
 | GitHub-Repo | `all-the-rest/baah` (voraussichtlich) |
 
-**Ist-Zustand bis zum Rename:** Verzeichnis `opencode-harness-web`,
-Scope `@ohw`, Pakete `@ohw/{web,core,tool-*}` (~50 Textstellen in 20 Dateien).
-
-**Reihenfolge (Nutzerentscheidung):** Der Rename passiert **erst nach Abschluss
-der Recherche** (§14), damit die Recherche-Dokumente nicht zweimal angefasst
-werden. Der Rename ist ein eigener Commit, kein Nebenprodukt einer
-Feature-Änderung. Danach ist `@ohw` im Repo verboten.
+**Status: umgesetzt.** Verzeichnis `/projects/baah-harness`, Scope
+`@all-the.rest`, Pakete `@all-the.rest/baah-{core,web,tool-<id>}`. Der `@ohw`-Name
+existiert im Repo nicht mehr und ist für neue Dateien verboten.
 
 **Warum der Name:** `baah` beschreibt genau die Projektdefinition (§1) und
 vermeidet die Verwechslung mit OpenCode, das nur *Vorbild* ist, nicht
@@ -92,31 +88,31 @@ verifiziert (§12).
 
 | Tool | Package | `access` | Web-first Realisierung | Machbar |
 |---|---|---|---|---|
-| `read` | `@ohw/tool-read` ✅ | read | `getFile()` → `text()`, Zeilennummern, `offset`/`limit`, Binär-Abweisung, Zeilen-Truncation | ✅ fertig |
-| `write` | `@ohw/tool-write` ✅ | write | `getFileHandle(create)` → `createWritable()` → `write`/`close`; 5-MB-Guard, Verzeichnis-Guard | ✅ fertig |
-| `edit` | `@ohw/tool-edit` ✅ | write | exakter String-Ersatz; Fehler bei 0 Treffern; `>1` nur mit `replaceAll`; literale `$`-Sequenzen | ✅ fertig |
-| `list` | `@ohw/tool-list` ✅ | read | `dirHandle.values()`; Verzeichnisse zuerst, `limit`/`total`/`truncated` | ✅ fertig |
-| `glob` | `@ohw/tool-glob` | read | Walker über `values()` + **`picomatch@4`** (zero deps); Pfad-Index im Worker, damit es nach dem ersten Walk sofort ist | ✅ |
-| `grep` | `@ohw/tool-grep` | read | **`grep-wasm`** (echtes ripgrep als WASM, in-memory-API, wendet `.gitignore` an) + **JS-`RegExp`-Fallback**; Kandidatenliste über `ignore@7` | ✅ |
-| `patch` | `@ohw/tool-patch` | write | optionaler Mehr-Hunk-Editor auf `edit`-Basis | später |
+| `read` | `@all-the.rest/baah-tool-read` ✅ | read | `getFile()` → `text()`, Zeilennummern, `offset`/`limit`, Binär-Abweisung, Zeilen-Truncation | ✅ fertig |
+| `write` | `@all-the.rest/baah-tool-write` ✅ | write | `getFileHandle(create)` → `createWritable()` → `write`/`close`; 5-MB-Guard, Verzeichnis-Guard | ✅ fertig |
+| `edit` | `@all-the.rest/baah-tool-edit` ✅ | write | exakter String-Ersatz; Fehler bei 0 Treffern; `>1` nur mit `replaceAll`; literale `$`-Sequenzen | ✅ fertig |
+| `list` | `@all-the.rest/baah-tool-list` ✅ | read | `dirHandle.values()`; Verzeichnisse zuerst, `limit`/`total`/`truncated` | ✅ fertig |
+| `glob` | `@all-the.rest/baah-tool-glob` | read | Walker über `values()` + **`picomatch@4`** (zero deps); Pfad-Index im Worker, damit es nach dem ersten Walk sofort ist | ✅ |
+| `grep` | `@all-the.rest/baah-tool-grep` | read | **`grep-wasm`** (echtes ripgrep als WASM, in-memory-API, wendet `.gitignore` an) + **JS-`RegExp`-Fallback**; Kandidatenliste über `ignore@7` | ✅ |
+| `patch` | `@all-the.rest/baah-tool-patch` | write | optionaler Mehr-Hunk-Editor auf `edit`-Basis | später |
 
 ### Tier 2 — Arbeitsorganisation und Delegation
 
 | Tool | Package | `access` | Web-first Realisierung | Machbar |
 |---|---|---|---|---|
-| `todowrite` | `@ohw/tool-todo` | write | Aufgabenliste in der DB, UI in der Sidebar | ✅ |
-| `task` | `@ohw/tool-task` | execute | Sub-Agent mit eigenem Message-Array + reduziertem Tool-Set, im Worker; Ergebnis als Text | ✅ |
-| `question` | `@ohw/tool-question` | read | UI-Karte im Transcript; `Promise`, das der Loop `await`et | ✅ |
-| `skill` | `@ohw/tool-skill` | read | Markdown unter `.ohw/skills/*.md` laden und in den System-Prompt injizieren | ✅ |
+| `todowrite` | `@all-the.rest/baah-tool-todo` | write | Aufgabenliste in der DB, UI in der Sidebar | ✅ |
+| `task` | `@all-the.rest/baah-tool-task` | execute | Sub-Agent mit eigenem Message-Array + reduziertem Tool-Set, im Worker; Ergebnis als Text | ✅ |
+| `question` | `@all-the.rest/baah-tool-question` | read | UI-Karte im Transcript; `Promise`, das der Loop `await`et | ✅ |
+| `skill` | `@all-the.rest/baah-tool-skill` | read | Markdown unter `.baah/skills/*.md` laden und in den System-Prompt injizieren | ✅ |
 
 ### Tier 3 — Netz und Ausführung
 
 | Tool | Package | `access` | Web-first Realisierung | Machbar |
 |---|---|---|---|---|
-| `webfetch` | `@ohw/tool-webfetch` | network | `fetch()` → Text; **CORS-limitiert**, nur erlaubende Origins | ⚠️ eingeschränkt |
-| `websearch` | `@ohw/tool-websearch` | network | externe Such-API („bring your own key"), ebenfalls CORS-abhängig | ⚠️ |
-| `shell` | `@ohw/tool-shell` | execute | **`just-bash`** (echter Bash-Interpreter im Browser, ~90 Built-ins) auf unserem `Workspace`; Kommando-Allow-Liste. Kein `npm install`/`node` (§5.4) | ✅ Phase 4 |
-| `git` | `@ohw/tool-git` | execute | **`isomorphic-git`**: `status`, `log`, `diff`, `commit`, `branch`. **Keine Remotes** (`clone`/`push` bräuchten einen CORS-Proxy = Server) | ✅ Phase 4 |
+| `webfetch` | `@all-the.rest/baah-tool-webfetch` | network | `fetch()` → Text; **CORS-limitiert**, nur erlaubende Origins | ⚠️ eingeschränkt |
+| `websearch` | `@all-the.rest/baah-tool-websearch` | network | externe Such-API („bring your own key"), ebenfalls CORS-abhängig | ⚠️ |
+| `shell` | `@all-the.rest/baah-tool-shell` | execute | **`just-bash`** (echter Bash-Interpreter im Browser, ~90 Built-ins) auf unserem `Workspace`; Kommando-Allow-Liste. Kein `npm install`/`node` (§5.4) | ✅ Phase 4 |
+| `git` | `@all-the.rest/baah-tool-git` | execute | **`isomorphic-git`**: `status`, `log`, `diff`, `commit`, `branch`. **Keine Remotes** (`clone`/`push` bräuchten einen CORS-Proxy = Server) | ✅ Phase 4 |
 
 **Nicht im Vorbild, aber sinnvoll:** `git` hat OpenCode v2 nicht als eigenes Tool
 (es läuft dort über die Shell). Für uns ist ein eigener Tool besser, weil die
@@ -136,7 +132,7 @@ Phase 4.
 
 ### 4.2 Tool-Vertrag
 
-Bereits implementiert in `@ohw/core`:
+Bereits implementiert in `@all-the.rest/baah-core`:
 
 ```ts
 interface ToolDefinition<Input, Output> {
@@ -215,7 +211,7 @@ zutrifft, fällt die Engine auf IndexedDB zurück (siehe §13, Recherche C).
 
 ### 5.3 Workspace-Abstraktion
 
-Ein Interface, mehrere Implementierungen (`@ohw/core`, bereits vorhanden):
+Ein Interface, mehrere Implementierungen (`@all-the.rest/baah-core`, bereits vorhanden):
 
 | Implementierung | Zweck | Status |
 |---|---|---|
