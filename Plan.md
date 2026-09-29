@@ -7,6 +7,33 @@
 
 ---
 
+## 0. Projektname & Rename (entschieden, noch nicht ausgeführt)
+
+| Ding | Ziel |
+|---|---|
+| Projektname | **`baah`** — „**B**rowser **a**s **a** **H**arness" |
+| npm-Scope | `@all-the-rest` |
+| Root-Package | `@all-the-rest/baah` |
+| App | `@all-the-rest/baah-web` |
+| Engine | `@all-the-rest/baah-core` |
+| Tools | `@all-the-rest/baah-tool-<id>` (z. B. `baah-tool-read`) |
+| Verzeichnis | `/projects/baah-harness` |
+| GitHub-Repo | `all-the-rest/baah` (voraussichtlich) |
+
+**Ist-Zustand bis zum Rename:** Verzeichnis `opencode-harness-web`,
+Scope `@ohw`, Pakete `@ohw/{web,core,tool-*}` (~50 Textstellen in 20 Dateien).
+
+**Reihenfolge (Nutzerentscheidung):** Der Rename passiert **erst nach Abschluss
+der Recherche** (§14), damit die Recherche-Dokumente nicht zweimal angefasst
+werden. Der Rename ist ein eigener Commit, kein Nebenprodukt einer
+Feature-Änderung. Danach ist `@ohw` im Repo verboten.
+
+**Warum der Name:** `baah` beschreibt genau die Projektdefinition (§1) und
+vermeidet die Verwechslung mit OpenCode, das nur *Vorbild* ist, nicht
+Bestandteil.
+
+---
+
 ## 1. Ziel
 
 Eine **web-first Coding-Harness**: eine Web-App, die den *Basis-Werkzeugkasten*
@@ -66,9 +93,9 @@ verifiziert (§12).
 | Tool | Package | `access` | Web-first Realisierung | Machbar |
 |---|---|---|---|---|
 | `read` | `@ohw/tool-read` ✅ | read | `getFile()` → `text()`, Zeilennummern, `offset`/`limit`, Binär-Abweisung, Zeilen-Truncation | ✅ fertig |
-| `write` | `@ohw/tool-write` | write | `getFileHandle(create)` → `createWritable()` → `write`/`close` | ✅ |
-| `edit` | `@ohw/tool-edit` | write | exakter String-Ersatz; Fehler bei 0 Treffern; `>1` nur mit `replaceAll` | ✅ |
-| `list` | `@ohw/tool-list` | read | `dirHandle.values()`; Verzeichnisse mit `/` markiert | ✅ |
+| `write` | `@ohw/tool-write` ✅ | write | `getFileHandle(create)` → `createWritable()` → `write`/`close`; 5-MB-Guard, Verzeichnis-Guard | ✅ fertig |
+| `edit` | `@ohw/tool-edit` ✅ | write | exakter String-Ersatz; Fehler bei 0 Treffern; `>1` nur mit `replaceAll`; literale `$`-Sequenzen | ✅ fertig |
+| `list` | `@ohw/tool-list` ✅ | read | `dirHandle.values()`; Verzeichnisse zuerst, `limit`/`total`/`truncated` | ✅ fertig |
 | `glob` | `@ohw/tool-glob` | read | Walker über `values()` + `picomatch`/`minimatch`; Ergebnis sortiert | ✅ (Perf ⏳) |
 | `grep` | `@ohw/tool-grep` | read | Walker + `RegExp` über Dateiinhalte; Musterfilter, `head_limit`, ignoriert Binärdateien | ✅ (Perf ⏳) |
 | `patch` | `@ohw/tool-patch` | write | optionaler Mehr-Hunk-Editor auf `edit`-Basis | später |
@@ -170,12 +197,41 @@ Ein Interface, mehrere Implementierungen (`@ohw/core`, bereits vorhanden):
 | Implementierung | Zweck | Status |
 |---|---|---|
 | `createMemoryWorkspace` | Tests, Demo, „kein Ordner nötig" | ✅ fertig |
-| `FileSystemAccessWorkspace` | echter Projektordner via `showDirectoryPicker()` | Phase 5 |
-| `OpfsWorkspace` | privater Sandbox-Ordner, immer verfügbar | Phase 1 |
+| `FileSystemAccessWorkspace` | **echter** Projektordner via `showDirectoryPicker()` — in-place lesen *und* schreiben | Phase 5 |
+| `OpfsWorkspace` | privater Sandbox-Ordner; Import + Export | Phase 1 |
 
-Beide Produktions-Varianten erfüllen dasselbe `Workspace`-Interface
-(`stat`, `exists`, `readText`, `writeText`, `list`, `remove`, `walk`). Tools
-kennen nur dieses Interface — deshalb sind sie ohne Browser testbar.
+**Browser-Realität (belegt, §14.1):** Die File System Access API ist
+**Chromium-only** — Firefox hat eine negative Standards-Position, Safari
+opponiert. Daraus folgt zwingend ein Zwei-Modus-Design:
+
+| Modus | Browser | Verhalten |
+|---|---|---|
+| **In-place** | Chrome/Edge 86+ (Desktop), Chrome Android 132+ | Ordner verbinden, direkt im echten Projekt lesen/schreiben |
+| **Workspace** | Firefox 111+, Safari 16.4+ | Ordner **importieren** (read-only) → in OPFS arbeiten → **exportieren** |
+
+Die UI muss den Modus *sichtbar* machen („du arbeitest in einer Kopie") — sonst
+erwartet ein Firefox-Nutzer Speicherungen auf der Platte, die nicht passieren.
+
+**Harte technische Nebenbedingungen** (aus §14.1, alle im Design berücksichtigt):
+
+- **Permission nur aus einem Klick.** `requestPermission()` braucht eine
+  Nutzergeste auf dem **Main Thread**; ein Worker kann ein *gewährtes* Handle
+  benutzen, aber nie selbst um Erlaubnis fragen. ⇒ Nach jedem Kaltstart zeigt die
+  App einen „Projekt wieder öffnen"-Button, der die Permission im Click-Handler
+  anfordert.
+- **Handles gehören in IndexedDB** (structured clone), nicht in JSON. Sie
+  referenzieren den Eintrag, nicht die Bytes.
+- **Safari kann gepickte Handles nicht an einen Worker übergeben** (Stand heute
+  nur Preview). ⇒ Der Worker holt sich im OPFS-Modus sein Root selbst über
+  `navigator.storage.getDirectory()`; im In-place-Modus läuft der Walk auf dem
+  Main Thread bzw. Chromium-only im Worker.
+- **Eviction ist real:** Safari löscht skript-erzeugte Daten nach **7 Tagen ohne
+  Interaktion**; OPFS ist per Default *best-effort*. ⇒ `navigator.storage.persist()`
+  anfordern, den Nutzer warnen, und Export/Backup als First-Class-Feature
+  behandeln (nicht als Nebenfunktion).
+- **`grep`/`glob` existieren nicht** als Plattform-Primitiv ⇒ auf `list`/`read`
+  aufbauen, mit Ignore-Liste, Byte-Cap und Binär-Sniffing (§14.1).
+
 
 ### 5.4 Shell-Optionen (bewusst nicht v1)
 
@@ -189,33 +245,97 @@ Begründung: Ein Modell arbeitet mit strukturierten Tools (`read`/`grep`/`glob`/
 `edit`) präziser und sicherer als mit einer halbgaren Shell. Eine *schlechte*
 Shell ist schlechter als keine.
 
-## 6. Datenmodell
+## 6. Datenmodell & Persistenz (entschieden)
 
-⏳ Finalisierung aus Recherche C. Entwurf:
+**Engine: `@sqlite.org/sqlite-wasm` mit dem `opfs-sahpool`-VFS, in genau einem
+dedizierten Web Worker.** Belegt in §14.2 — und der ausschlaggebende Punkt:
+`opfs-sahpool` braucht **kein `SharedArrayBuffer`** und damit **keine
+COOP/COEP-Header**, die eine statische SPA nicht setzen kann. Der klassische
+`opfs`-VFS fällt genau deshalb aus.
+
+| Aspekt | Entscheidung |
+|---|---|
+| Engine | `@sqlite.org/sqlite-wasm` (WASM, FTS5 verifiziert vorhanden) |
+| VFS | `opfs-sahpool` — kein COOP/COEP, schnellster OPFS-VFS, **Single Connection** |
+| Query-Layer | `drizzle-orm/sqlite-proxy` — generischer async-Callback, passt exakt auf einen Worker-RPC |
+| Volltextsuche | FTS5 über `parts.content_text` (external content, Trigger-basiert) |
+| Handles & Blobs | **Sidecar-IndexedDB** — WASM-SQLite kann `FileSystemHandle` nicht halten |
+| Multi-Tab | Ein Writer via `navigator.locks`; zweiter Tab liest oder zeigt Banner |
+| Migrationen | `PRAGMA user_version` + `schema_migrations`-Tabelle, SQL aus `drizzle-kit` |
+
+### 6.1 Schema (SQLite, `STRICT`)
 
 ```sql
-sessions(id, title, workspace_id, parent_session_id, created_at, updated_at, archived)
-messages(id, session_id, role, seq, created_at, status, model, provider)
-  -- status: streaming | complete | interrupted | error
-parts(id, message_id, idx, type, data_json)
-  -- type: text | reasoning | tool_call | tool_result | file | error
-tool_invocations(id, message_id, tool_call_id, tool_name, input_json,
-                 state, output_json, error, started_at, finished_at)
-approvals(id, tool_call_id, decision, scope, decided_at)
-todos(session_id, id, content, status, priority, seq)
-workspaces(id, name, kind, label, created_at)
-file_handles(workspace_id, handle)      -- FileSystemDirectoryHandle, structured clone
-settings(key, value_json)
+sessions(id TEXT PK, title, status, model, system_prompt, metadata JSON,
+         created_at, updated_at, archived_at)
+
+turns(id PK, session_id FK, seq, status, lease_owner, heartbeat_at,
+      started_at, finished_at, error, UNIQUE(session_id, seq))
+  -- der Reload-/Interrupt-Anker: der Writer erneuert heartbeat_at je Flush
+
+messages(id PK, session_id FK, turn_id FK, parent_id FK, seq, role, status,
+         model, error, usage JSON, created_at, updated_at, UNIQUE(session_id, seq))
+
+parts(id PK, message_id FK, session_id FK, seq, type, data JSON,
+      content_text, status, created_at, updated_at, UNIQUE(message_id, seq))
+  -- type: text|reasoning|tool_call|tool_result|file_diff|file|image|source|error|step
+  -- content_text ist die denormalisierte, durchsuchbare Projektion
+
+tool_invocations(id PK, session_id FK, message_id FK, call_part_id, result_part_id,
+                 tool_name, args JSON, status, result_preview, error,
+                 started_at, finished_at, created_at, updated_at)
+
+approvals(id PK, session_id FK, tool_invocation_id FK, request JSON,
+          decision, scope, decided_at, expires_at, created_at)
+
+todos(id PK, session_id FK, seq, content, status, priority, created_at, updated_at)
+
+workspaces(id PK, name, kind, root_handle_id, metadata JSON, created_at, last_opened_at)
+
+file_handles(id PK, workspace_id FK, kind, name, relative_path, handle_id,
+             permission, last_checked_at, UNIQUE(workspace_id, relative_path))
+
+settings(key PK, value JSON, updated_at)
+schema_migrations(version PK, name, applied_at)
 ```
 
-Design-Entscheidungen:
+Pragmas pro Verbindung: `foreign_keys=ON`, `journal_mode=DELETE` (WAL bringt im
+Web-VFS nichts), `synchronous=NORMAL`, `busy_timeout=5000`.
 
-- **`seq`** (Integer, pro Session) ist der Sortierschlüssel, **nicht** der
-  Zeitstempel — zwei Nachrichten können in derselben Millisekunde entstehen.
-- **Partielle Assistenten-Antworten** werden inkrementell an denselben
-  `part`-Datensatz angehängt; `messages.status` markiert beim Laden, was als
-  unterbrochen gilt.
-- **Token/Kosten** werden pro Message mitgeschrieben (Anzeige + Budget).
+### 6.2 Design-Entscheidungen
+
+- **`seq`** (Integer, pro Parent, innerhalb der Schreibtransaktion vergeben) ist
+  der Sortierschlüssel — **nicht** `created_at`. Zwei Nachrichten können in
+  derselben Millisekunde entstehen. `created_at` ist reine Anzeige.
+- **Parts: eine Tabelle mit `type`-Diskriminator + JSON**, nicht eine Tabelle je
+  Typ. Die Part-Taxonomie folgt dem Protokoll und ändert sich; eine Nachricht
+  rendern ist ein indizierter Scan statt `UNION ALL`. Schwere Fälle
+  (`tool_invocations`, `approvals`) sind bewusst eigene Tabellen — dieser Hybrid
+  hält den heißen Pfad einfach.
+- **Streaming:** Deltas im Worker puffern, alle ~50–100 ms in **einer kurzen**
+  Transaktion flushen (UPSERT auf `parts` + append-only `part_deltas` für
+  Idempotenz). **Niemals** eine Transaktion über ein `await` außerhalb SQLite
+  offen halten. Kein Schreiben pro Token.
+- **Reload:** Beim Start `turns` mit `status='streaming'` und altem
+  `heartbeat_at` auf `interrupted` setzen; Teilttext **behalten**, nicht
+  verwerfen; UI bietet „Wiederholen" (neuer Turn) und „Fortsetzen" an.
+- **`FileSystemHandle` liegt in IndexedDB**, nicht in SQLite — WASM hat keinen
+  Zugriff auf die structured-clone-Objekte. `handle_id` ist eine Referenz per
+  Konvention.
+
+### 6.3 Was browser-only unmöglich bleibt
+
+- Ein laufender Stream ist nach einem Reload **nicht** wieder anhängbar — die
+  `ReadableStream` der Seite ist weg, es gibt keinen Server, der sie hält.
+- Der Provider generiert nach dem Abbruch ggf. weiter (und rechnet ab); diese
+  Tokens sind unwiederbringlich.
+- Ein bereits laufendes Tool kann nicht „exactly once" wiederhergestellt werden;
+  offene Approvals müssen nach dem Reload neu bestätigt werden.
+- Kein Multi-Tab-/Multi-Gerät-Wahrheitsanspruch, keine Server-Retention.
+
+Gegenmaßnahme ist bewusst UX, nicht Technik: Verlust ist auf das Flush-Intervall
+begrenzt (≤ ~100 ms), und Export ist ein First-Class-Feature (§8.2).
+
 
 ## 7. Permissions (Reimplementierung des Vorbilds)
 
@@ -276,8 +396,8 @@ Jede Phase endet mit `pnpm check` grün **und** unabhängiger Verifikation (§12
 
 | Phase | Inhalt | Fertig, wenn |
 |---|---|---|
-| **0 — Fundament** ✅ | Repo, pnpm-Workspace, TS 7/Tailwind 4/daisyUI 5, `core`-Verträge, `read`-Tool, `Plan.md`, `AGENTS.md` | `pnpm check` grün; 17 Tests |
-| **1 — Engine-Kern** | `write`, `edit`, `list`, OPFS-Workspace, Storage-Adapter, Loop-Skelett gegen Mock-Modell | Contract-Tests aller Tools; Loop läuft headless im Test |
+| **0 — Fundament** ✅ | Repo, pnpm-Workspace, TS 7/Tailwind 4/daisyUI 5, `core`-Verträge, `read`/`write`/`edit`/`list`, `Plan.md`, `AGENTS.md`, Recherche FS + DB | `pnpm check` grün; 52 Tests |
+| **1 — Engine-Kern** | OPFS-Workspace, SQLite-Worker (`sqlite-wasm` + `opfs-sahpool`), Drizzle-`sqlite-proxy`, Migrationen, Loop-Skelett gegen Mock-Modell | Contract-Tests aller Tools; Loop läuft headless im Test; Reload überlebt |
 | **2 — Suche** | `glob`, `grep`, ignore-Filter, Worker-Auslagerung, Perf-Smoke (≥10k Dateien) | Suche blockiert UI nicht; Benchmark dokumentiert |
 | **3 — UI + Onboarding** | Transcript, Tool-Karten, Approval-Cards, Wizard, Settings, Export/Import | Playwright: 0 → Chat, Reload-Resilienz, Export→Import |
 | **4 — Tier 2** | `todowrite`, `question`, `skill`, `AGENTS.md`-Injektion, `task`/Subagent | Subagent läuft isoliert mit eigenem Kontext |
@@ -323,27 +443,97 @@ Der Orchestrator implementiert nicht selbst, sondern schneidet und prüft.
 Ein Subagent bekommt **nur** den relevanten `Plan.md`-Ausschnitt plus
 `AGENTS.md` — nicht das ganze Dokument.
 
-## 13. Offene Fragen (Recherche)
+## 13. Offene Fragen
 
-| # | Frage | Strang |
+| # | Frage | Status |
 |---|---|---|
-| 1 | IndexedDB vs. SQLite-WASM/OPFS — welche Engine? | C ⏳ |
-| 2 | Braucht SQLite-WASM `SharedArrayBuffer`/COOP-COEP — verträgt sich das mit einer statischen SPA? | C ⏳ |
-| 3 | Läuft der AI-SDK-Loop vollständig im Browser (Flags, Bundling)? | B ⏳ |
-| 4 | Welche Provider erlauben CORS direkt? | B ⏳ |
-| 5 | `grep`/`glob` ohne natives ripgrep: welche Perf bei ≥10k Dateien? | C ⏳ |
-| 6 | Wie weit trägt ein WASM-Node/WebContainer als Shell-Ersatz? | C ⏳ |
-| 7 | Exakter Tool-Katalog + Loop-Semantik des Vorbilds (Truncation, Parallelität, Fehlerform) | A ⏳ |
-| 8 | Modellkatalog-Quelle und Preis-Anzeige (`@opencode-ai/models`?) | B ⏳ |
+| 1 | IndexedDB vs. SQLite-WASM/OPFS — welche Engine? | ✅ **entschieden** §6 (`sqlite-wasm` + `opfs-sahpool`) |
+| 2 | Braucht SQLite-WASM `SharedArrayBuffer`/COOP-COEP — verträgt sich das mit einer statischen SPA? | ✅ **gelöst**: `opfs-sahpool` braucht es **nicht** (§14.2) |
+| 3 | Läuft der AI-SDK-Loop vollständig im Browser (Flags, Bundling)? | ⏳ B |
+| 4 | Welche Provider erlauben CORS direkt? | ⏳ B |
+| 5 | `grep`/`glob` ohne natives ripgrep: welche Perf bei ≥10k Dateien? | ⏳ C — Sucharchitektur offen |
+| 6 | Wie weit trägt ein WASM-Node/WebContainer als Shell-Ersatz? | ⏳ C |
+| 7 | Exakter Tool-Katalog + Loop-Semantik des Vorbilds | ⏳ A |
+| 8 | Modellkatalog-Quelle und Preis-Anzeige (`@opencode-ai/models`?) | ⏳ B |
+| 9 | Multi-Tab: ein Writer via `navigator.locks` reicht das, oder braucht es `wa-sqlite OPFSCoopSyncVFS`? | ⏳ Phase 1 |
+| 10 | Wie erkennt die App „dieser Workspace ist zu groß für einen Walk"? (Byte-/Datei-Budget) | ⏳ Phase 2 |
 
-## 14. Recherche-Anhang
+## 14. Recherche-Ergebnisse
 
-Wird nach Abschluss der Stränge befüllt:
+### 14.1 Dateizugriff im Browser (abgeschlossen)
 
-- **A — Vorbild-Innenleben:** Tool-Katalog, Agent-Loop, Datenmodell,
-  Config/Permissions. *Zweck: unsere Tools sind gegen ein echtes Vorbild
-  gespiegelt statt erfunden.*
-- **B — Vercel AI SDK:** Loop-API, Streaming, Browser-Runtime, Provider-CORS,
-  Persistenz-Primitive, Lücken.
-- **C — Browser-FS & Browser-DB:** File System Access API vs. OPFS, Worker,
-  WASM-Werkzeuge (Suche/Glob/Diff/Highlighting), DB-Wahl, Shell-Optionen.
+**Kernbefund: Es gibt keinen browserübergreifenden Weg auf den echten
+Projektordner.** Die File System Access API ist Chromium-only (Firefox:
+negative Standards-Position, Safari: opponiert). Daraus folgt das Zwei-Modus-
+Design in §5.3.
+
+| Fähigkeit | Chromium | Firefox | Safari |
+|---|---|---|---|
+| Ordner-Picker (`showDirectoryPicker`) | ✅ 86+ | ❌ | ❌ |
+| In-place lesen/schreiben | ✅ | ❌ | ❌ |
+| OPFS (`getDirectory`) | ✅ 108+ | ✅ 111+ | ✅ 16.4+ |
+| Sync-Access-Handle (nur Worker) | ✅ 102+ | ✅ 111+ | ✅ 15.2+ |
+| Handle per `postMessage` in Worker | ✅ | (nur OPFS) | ⚠️ nur Preview |
+| `SharedArrayBuffer` | COOP/COEP nötig | dito | dito |
+
+Zentrale Konsequenzen (alle im Design berücksichtigt):
+
+1. **Permission nur per Klick auf dem Main Thread.** `requestPermission()`
+   verlangt eine Nutzergeste und wirft im Worker `SecurityError`. ⇒ Nach jedem
+   Kaltstart ein „Projekt wieder öffnen"-Button.
+2. **Handles in IndexedDB** (structured clone), nie in JSON; sie referenzieren
+   den Eintrag, nicht die Bytes.
+3. **Safari kann gepickte Handles nicht an Worker übergeben** ⇒ Worker holt sich
+   im OPFS-Modus sein Root selbst.
+4. **Eviction ist real:** Safari löscht skript-erzeugte Daten nach 7 Tagen ohne
+   Interaktion; OPFS ist per Default best-effort. ⇒ `storage.persist()` +
+   Warnung + Export als First-Class-Feature.
+5. **`grep`/`glob` sind keine Plattform-Primitive** ⇒ auf `list`/`read` bauen,
+   mit Ignore-Liste, Byte-Cap und Binär-Sniffing (Extension → NUL-Byte →
+   `TextDecoder(fatal:true)`). `file.size` ist vor dem Lesen verfügbar — das ist
+   das Gate für große Dateien.
+6. **`createWritable()` schreibt atomar** (Temp-Datei, Ersetzen bei `close()`) —
+   gut für `edit`/`write`. `createSyncAccessHandle()` ist Worker-only und
+   exclusive-locked — das ist die Grundlage des Single-Writer-Modells der DB.
+
+### 14.2 Browser-Datenbank (abgeschlossen)
+
+Verglichen wurden IndexedDB (+`idb`/`dexie`), `sql.js`, `wa-sqlite` und
+`@sqlite.org/sqlite-wasm`. Entscheidung und Begründung stehen in §6.
+
+Die ausschlaggebenden Messungen/Funde:
+
+- **FTS5 ist im offiziellen `sqlite-wasm`-Build verifiziert vorhanden und
+  funktionsfähig** (`ENABLE_FTS5=1`, `MATCH` liefert Treffer, `bm25()`/`snippet()`
+  nutzbar). `sql.js` **nicht** (`no such module: fts5`) und ist zudem rein
+  in-memory — damit für inkrementelles Append untauglich.
+- **`opfs-sahpool` braucht kein COOP/COEP** (im Gegensatz zum `opfs`-VFS, das
+  `SharedArrayBuffer` und damit Header verlangt, die eine statische SPA nicht
+  setzen kann). Die offizielle SQLite-Doku empfiehlt es ausdrücklich für
+  Clients, die keine Response-Header setzen können.
+- **`drizzle-orm/sqlite-proxy` ist kein HTTP-Treiber**, sondern ein generischer
+  async-Callback `(sql, params, method) => Promise<{rows}>` — er bildet 1:1 auf
+  einen Worker-RPC ab. Transaktionen laufen als echtes SQL (`begin`/`commit`/
+  `rollback`, verschachtelt via `savepoint`) durch denselben Callback.
+- **`SQLocal` scheidet aus**, weil es Cross-Origin-Isolation voraussetzt — genau
+  das Problem, das `opfs-sahpool` vermeidet.
+- **Preis von `opfs-sahpool`:** genau **eine** Verbindung. Ein zweiter Tab kann
+  nicht mitinstallieren ⇒ Writer-Wahl über `navigator.locks`, sonst
+  Read-only-Spiegel. Falls Multi-Tab-Writes später Pflicht werden, ist der
+  Wechsel auf `wa-sqlite OPFSCoopSyncVFS` der vorgesehene Ausweg — **SQL und
+  Schema bleiben dabei identisch**, es ändert sich nur VFS/Treiber.
+
+### 14.3 Vorbild-Innenleben (Tool-Katalog, Loop, Config)
+
+⏳ läuft.
+
+### 14.4 Vercel AI SDK (Browser-Runtime, CORS, Persistenz)
+
+⏳ läuft.
+
+### 14.5 Browser-Sandbox / Shell-Ersatz
+
+⏳ läuft. Vorab: Der `shell`-Tool ist bewusst **nicht** v1 (§5.4) — die
+strukturierten Tools (`read`/`grep`/`glob`/`edit`) sind präziser und sicherer
+als eine halbe Shell.
+

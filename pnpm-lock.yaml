@@ -77,7 +77,55 @@ importers:
         specifier: ^5.0.2
         version: 5.0.2(vite@8.3.1)
 
+  packages/tools/edit:
+    dependencies:
+      '@ohw/core':
+        specifier: workspace:*
+        version: link:../../core
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.2
+        version: 5.0.2(vite@8.3.1)
+
+  packages/tools/list:
+    dependencies:
+      '@ohw/core':
+        specifier: workspace:*
+        version: link:../../core
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.2
+        version: 5.0.2(vite@8.3.1)
+
   packages/tools/read:
+    dependencies:
+      '@ohw/core':
+        specifier: workspace:*
+        version: link:../../core
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.2
+        version: 5.0.2(vite@8.3.1)
+
+  packages/tools/write:
     dependencies:
       '@ohw/core':
         specifier: workspace:*
