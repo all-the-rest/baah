@@ -101,7 +101,7 @@ verifiziert (§12).
 
 | Tool | Package | `access` | Web-first Realisierung | Machbar |
 |---|---|---|---|---|
-| `todowrite` | `@all-the.rest/baah-tool-todo` | write | Aufgabenliste in der DB, UI in der Sidebar | ✅ |
+| `todo` | `@all-the.rest/baah-tool-todo` | write | Aufgabenliste in der DB, UI in der Sidebar | ✅ |
 | `task` | `@all-the.rest/baah-tool-task` | execute | Sub-Agent mit eigenem Message-Array + reduziertem Tool-Set, im Worker; Ergebnis als Text | ✅ |
 | `question` | `@all-the.rest/baah-tool-question` | read | UI-Karte im Transcript; `Promise`, das der Loop `await`et | ✅ |
 | `skill` | `@all-the.rest/baah-tool-skill` | read | Markdown unter `.baah/skills/*.md` laden und in den System-Prompt injizieren | ✅ |
@@ -265,44 +265,151 @@ Entscheidung, keine Auslassung:
 - Die einzige saubere Lösung für einen gebrochenen Middlebox-Weg wäre ein
   **Proxy** — und der ist out of scope, siehe §2.
 
-**Was wir stattdessen bauen** — ein Detektor plus genau **einen** Fallback.
-Wichtig: „die ersten Deltas kommen spät" ist **kein** Fehlerindikator, sondern
-bei Reasoning-Modellen, Kaltstart und Rate-Limit-Queues der Normalfall. Gemessen
-wird deshalb die **Chunk-Signatur**, nicht die Latenz.
+**Was wir stattdessen bauen** — ein Detektor, ein Fallback und ein Retry.
 
-Gemessene Größen pro Turn: `chunkCount` (wie viele `read()`-Calls Daten
-lieferten), `firstDeltaMs`, `streamDurationMs` (erster bis letzter Delta),
-`bodyBytes`, und ob Reader/Fetch geworfen hat.
+#### Erfolgskriterium: nicht der Status, sondern der Stream
 
-| Klassifikation | Signatur | Reaktion |
+Ein `200` ist **kein** Erfolgsindikator. Bekannt und reproduzierbar sind Fälle,
+in denen der Status `200` ist und die Antwort trotzdem unbrauchbar:
+
+| 200-aber-failed | Wie es sich zeigt |
+|---|---|
+| Header kommen, **Body bleibt leer** | Stream endet sofort, null Chunks |
+| SSE-Stream **bricht mitten drin ab** | Chunks hörten auf, **kein** `data: [DONE]`, kein `finish`-Event |
+| **Fehler-Event im Stream** | `200` bei den Headern, dann ein `error`-Part im Protokoll |
+| **JSON-Fehlerbody statt SSE** | `200`, aber `content-type: application/json` mit einem Fehlerobjekt |
+| **Terminal-Event fehlt** | Text kam, aber kein `finish`/`stop` — der Turn ist unvollständig |
+
+**Erfolg = der Stream endet sauber mit einem Terminal-Event.** Alles andere ist
+ein Fehler, egal was die Statuszeile sagt. Diese Regel ersetzt jede Prüfung auf
+den HTTP-Status und ist der Grund, warum wir überhaupt eine eigene Erfolgslogik
+brauchen statt auf „kein Wurf = gut" zu vertrauen.
+
+#### Welche Fehler automatisch wiederholt werden
+
+| Klasse | Beispiele | Auto-Retry? |
 |---|---|---|
-| **healthy** | ≥ 2 Chunks **und** `streamDurationMs` > ~200 ms | nichts — läuft normal |
-| **buffered** | 1 Chunk mit dem kompletten Body, oder `streamDurationMs` < ~150 ms bei nicht-trivialer Größe | als `buffered` merken; nach **2 aufeinanderfolgenden** Turn umschalten, sichtbar und umkehrbar |
-| **broken** | Reader wirft, oder `fetch` bricht mitten im Stream ab | **ein** Retry ohne Streaming, siehe Kostenregel unten |
-| **unknown / slow** | bis zu **20 s** keine Bytes, Verbindung aber noch offen | **niemals** automatisch degradieren. „Warte auf das Modell (Ns)" anzeigen + *manuelle* Aktion „ohne Streaming wiederholen" |
+**Reihenfolge der Prüfung** — die Reihenfolge ist nicht beliebig, sie ist der
+Schlüssel, weil ein `200` mit Fehler-JSON sonst wie ein Erfolg aussieht:
 
-- **Onboarding-Probe:** einmal beim Einrichten des Endpoints — dieselbe
-  Chunk-Signatur-Messung auf einer winzigen Anfrage.
-- **Sichtbar und dauerhaft:** ein Hinweis, dass Antworten in dieser Umgebung am
-  Stück erscheinen. Ohne ihn hält man die UI für kaputt.
-- **Fallback-Implementierung:** `generateText` (ohne Stream) →
-  `createUIMessageStream` mit synthetischen `text-delta`-Chunks. Kein eigener
-  Transport, kein zweiter Codepfad im Loop.
-- **Erkenntnisse werden pro `provider + baseURL` gemerkt**, nicht pro Turn, und
-  in den Settings sichtbar und zurücksetzbar.
+```
+1. Gab es überhaupt eine Antwort?   nein → KEINE Retry (20-s-Regel unten)
+2. Statuscode                        5xx / 429 → Retry (429: Retry-After gewinnt)
+3. 4xx, die sich nicht ändern        400/401/403/404/422 → KEINE Retry
+4. Status 200 → Antwort VERIFIZIEREN, nicht annehmen
+5. Stream endet mit Terminal-Event?   nein → Retry
+6. Sonst                             Erfolg
+```
 
-**Kostenregel beim Retry — der entscheidende Punkt.** Ein Retry sendet die
-Anfrage erneut. Hat der Provider angefangen zu generieren, wird der erste
-Versuch **trotzdem abgerechnet** — wir würden also für denselben Turn doppelt
-bezahlen, ohne es zu merken. Daraus folgt:
+Schritt 4 ist der ganze Punkt: **Ein `200` ist eine Behauptung, keine
+Tatsache.** Geprüft wird, was wirklich ankam:
 
-- **Auto-Retry nur bei `broken` mit null empfangenen Bytes** (Verbindung kam
-  nie zustande). Da ist keine Generierung passiert.
-- **Bereits Bytes empfangen und dann Abbruch** ⇒ **kein** Auto-Retry. Wir
-  zeigen den Teiltranscript, markieren den Turn als `interrupted` und lassen
-  den Nutzer entscheiden. Das ist exakt die Recovery aus §6.2.
-- **Maximal ein Auto-Retry pro Turn**, sessionweit protokolliert, damit kein
-  Retry-Schleifen entstehen.
+| Was ankam | Bewertung | Reaktion |
+|---|---|---|
+| `content-type: application/json` statt `text/event-stream` | **Fehler-JSON** mit Status 200 | Body **einmal** lesen, das JSON auswerten |
+| JSON mit `error`, `message`, `code` | Providerfehler trotz 200 | wie 5xx behandeln → Retry |
+| JSON mit `error.type = "insufficient_quota"` / `billing` | **kein** Retry | Endgültiger Fehler, Key/Quota melden, Retry-Schleife wäre Geldverbrennung |
+| JSON **ohne** Fehler, aber kein Stream | Protokoll-Missverständnis | einmaliger Retry, dann Nutzer |
+| SSE-Stream ohne `data: [DONE]` / ohne Terminal-Part | abgeschnitten | Retry |
+| SSE-Stream **mit** `error`-Event | Abbruch mitten drin | Retry |
+| leere Antwort trotz 200 | unbrauchbar | Retry |
+
+**Drei verschiedene Dinge, die alle als „200" ankommen** — und die man nicht
+verwechseln darf:
+
+| | 5xx im Status | 200 + Fehler im JSON | 200 + leer/abgeschnitten |
+|---|---|---|---|
+| Was es ist | Server kaputt | Server lehnt inhaltlich ab, transporttechnisch 200 | Transport kaputt |
+| Wiederholbar? | ja | **kommt auf den Inhalt an** | ja |
+| Unser Verhalten | Retry | Inhalt auswerten → dann entscheiden | Retry |
+
+Für den JSON-Fehlerfall gibt es deshalb **kein** festes „retry ja/nein",
+sondern eine Regel über den erkannten Fehlertyp:
+
+| `error.type` / Muster | Retry | Grund |
+|---|---|---|
+| `insufficient_quota`, `billing`, `credit` | ❌ nie | Geld, nicht Zufall |
+| `invalid_api_key`, `authentication` | ❌ nie | Key ist falsch, nicht kaputt |
+| `permission`, `not_found` | ❌ nie | Anfrage ist falsch |
+| `rate_limit`, `overloaded`, `server_error`, `internal` | ✅ ja | transient |
+| unbekannt | ✅ einmal, dann an den Nutzer | lieber sichtbar raten als still |
+
+**Begründung für diese Sorgfalt:** Ein `200` mit Fehler-JSON sieht für jede
+naive Erfolgskontrolle wie ein Erfolg aus. Genau daran scheitern gute
+Harnesses still — der Turn gilt als fertig, das Transcript ist unvollständig,
+und niemand erfährt warum. Deshalb ist „`200` allein zählt nie" hier eine
+harte Regel und keine Vorsicht.
+
+#### Auto-Retry-Klassen (Zusammenfassung)
+
+| Klasse | Beispiele | Auto-Retry? |
+|---|---|---|
+| **Antwort kam, unbrauchbar** | 5xx, 429, 200+Fehler-JSON (transient), 200+abgeschnitten/leer, Verbindung nach den Headern abgerissen | ✅ **ja** |
+| **429 mit `Retry-After`** | Rate-Limit | ✅ ja, **mit** dem vom Server genannten Warten |
+| **Keine Antwort überhaupt** | Verbindung kam nie zustande, 20 s Stillstand bei offener Verbindung | ❌ **nein** — der Provider generiert womöglich noch; „Warte auf das Modell (Ns)" + manuelle Aktion |
+| **Endgültige Fehler** | 401, `insufficient_quota`, `billing`, `invalid_api_key`, 400/403/404/422 | ❌ nein — wiederholen behebt nichts, ein 401- oder Quota-Loop verbrennt nur Requests |
+| **Nutzer hat abgebrochen** | `stop()` | ❌ nein |
+
+Auto-Retry also **nur dort, wo tatsächlich eine verwertbare Antwort angekommen
+ist, und nur bei transienten Ursachen**. Die inhaltliche Prüfung des
+Fehler-JSON ist dabei kein Detail, sondern die halbe Logik.
+
+Auto-Retry also **nur dort, wo tatsächlich eine Antwort angekommen ist**. Das ist
+die Grenze, die der Nutzer gezogen hat, und sie ist die richtige: ohne Antwort
+ist der erste Versuch möglicherweise schon teuer im Lauf, mit Antwort ist er
+nachweislich unbrauchbar.
+
+#### Backoff: sofort, dann wachsend
+
+| Versuch | Warten **vor** dem Versuch | kumuliert |
+|---|---|---|
+| 1 | **0 s** — sofort | 0 s |
+| 2 | **2 s** | 2 s |
+| 3 | **8 s** | 10 s |
+| 4 | **ab hier kein Auto-Retry** | — |
+
+- **±25 % Jitter** auf jede Wartezeit. Ohne Jitter starten nach einem
+  Provider-Aussetzer alle Clients weltweit im selben Takt erneut — das ist der
+  Unterschied zwischen „erholt sich" und „verlängert den Ausfall".
+- `Retry-After` vom Server **gewinnt** über unsere Tabelle, gedeckelt auf 60 s.
+- Obergrenze: **maximal 3 automatische Versuche pro Turn**, danach Übergabe an
+  den Nutzer. Ein Retry ist immer teuer (die Anfrage wird erneut gesendet), also
+  ist eine unbegrenzte Schleife ausgeschlossen.
+- Die Versuche werden im UI sichtbar: „Versuch 2 von 3" — ein stilles
+  Wiederholen wäre bei genau diesem Fehlerbild unhilfreich.
+
+#### Was mit dem Teiloutput passiert
+
+Ein Retry kann den Stream nicht fortsetzen (keine Resume-ID, §14.4). Also wird
+der **gesamte Turn** erneut gesendet. Damit das nicht still verschwindet:
+
+- Der abgebrochene Versuch wird im Transcript als **`interrupted` markiert und
+  sichtbar gelassen** — inklusive des Teilttexts.
+- Der neue Versuch ist ein eigener Turn mit eigener Nachricht.
+- Nie wird der Teiltext eines fehlgeschlagenen Versuchs in den neuen
+  kopiert. Der Nutzer sieht „Versuch 1 abgebrochen, Versuch 2 läuft" — genau
+  damit wird ein 200-aber-failed-Fall überhaupt diagnostizierbar.
+
+#### Kosten — dokumentierte Entscheidung
+
+Ein Retry sendet die Anfrage erneut. Hat der Provider angefangen zu
+generieren, wird der erste Versuch **trotzdem abgerechnet**. Auto-Retry bei
+„Antwort kam, unbrauchbar" kann also Mehrkosten verursachen. Das ist bewusst so
+entschieden: bei 200-aber-failed ist der erste Versuch für den Nutzer wertlos,
+und ein Turn, der hängen bleibt, ist schlechter. Die harte Grenze bleibt
+**3 Versuche pro Turn**.
+
+#### Stream-Transport im Übrigen
+
+- **Passive Erkennung** der Chunk-Signatur pro `provider + baseURL`, gespeichert
+  und in den Settings sichtbar und zurücksetzbar.
+- **Onboarding-Probe** mit derselben Messung auf einer winzigen Anfrage.
+- **Fallback ohne Streaming:** `generateText` → `createUIMessageStream` mit
+  synthetischen `text-delta`-Chunks. Kein eigener Transport, kein zweiter
+  Codepfad im Loop.
+- **Dauerhafter Hinweis**, wenn Antworten am Stück ankommen — sonst hält man die
+  UI für kaputt.
+
 
 
 ### 5.5 Shell — von „nicht v1" zu „v1 möglich" (revidiert)
@@ -688,7 +795,7 @@ Jede Phase endet mit `pnpm check` grün **und** unabhängiger Verifikation (§12
 | **1 — Engine-Kern** | OPFS-Workspace, SQLite-Worker (`sqlite-wasm` + `opfs-sahpool`), Drizzle-`sqlite-proxy`, Migrationen, Loop-Skelett gegen Mock-Modell | Contract-Tests aller Tools; Loop läuft headless im Test; Reload überlebt |
 | **2 — Suche + Service Worker** | `glob` (`picomatch`), `grep` (`grep-wasm` + JS-Fallback), `ignore`-Filter, Pfad-Index im Worker, Perf-Smoke (≥10k Dateien); **SW als Infrastruktur**: Offline-App-Shell, Single-Writer (`navigator.locks` + `BroadcastChannel`), PWA-Manifest | Suche blockiert UI nicht; Benchmark dokumentiert; App startet offline; zwei Tabs kollidieren nicht |
 | **3 — UI + Onboarding** | Transcript, Tool-Karten, Approval-Cards, Wizard, Settings, Export/Import | Playwright: 0 → Chat, Reload-Resilienz, Export→Import |
-| **4 — Tier 2 + Shell** | `todowrite`, `question`, `skill`, `AGENTS.md`-Injektion, `task`/Subagent, `shell` (`just-bash`), `git` (`isomorphic-git`) | Subagent läuft isoliert mit eigenem Kontext; Shell nur über die Allow-Liste |
+| **4 — Tier 2 + Shell** | `todo`, `question`, `skill`, `AGENTS.md`-Injektion, `task`/Subagent, `shell` (`just-bash`), `git` (`isomorphic-git`) | Subagent läuft isoliert mit eigenem Kontext; Shell nur über die Allow-Liste |
 | **5 — Härtung** | FS-Access-Workspace (echter Ordner), Resume nach Reload, Token/Kosten, `webfetch`, CORS-Matrix als Test | Reconnect-Test: Reload mitten im Turn → sauberer Zustand |
 | **6 — optional** | Route B (WASM-Node) als bewusst eingeschalteter Modus, MCP-Spike (nur `remote`), Tree-Sitter-Highlighting, TS-6-Sprachdienst im Worker, **SW-Relay-Experiment** („Stream überlebt Reload", Erwartungswert ≤ 5 min, §14.6) | — |
 
