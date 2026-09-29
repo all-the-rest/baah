@@ -462,8 +462,75 @@ einen Maintainer".
 
 ---
 
-## Nur manuell beweisbar
-## Nur manuell beweisbar
+## Uebergabe an Welle 2 — Vertraege, die der Engine-Fix gewachsen sind
+
+Das ist keine Task-Liste, das sind **Schnittstellen**, die in Welle 2 brechen, wenn sie
+niemand liest. Alle aus `ca7c02e`.
+
+- [!] **`ProviderRegistry.resolve` und `fingerprint` sind jetzt `async`.**
+      `AGENTS.md` §2 verlangt `crypto.subtle`, und es gibt kein synchrones WebCrypto.
+      Heute bricht nichts (`baah-web` importiert nur `CORE_PACKAGE`), **Welle 2 muss
+      awaiten.**
+- [!] **Der Store-Vertrag ist gewachsen.** Welle 2 muss bauen:
+      1. `tool_invocations.status` — unterscheidet `begun` von `done`. Ohne die Spalte ist
+         das Crash-Fenster wieder unsichtbar und `write` haengt ein zweites Mal an.
+      2. **Vier-Teile-Schluessel** statt nackter `toolCallId`:
+         `{sessionId, attempt, toolCallId, occurrence}`. `session_id` ist als Spalte schon da,
+         `attempt` und `occurrence` sind Engine-Buchhaltung.
+      3. `listUnfinishedTurns({ sessionId })` — neu, fuer die Reload-Recovery.
+- [ ] **`store.flushDelta` wird vom Loop bis heute nicht aufgerufen.** Wie `onProgress` liegt
+      es an der Naht fuer die **App**, nicht fuer die Engine. Von mir benannt, damit es nicht
+      als tote Methode wiederentdeckt wird.
+- [ ] **`ToolDefinition.toModelOutput?` existiert jetzt** — optional, synchron,
+      `undefined` = Default. Die im `question`-README dokumentierte Rahmen-Pflicht ist damit
+      **implementierbar**; die Pflicht selbst bleibt Welle 2 (untrusted answer, API-Key im
+      selben Tab).
+- [ ] **Neue Verdict-/Event-Typen brauchen UI:** `config-error` mit `missing_api_key` (vorher
+      als 20-Sekunden-Stall gemeldet), `tool-outcome-unknown` mit `TurnResult.unknownOutcomes`,
+      und `turn-stopped` fuer beide Stop-Pfade.
+- [!] **Der 20-Sekunden-Stall-Watchdog fehlt weiterhin** und ist in `Plan.md` §5.4 als Luecke
+      protokolliert. Er braucht einen Timer auf **Chunk-Ebene** — also dieselbe Ebene, die
+      `ToolLoopAgent` nicht freigibt. Haengt an derselben Entscheidung wie der Roh-Chunk-Zugriff.
+
+## Lehren aus dem Engine-Fix — vier, die in kuenftige Auftraege gehoeren
+
+**1. Ich habe ein Signal vorgegeben, der Agent hat ein besseres gemessen.** Ich schrieb
+*benutze `AI_NoOutputGeneratedError`*. Der Agent hat **vor dem Schreiben das SDK gemessen**
+und `TextStreamFinishPart.rawFinishReason` gefunden — ein **oeffentliches, typisiertes**
+Feld, das die eigene Begruendung des Providers woertlich traegt und das der SDK **bei einem
+selbst synthetisierten** `finish`-Part `undefined` laesst. Gemessen:
+
+| Lauf | `finishReason` | `rawFinishReason` |
+|---|---|---|
+| abgeschnitten (kein Provider-`finish`) | `"other"` | **fehlt** |
+| Provider sendet `finish("other")` | `"other"` | **`"other"`** |
+
+→ **Regel:** Wenn ich einen Fix-Agenten auf ein Signal anweise, ist das eine **Hypothese**,
+keine Vorgabe. Sagen: *das Signal, das ich vermute, ist X — miss erst, ob es das ist.*
+Ich hatte die Fehlerklasse richtig und das falsche Feld.
+
+**2. Ein ueberlebender Mutant muss entweder sterben oder als bedeutungslos bewiesen werden —
+und wenn er bedeutungslos ist, ist meistens der *Kommentar* die Luege.** M25b ueberlebte,
+weil der aufgeloeste Label **genau einen** Konsumenten hat. Der Agent hat keinen Test gebaut,
+der eine tote Reihenfolge festnagelt, sondern **den Kommentar korrigiert**, der eine
+Reihenfolge behauptete, die kein Test halten kann. → Ein Test fuer ein
+Implementierungsdetail ist schlechter als ehrliche Dokumentation.
+
+**3. Ein Test, der einen Defekt behauptet, kann den Fix nicht ueberleben — richtig ist
+umdrehen, nicht loeschen.** Vier Verify-Tests behaupteten den Header-Drop, das falsche
+Format, den Namen als Base-URL, den fehlenden Key und die Fingerprint-Alias. Sie wurden
+**invertiert**: Fall bleibt, Name und Behauptung beschreiben jetzt das behobene Verhalten.
+**Geloescht haetten sie die Abdeckung gekostet.**
+
+**4. Eine Mutation fand einen echten Bug in der Loesung des Agenten selbst.** M10b
+(occurrence-Vorschub in `begin` statt im Lookup) — ein kurzgeschlossener Aufruf beginnt nie,
+also loesten zwei Aufrufe mit gleicher Id **beide** auf Occurrence 0 auf und das Modell
+bekam die Antwort des ersten fuer den zweiten. Gefunden von einem **neuen** Test, nicht vom
+Review — die dritte Runde, in der ein Test den Agenten belogen hat statt umgekehrt.
+
+---
+
+
 ## Nur manuell beweisbar — `Plan.md` §15
 
 Diese Punkte bleiben offen, bis jemand in einem echten Browser zusieht. Kein
