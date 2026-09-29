@@ -84,6 +84,8 @@ und in den System-Prompt aufgenommen. 🔜
 | Volltextsuche über die Historie (FTS5) | 🔜 |
 | Streaming-Deltas werden inkrementell persistiert (Verlust ≤ ~100 ms) | 🔜 |
 | Alles bleibt lokal — nichts wird hochgeladen | ✅ |
+| Service Worker: Offline-App-Shell, ein DB-Writer über alle Tabs hinweg | 🔜 |
+| Installierbar als PWA — auf Chrome bleiben Datei-Freigaben dadurch ohne erneute Rückfrage erhalten | 🔜 |
 
 ### 6. Onboarding und Settings
 
@@ -144,10 +146,12 @@ Kleingedruckte:
 1. **Der API-Key liegt im Browser.** Bei „bring your own key" unvermeidlich. Er
    geht nur an den Provider, aber wer Zugriff auf das Browserprofil hat, kommt
    an ihn. Empfehlung im Onboarding: eigener, widerrufbarer Key mit Ausgabenlimit.
-2. **Nach einem Reload mitten im Turn ist der Stream nicht fortsetzbar.** Die
-   Verbindung gehört dem Tab; es gibt keinen Server, der sie hält. Der Teiltext
-   bleibt erhalten, der Turn wird als unterbrochen markiert und kann wiederholt
-   werden.
+2. **Ein Reload mitten im Turn ist nicht beliebig lange überlebbar.** Der Stream
+   gehört dem Tab. Ein Service Worker kann ihn über einen **Reload** retten —
+   aber nicht über den Browser, und hart begrenzt auf **~5 Minuten** pro Request
+   (Chrome und Firefox beenden den Worker auch mitten im Stream). Der Teiltext
+   bleibt in jedem Fall erhalten; der Turn wird als unterbrochen markiert und
+   kann wiederholt werden.
 3. **Die Permission-Freigabe ist eine UX-Leitplanke, keine Sicherheitskontrolle.**
    Ohne Server gibt es niemanden, der eine Freigabe signieren könnte.
 4. **Nicht jeder Browser kann alles.** Der echte Projektordner in-place geht nur

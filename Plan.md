@@ -374,15 +374,70 @@ Web-VFS nichts), `synchronous=NORMAL`, `busy_timeout=5000`.
   Zugriff auf die structured-clone-Objekte. `handle_id` ist eine Referenz per
   Konvention.
 
-### 6.3 Was browser-only unmöglich bleibt
+### 6.3 Was browser-only (nicht) möglich ist
 
-- Ein laufender Stream ist nach einem Reload **nicht** wieder anhängbar — die
-  `ReadableStream` der Seite ist weg, es gibt keinen Server, der sie hält.
-- Der Provider generiert nach dem Abbruch ggf. weiter (und rechnet ab); diese
-  Tokens sind unwiederbringlich.
-- Ein bereits laufendes Tool kann nicht „exactly once" wiederhergestellt werden;
-  offene Approvals müssen nach dem Reload neu bestätigt werden.
-- Kein Multi-Tab-/Multi-Gerät-Wahrheitsanspruch, keine Server-Retention.
+**Korrektur zu einer früheren Fassung dieses Plans:** Ich hatte geschrieben,
+ein laufender Stream sei nach einem Reload „nicht wieder anhängbar". Das ist zu
+absolut. Ein **Service Worker** ist ein dokumentunabhängiger Kontext und kann
+die Seite überleben — damit überlebt der Stream *einen Reload*. Aber er
+überlebt nicht den Browser.
+
+Belegte Grenzen (§14.6), die die Reichweite festlegen:
+
+| Grenze | Wert | Konsequenz |
+|---|---|---|
+| Idle-Timeout des Service Workers | **30 s** ohne Aktivität | Der Idle-Timer wird bei **jedem `reader.read()`** zurückgesetzt, solange das Promise offen ist. Ein *aktiv fließender* Stream hält den SW also am Leben — `setInterval` dagegen **nicht**. |
+| Einzelner Request | **5 min** hart, Chrome **und** Firefox | WONTFIX in der Spec-Diskussion („Chrome stops the service worker after 5+ minutes timeout **even if it is streaming**"). |
+| `fetch()`-Antwort | 30 s bis zum ersten Byte | Für LLM-Streams unkritisch. |
+
+**Was daraus folgt — ehrlich:**
+
+- Ein Turn, der **kürzer als ~5 Minuten** ist, überlebt einen Reload: der SW
+  schreibt die Deltas weiter in die DB, die neue Seite liest sie und hängt sich
+  wieder an.
+- Ein **längerer** Turn stirbt **hart** — mitten im Stream, ohne Vorwarnung. Das
+  ist schlechter als der heutige Zustand, weil man es nicht kommen sieht.
+- Pausiert der Provider **> 30 s** (langes Reasoning ohne Deltas), kann Chrome
+  den SW trotzdem abräumen.
+
+**Der Preis:** Der ganze Loop (AI SDK + Tool-Ausführung) müsste in den SW
+wandern. Das kollidiert mit unserem Design:
+
+- `showDirectoryPicker()` und `requestPermission()` brauchen einen
+  **Main-Thread mit Nutzergeste** — der SW kann beides nicht.
+- Approval-Cards und `question` sind UI und müssen über die Seite laufen.
+- Also bräuchte jeder Tool-Aufruf einen Round-Trip Page ↔ SW, und der SW müsste
+  ein bereits gewährtes `FileSystemDirectoryHandle` per `postMessage` bekommen
+  (ob SWs Handles annehmen, ist **UNVERIFIED** — muss getestet werden).
+
+**Entscheidung:** Service Worker wird **nicht** zum Fundament des Loops. Er kommt
+in zwei Stufen, die beide auch ohne ihn nützlich sind:
+
+1. **Phase 2 — SW als Infrastruktur:** Offline-App-Shell, Single-Writer für die
+   DB über Tabs hinweg (`navigator.locks` + `BroadcastChannel`), und
+   **PWA-Installation**. Der Install bringt einen konkreten Gewinn: eine
+   installierte PWA behält auf Chrome die Datei-Freigaben **ohne erneute
+   Rückfrage** (§14.1).
+2. **Phase 6 — Experiment „Stream überlebt Reload":** SW als Stream-Relay,
+   hinter einer Fähigkeitsprüfung und mit ehrlichem Erwartungswert (≤ 5 min).
+   Wird nur gebaut, wenn die Messung die 5-Minuten-Grenze nicht ohnehin
+   entwertet.
+
+**Was in jedem Fall unmöglich bleibt:**
+
+- Ein Stream, der **den Browser** überlebt (Tab schließen, Browser beenden).
+- Der Provider generiert nach dem Abbruch weiter und rechnet ab — diese Tokens
+  sind unwiederbringlich.
+- Ein bereits laufendes Tool „exactly once" wiederherstellen; offene Approvals
+  müssen nach dem Reload neu bestätigt werden.
+- **`Background Fetch`** löst das nicht: Chrome-only, erzwingt eine
+  nicht-schließbare Browser-UI, ist auf GET/Blob-Downloads ausgelegt — nicht auf
+  einen POST mit gestreamter Antwort.
+
+Die Recovery-Leitplanke aus §6.2 bleibt also **in jedem Fall** nötig: Deltas
+aggressiv persistieren, unterbrochene Turns markieren, „Wiederholen" anbieten.
+Der SW verbessert die Lage, er ersetzt sie nicht.
+
 
 Gegenmaßnahme ist bewusst UX, nicht Technik: Verlust ist auf das Flush-Intervall
 begrenzt (≤ ~100 ms), und Export ist ein First-Class-Feature (§8.2).
@@ -565,11 +620,11 @@ Jede Phase endet mit `pnpm check` grün **und** unabhängiger Verifikation (§12
 |---|---|---|
 | **0 — Fundament** ✅ | Repo, pnpm-Workspace, TS 7/Tailwind 4/daisyUI 5, `core`-Verträge, `read`/`write`/`edit`/`list`, `Plan.md`, `AGENTS.md`, Recherche FS + DB | `pnpm check` grün; 52 Tests |
 | **1 — Engine-Kern** | OPFS-Workspace, SQLite-Worker (`sqlite-wasm` + `opfs-sahpool`), Drizzle-`sqlite-proxy`, Migrationen, Loop-Skelett gegen Mock-Modell | Contract-Tests aller Tools; Loop läuft headless im Test; Reload überlebt |
-| **2 — Suche** | `glob` (`picomatch`), `grep` (`grep-wasm` + JS-Fallback), `ignore`-Filter, Pfad-Index im Worker, Perf-Smoke (≥10k Dateien) | Suche blockiert UI nicht; Benchmark dokumentiert; Fallback-Pfad getestet |
+| **2 — Suche + Service Worker** | `glob` (`picomatch`), `grep` (`grep-wasm` + JS-Fallback), `ignore`-Filter, Pfad-Index im Worker, Perf-Smoke (≥10k Dateien); **SW als Infrastruktur**: Offline-App-Shell, Single-Writer (`navigator.locks` + `BroadcastChannel`), PWA-Manifest | Suche blockiert UI nicht; Benchmark dokumentiert; App startet offline; zwei Tabs kollidieren nicht |
 | **3 — UI + Onboarding** | Transcript, Tool-Karten, Approval-Cards, Wizard, Settings, Export/Import | Playwright: 0 → Chat, Reload-Resilienz, Export→Import |
 | **4 — Tier 2 + Shell** | `todowrite`, `question`, `skill`, `AGENTS.md`-Injektion, `task`/Subagent, `shell` (`just-bash`), `git` (`isomorphic-git`) | Subagent läuft isoliert mit eigenem Kontext; Shell nur über die Allow-Liste |
 | **5 — Härtung** | FS-Access-Workspace (echter Ordner), Resume nach Reload, Token/Kosten, `webfetch`, CORS-Matrix als Test | Reconnect-Test: Reload mitten im Turn → sauberer Zustand |
-| **6 — optional** | Route B (WASM-Node) als bewusst eingeschalteter Modus, MCP-Spike (nur `remote`), Tree-Sitter-Highlighting, TS-6-Sprachdienst im Worker | — |
+| **6 — optional** | Route B (WASM-Node) als bewusst eingeschalteter Modus, MCP-Spike (nur `remote`), Tree-Sitter-Highlighting, TS-6-Sprachdienst im Worker, **SW-Relay-Experiment** („Stream überlebt Reload", Erwartungswert ≤ 5 min, §14.6) | — |
 
 ## 11. MCP — vertagt, aber vorgesehen
 
@@ -920,5 +975,36 @@ Benchmark — Phase 2 misst.
 Volar/LSP-Vollintegration; Filesystem-Watcher (stattdessen mtime-Vergleich on
 demand); Volltext-Indexierung des ganzen Korpus; Windows-Pfadsemantik; und
 **niemals** die Behauptung, `just-bash` sei ein Sicherheits-Sandbox.
+
+### 14.6 Service Worker als Überlebensschicht (nachgezogen)
+
+Auf Nachfrage geprüft, ob ein Worker den Stream über einen Reload retten kann.
+Ergebnis: **Dedicated und Shared Worker nicht, Service Worker teilweise.**
+
+| Kontext | Lebt der Stream einen Reload der Seite? |
+|---|---|
+| Dedicated Worker | ❌ stirbt mit dem Dokument |
+| Shared Worker | ❌ stirbt, wenn der letzte Client geht |
+| **Service Worker** | ⚠️ **ja — bis ~5 Minuten**, dann hart beendet |
+| Background Fetch | ❌ Chrome-only, Pflicht-UI, GET/Blob — kein POST-Stream |
+
+Die harten Zahlen (Chrome-Doku, Spec-Diskussion, Mozilla-Bug):
+
+- **30 s Inaktivität** → beendet. Der Timer wird bei **jedem `reader.read()`**
+  zurückgesetzt, solange das Promise offen ist. **Ein aktiver Lese-Loop hält den
+  SW also am Leben; `setInterval` nicht.**
+- **5 min pro Request** → hart beendet, **auch wenn gestreamt wird**.
+  Chrome-Bug 753646 wurde als WONTFIX geschlossen; Firefox beendet ebenfalls
+  nach ~5 Minuten. Kein `waitUntil()` hebt das auf.
+- **30 s bis zur ersten Byte einer `fetch()`-Antwort** → beendet.
+- Serverseitige Pausen > 30 s (langes Reasoning ohne Deltas) sind damit ein
+  zusätzliches Risiko.
+
+**Fazit:** Der SW ist die einzige echte Verbesserung — aber er ist ein
+Zeitfenster, kein Zustand. Er rechtfertigt keinen Umbau des Loops in den SW
+(Tool-Ausführung braucht Main-Thread-Gesten und UI), wohl aber zwei Dinge, die
+auch für sich lohnen: **Offline-App-Shell + Single-Writer + PWA-Install**
+(Phase 2) und ein **begrenztes Relay-Experiment** (Phase 6).
+
 
 
