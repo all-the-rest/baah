@@ -43,10 +43,13 @@
       ⚠️ **Commit wartet auf den Engine-Block:** Core hat `toolCallId`/`attempt` auf
       `ToolContext` gesetzt (uncommittet, 24 Zeilen in `tool.ts`). Die Tests hier brauchen
       die Felder, ein Commit jetzt wäre also ein **roter `main`** (§8). Erst nach Core.
-- [~] **Agent-Engine** (`ToolLoopAgent`, Classification, Backoff, Approval) — Build-Agent läuft.
-      `stream/classify.ts` + `stream/backoff.ts` stehen, `agent/*` + `provider/*` fehlen.
-- [ ] **Verify: Agent-Engine** — eigener Verify-Agent, danach Mutationstest. **offen**
-      **Hängt an der Reihenfolge:** Core-Paket, gleiche Paketgrenze wie oben.
+- [x] **Agent-Engine** — `0f068cc`, 323 Tests. `ToolLoopAgent` + `DirectChatTransport`,
+      `ToolContext` mit `toolCallId`/`attempt`, `todo` als eigene Permission-Action.
+- [x] **Verify: Agent-Engine** — abgeschlossen. **20 Befunde**, 81 neue Tests → **404**.
+      Der wichtigste ist eine **Architektur-Lüge**, keine Bug: siehe „Engine: was der
+      Verify-Agent umgeworfen hat".
+- [~] **Fix: Agent-Engine** — Fix-Agent läuft. Drei Schnittstellen-Entscheidungen sind
+      gefallen (D1/D2/D3 unten), der Rest ist als Bugliste durchnummeriert.
 
 ## Welle 2 — Engine verdrahten + Oberfläche
 
@@ -156,6 +159,145 @@ question could not be answered … Assume nobody can reply right now"* verkommt,
 Modell sagt, **die UI sei kaputt**. Genau die Verwechslung, die F2 beseitigen soll.
 Auflage: der Text-Pfad ist ein **dokumentierter Migrationspfad** und darf ausschließlich
 einen Fehler *spezifischer* machen, niemals die Antwort berühren.
+
+---
+
+## Engine: was der Verify-Agent umgeworfen hat
+
+**Die Behauptung „`classify.ts` ist implementiert" war falsch.** `loop.ts:65` importiert
+**nur `classifyThrownError`. Für `classifyResponse` gibt es in `src/` keinen einzigen
+Aufruf.** Die ganze 200-Verifikation — JSON-Fehler-Bodies, Content-Type-Prüfung,
+`sawTerminalEvent` — wird **nur von ihren eigenen Unit-Tests ausgeführt und nie von einem
+Turn.** Das ist eine Spezifikationszusage ohne Implementierung, die 46 grüne Tests trägt.
+
+**Und der Ersatz, der an ihre Stelle trat, ist degeneriert — nicht verlustbehaftet.**
+Gemessen wurden zwei Part-Sequenzen durch `ToolLoopAgent.stream()`:
+
+| Eingang | Sequenz |
+|---|---|
+| abgeschnittener Stream (kein finish-Part) | `start, start-step, text-start, text-delta, text-end, finish-step(other), finish(other)` |
+| **legitimes** `finish("other")` | **byte-identisch** |
+
+`ai@7.0.122`: `unified: finishReason === "unknown" ? "other" : finishReason`. Ein Provider,
+der **bewusst** mit dem spec-legalen `"unknown"` endet, wird als Trunkierung gelesen und
+**erneut versucht — 3 Requests für eine Antwort, die bereits da war.**
+
+**Das Rohsignal existiert und wird weggeworfen.** Ein leerer Stream wirft
+`AI_NoOutputGeneratedError: "No output generated. The model stream ended without a finish
+chunk."` — §5.4s Rohsignal, wörtlich. `loop.ts` schickt es durch `classifyThrownError` und
+verliert den Namen.
+
+**Architekturelle Ursache:** `ToolLoopAgentSettings` hat **kein** `onChunk`, **kein**
+`includeRawChunks`, **kein** `onError`. Auf dieser Ebene ist der rohe Chunk **nicht
+erreichbar** — nicht schwer, nicht mühsam: nicht. → **D1: Heuristik streichen, typisierten
+Fehler benutzen, und `Plan.md` §5.4 ehrlich amendieren** (das Prinzip gilt auf Body-Ebene,
+nicht auf Chunk-Ebene).
+
+### Zwei Implementierungen, die auseinanderdriften
+
+`classifyThrownError` (live) und `classifyResponse` (tot) **widersprechen sich** beim
+selben Input. `LoadAPIKeyError` → live `no-response`, das ist §5.4s Konzept des
+**20-Sekunden-Stalls** — ein **fehlender API-Key wird der UI als Stall gemeldet**.
+`loop.ts:1082-1086` behauptet „diese Datei hat bewusst keine zweite Kopie" — die *Datei*
+hat keine, das **Modul** schon, und sie driften. Die live ist die schlechtere. → **D2.**
+
+### D3 — das Crash-Fenster: der Zustand war nicht darstellbar
+
+Gemessen: `beginToolCall` schreibt eine Zeile, die **niemand zurücklesen kann**.
+`TurnStore` hat kein Statusfeld, „begonnen ohne Ergebnis" ist **nicht darstellbar**.
+Absturz zwischen den zwei → der Aufruf ist unsichtbar, der Kurzschluss greift nicht, und
+**das Tool läuft erneut.** Ein `write`, das anhängt, ergab `log === ["x","x"]`, während
+das Transkript **einen** Schreibvorgang zeigte.
+
+Meine Abwägung: Wiederholen macht aus einem **stillen Auslassen** eine **stille
+Beschädigung der Dateien des Users** — und Beschädigung ist vom Modell nicht reparierbar,
+Auslassen meistens schon. → **`getToolCall` bekommt einen Status (`begun`/`done`)**, der
+Kurzschluss feuert **nur auf `done`**, und `begun`-ohne-`done` wird als **Ergebnis
+unbekannt** sichtbar gemeldet statt still entschieden. **Es gibt hier keine kostenlose
+Antwort**, also muss die getroffene Wahl im Kommentar lesbar sein.
+
+### Weitere Befunde, nach Schwere
+
+- [ ] **Der Anthropic-Header kann stillschweigend verloren gehen — und der Kommentar
+      behauptet das Gegenteil.** `registry.ts:201`: Object-Spread merged rechts nach
+      links, also gewinnt `settings.headers` vom Aufrufer. Der Kommentar sagt, Required
+      Header werden zuerst gemergt, „so kann ein Required Header nie durch einen Unfall in
+      den Settings verloren gehen" — **zweimal im Code gesagt und genau verkehrt herum.**
+- [ ] **Der API-Key ist nicht Teil des Fingerprints.** `registry.ts:144-155`: Der Kommentar
+      sagt, zwei Settings, die sich nur im Key unterscheiden, dürfen keine Instanz teilen —
+      `fingerprint()` joint `vendor|model|baseUrl|name|headers` und **nie den Key**.
+      **Wer einen neuen Key einfügt, bekommt das Modell des alten Keys zurück.**
+      Fix mit **Hash**, nie mit dem Rohwert (Browser-Storage, Logs).
+- [ ] **Die Heartbeat-Altersgrenze existiert nicht.** `store.heartbeat` wird **einmal**
+      geschrieben und **nie gelesen** (`loop.ts:697`). Keine Altersarithmetik, keine
+      Konstante — „welche Seite der Grenze" hat also keine Antwort. Jedes `interrupted` im
+      Loop ist **versuchsbezogen** (Stop / Fehlschlag / Budget / no-response); **keines ist
+      Reload-Recovery**, obwohl `AGENTS.md` §3.1 es verlangt und `Plan.md` §6.1
+      `heartbeat_at` den Reload-Anker nennt. **Das ist eine fehlende Funktion, kein
+      fehlender Test** — kein Fake hätte das gefunden, nur die Frage „wo ist es?".
+- [ ] **Ein 200 + `server_error`-Body bekommt 2 Versuche statt 3.** `loop.ts:1058-1062`:
+      `isUnknownBodyError` strippt `_error` bedingungslos, `"server_error"` → `"server"`,
+      was kein Key ist, also gilt ein gelisteter *retryable* Typ als unbekannt.
+      `classify.ts:79-85` **dokumentiert genau diesen Bug**, sagt, er habe ihn gehabt, und
+      schützt ihn mit `normalizeErrorType` — **der Schutz ist nicht in die Loop-Kopie
+      übernommen.** Genau ein Eintrag ist kaputt.
+- [ ] **Eine wiederverwendete `toolCallId` verwirft einen legitimen Aufruf, still.**
+      Dedupliziert auf der nackten Id: kein Versuch, keine Session (`loop.ts:629`). Und
+      `getToolCall`/`recordToolCall` führen **keine Session-Id**, obwohl `tool_invocations`
+      eine hat (§6.1) und der Store eine `sessionId` kennt.
+- [ ] **Ein Tool kann seinen eigenen Output nicht rahmen.** `ToolDefinition` hat **kein**
+      `toModelOutput`-Feld, `createSdkTool` verdrahtet eines. Das `question`-Tool sagt,
+      Rahmen sei „Welle-2-Aufgabe an der `toModelOutput`-Naht" — **die Naht existiert
+      nicht.** Als optionales Feld ergänzen.
+- [ ] **`loop.ts:569-575`:** ein User-Abbruch in `#continue` wird als `no-response`
+      synthetisiert und als `attempt-failed` emittiert — **ein Stop während einer
+      Approval-Aufsetzung wird der UI als 20-Sekunden-Stall gemeldet.** Wer stoppt,
+      verdient ein anderes Event als ein Timeout.
+- [ ] **Vier Parser-Befunde in `registry.ts`**: `openai-compatible` ohne `baseUrl` bekommt
+      seinen **Namen** als Base-URL; die Fehlermeldung empfiehlt
+      `openai-compatible:groq:llama-3`, der Parser splittet aber am **ersten** Doppelpunkt;
+      `settings.name` dient nur als Anwesenheits-Flag; `fingerprint` ist nicht injektiv.
+- [ ] **`loop.ts:470-474`**: `void store;` ist tot, der Kommentar darüber **wörtlich
+      doppelt** — Reste eines Hand-Patches.
+
+### Zwei Mutationen, die überlebten — beide lehrreich
+
+- [ ] **`maxRetries: 0` löschen: 403 Tests bleiben grün.** Ursache: der Test-Helfer baut ein
+      **einfaches `Error`**, der SDK-Retry-Predicate ist aber
+      `APICallError.isInstance(error) && error.isRetryable === true`. Der Fake war für die
+      Retry-Schleife **unsichtbar** — **kein Test *konnte* die Wiederholung beobachten.**
+      Das ist die Mutation, die der Build-Report ausdrücklich als getötet gemeldet hat.
+      **Die Behauptung war wahr, der Beweis existierte nicht.** Der Verify-Agent hat die
+      fehlenden Tests mit einem **echten `APICallError`** gebaut; M1 stirbt jetzt an
+      5-Sekunden-Timeouts — was selbst der Beweis ist, dass das SDK durch seinen eigenen
+      Backoff geschlafen hat.
+- [ ] **`telemetry: { isEnabled: false }` löschen: null Tests sterben.** Bindende Konvention
+      in `AGENTS.md` §3.1, Begründung in §14.4, **null Abdeckung** — und trivial prüfbar
+      am Objekt, das an `ToolLoopAgent` geht.
+
+### Lehren aus dieser Verifikation
+
+**1. „Kann nicht getestet werden" war eine halbe Ausrede — in einem Durchgang widerlegt.**
+Der Build-Agent schrieb, `provider/registry.ts` habe keine Tests, weil kein
+Provider-SDK installiert sei. Er hatte die Vendor-Factories **selbst injiziert**, genau um
+die Verdrahtung testbar zu halten. Der Verify-Agent schrieb **32 Tests** mit einem Fake und
+fand **sechs** Befunde. → **Regel:** Wenn ein Agent sagt, etwas sei nicht testbar, muss er
+**strukturell** begründen, warum — nicht mit einer fehlenden Dependency, die seine eigene
+Injektion ohnehin umgeht.
+
+**2. Ein Build-Agent kann eine Mutation als getötet melden, die nichts getötet hat.** M1
+war die vom Build-Report explizit als tot verbuchte Mutation. Grund war nicht Schlamperei,
+sondern ein **Fixture am falschen Ort**: der Test prüfte die *richtige* Sache für das *falsche*
+Publikum. → **Regel:** Bei jeder Behauptung „Mutation X stirbt an Test Y" muss Y das
+**richtige Publikum** haben — ein Fake, den der Produktionscode nicht erkennt, ist kein Test.
+
+**3. „Braucht einen Browser" und „niemand hat einen Test geschrieben" sind verschiedene
+Behauptungen — und nur eine ist eine Ausrede.** Der Verify-Agent hat die Liste sauber
+getrennt. Das ist die Unterscheidung, die ich künftig in jedem Auftrag verlange.
+
+**4. Ein Missing Feature sieht aus wie ein Missing Test.** Der Heartbeat-Anker wurde von
+**keinem** Test verlangt, weil keine Zeile Code ihn liest. Kein Mutationstest hätte ihn
+gefunden; nur die Frage „wo ist er?" — dieselbe Frage, die den `Plan.md`-Unfall gefunden hat.
 
 ---
 
