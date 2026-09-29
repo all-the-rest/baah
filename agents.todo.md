@@ -30,9 +30,8 @@
 - [x] **Tools `glob`, `grep`** — `766c0f7`, 47 Tests
 - [x] **Workspaces (OPFS, File System Access) + Permission-Engine** — `917f223`, 87 Tests
 - [x] **Persistenz `baah-storage`** (Schema, Migrationen, Worker-RPC, Memory-Backend) — `fa7fb6e`, 270 Tests
-- [~] **Verify: `glob`/`grep`** — Verify-Agent läuft. Prüft u. a., ob der
-      grep-wasm-Pfad im Bundle überhaupt eine plausible URL auflöst und ob der
-      JS-Fallback wirklich *gleichwertig* durch dasselbe Entry-Point läuft.
+- [x] **Verify: `glob`/`grep`** — abgeschlossen. 12 Mutationen, **2 überlebten** (M1, M7).
+      3 Defekte habe ich **persönlich nachgemessen** und bestätigt (siehe unten).
 - [!] **Verify: Workspaces + Permission** — **bewusst zurückgestellt.** Der Block
       liegt in `packages/baah-core`, wo der Engine-Agent gerade schreibt. Ein
       `pnpm test` im Core-Paket würde dessen halbfertige Tests mitlaufen lassen;
@@ -161,6 +160,100 @@ kann sie schließen — sie sind Rendering- und Vertrauensfragen.
 
 ---
 
+## `grep-wasm` fliegt raus — Entscheidung des Orchestrators
+
+Begründung aus **gemessenen** Fakten, nicht aus Prinzip:
+
+- **Kein Codepfad, in dem ripgrep etwas kann, was der JS-Scanner nicht kann.** Das
+  `grep`-Schema bietet kein `-v`, `-c`, `-m`, `-A/-B/-C`, `-o`, kein Multiline, keine
+  Binärsuche. Sechs Parameter, **null** davon eine ripgrep-Fähigkeit. Was ripgrep
+  kauft, ist Geschwindigkeit — und der Tool deckelt sich selbst bei 16 MB.
+- **Die beiden Engines sind nicht gleichwertig.** `\p{L}+` liefert auf WASM 6 Treffer,
+  auf JS 0. Lookaround und Backreferences werden von einer Engine abgelehnt und von der
+  anderen akzeptiert. Der Fallback ist eine **andere, schwächere Query-Sprache**.
+- **`grep-wasm` hat in diesem Projekt nie ausgeführt** — kein einziges Mal, in keinem
+  der 96 Tests. Der Browser-Pfad ist nicht nur unverifiziert, sondern **falsch per
+  Default**: `init()` bekommt kein Argument, die Binary-URL leitet sich aus der
+  Modul-URL ab, und `vite.config.ts` setzt **kein `base`** → bei einem Sub-Path
+  landet der Fetch auf der Domain-Wurzel und 404t.
+- **1,8 MB Binary, die in drei ungetesteten Dimensionen stimmen müssen**, um nichts zu
+  liefern, was das Tool überhaupt anbietet.
+- Die einzige Doku dieses Vertrags ist ein Kommentar in `vite.config.ts:19`, der auf
+  **zwei nicht existierende READMEs** zeigt (von mir geprüft: beide fehlen).
+
+**Bleibt:** die Naht. Wenn ripgrep zurückkommt, dann als **opt-in Accelerator** mit
+Äquivalenztest gegen den JS-Scanner — nicht als unverifizierter Default.
+
+- [ ] **Toten `optimizeDeps.exclude: ["grep-wasm"]` in `vite.config.ts` entfernen.**
+      Datei gehört dem CI-Agenten. **Nach dessen Landung**, nicht vorher.
+
+## Aus der Verifikation `glob`/`grep` — 3 Defekte selbst nachgemessen
+
+- [!] **Die Suche kann den Tab unbegrenzt blockieren. Höchster Schweregrad.**
+      `grep/src/index.ts:157-161`: `RegExpSearchInput` hat **kein `signal`**, der Scanner
+      ist ein synchrones Backtracking-`RegExp.test` pro Zeile, **ohne Timeout**. Gemessen
+      auf dieser Maschine, `(a+)+$` gegen `"a"×N + "b"`:
+      **N=24 → 281 ms · N=26 → 1,1 s · N=28 → 4,6 s** — verdoppelt je 2 Zeichen.
+      Und der Docstring `:161-171` behauptet, der Fallback existiere *weil* eine schlechte
+      Dialekt-Auswahl ein Ausfallrisiko sei — er **ist** selbst das unbegrenzte.
+      Das Vorbild begrenzt das mit `DEFAULT_SEARCH_TIMEOUT_MS = 30_000`. → Fix-Agent läuft.
+- [!] **Eine gekappte Suche meldet sich als vollständig.**
+      `core/src/workspace.ts:214` kappt `walk` bei `maxEntries ?? 50_000`, und **keines
+      der beiden Tools meldet das**. Bei 50 051 Dateien, wo nur die alphabetisch letzte
+      die Nadel enthält, liefert `grep` `total: 0`, `matches: []`,
+      **`searchTruncated: false`**, `truncated: false` und den Hinweis
+      *No line matches … Widen `path` …*. Das Tool behauptet vollständiges Wissen,
+      ohne jemals nachgesehen zu haben. `glob` genauso: `total: 50000` als Trefferzahl
+      bei 50 051 existierenden Dateien.
+      **Braucht eine Kern-Änderung, die mir nicht gehört:** `Workspace.walk` muss eine
+      Kappungs-Flagge zurückgeben. Der Fix-Agent liefert mir die exakte Signatur.
+- [ ] **`bytesRead` überschreitet den `maxBytes`, den es selbst meldet.**
+      `:442-444` prüft das Budget *vor* jedem Read, also wird die überstehende Datei
+      voll gelesen. Gemessen: `bytesRead = 17.510.495` bei `maxBytes = 16.777.216` —
+      **das Ergebnis widerspricht sich selbst.** → Fix-Agent läuft.
+
+## Weitere Defekte aus der Verifikation (Fix-Agent läuft)
+
+- [ ] **Ein übersprungener Riesendatei erzeugt einen aktive falschen Hinweis** — der
+      Hinweis nennt `path`/`include`/`literal`, **keines davon** würde eine Datei finden,
+      die wegen >1 MiB übersprungen wurde.
+- [ ] **`grep` kann keine Hidden Files durchsuchen.** Das Vorbild setzt `--hidden`
+      **unbedingt** (`ripgrep.ts:221`), wir haben kein `includeHidden`. Ein Harness, der
+      `.github/workflows/*.yml` nicht greppen kann, fehlt einem Agenten viel.
+- [ ] **Schema-Abweichungen zu v2.0.19**: `limit` hat bei uns ein erfundenes
+      `.max(1000)` ohne Gegenstück (Vorbild: kein Maximum) — ein Modell mit
+      `limit: 5000` bekommt hier einen Validierungsfehler und dort Ergebnisse.
+      `glob.pattern` und `grep.include` haben bei uns ein `.min(1)`, wo das Vorbild keins
+      hat; das bleibt **bewusst**, mit dokumentiertem Grund statt stillschweigend.
+- [ ] **Der `include`-Konverter ist gut und bleibt.** 26 Muster gleich zu echtem
+      picomatch, und `globToSource`s `(?:[^/]+/)*` für `**/` ist der klassische
+      Off-by-one und **richtig**. Seine Abweichungen gehen alle in die Richtung
+      *matched still nichts*: `!`-Negation, Extglobs, POSIX-Klassen, `{a}`, `a\*b.ts`.
+      Der Scope ist bewusst und vertretbar — **nicht vertretbar ist, dass nicht
+      unterstützte Syntax ein leeres Ergebnis liefert, ununterscheidbar von „nichts
+      gefunden"**, und dass das Modell nie erfährt, welche Syntax unterstützt ist.
+- [ ] **Zwei Tests behaupten mehr, als sie prüfen**: `grep.test.ts:253` („das Ergebnis
+      entspricht der JS-Engine") belegt `fallback == fallback`, weil das wasm nie lädt —
+      es *liest sich* wie ein Äquivalenzbeweis und ist keiner. `:269` („meldet, welche
+      Engine lief") ist `expect([...]).toContain(engine)` — eine Tautologie.
+- [ ] **Zwei tote Tests in `glob.test.ts`**: `> is a read-only tool` wiederholt
+      `access: "read"` aus der Quelle, `> sorts deterministically` bescheinigt etwas, das
+      `src` schon `localeCompare`d.
+- [ ] **Zwei fehlende READMEs**, auf die `vite.config.ts:19` zeigt.
+
+## Was der Verifier richtig gemacht hat, das ich notiere
+
+Der `include`-Konverter war der Punkt, an dem ich einen Bug erwartet habe — handgeschriebene
+Glob-Konverter sind, wo die Fehler wohnen. Stattdessen: **26 Muster gleich zu echtem
+picomatch**, gemessen gegen die installierte Bibliothek statt geraten, inklusive aller
+Fälle, die ich genannt hatte. Und beim Entfernen von `grep-wasm`: es war die
+**entscheidende** Beobachtung, dass kein einziger Schemaparameter eine ripgrep-Fähigkeit
+abbildet. Das ist die Art Argument, die eine Abhängigkeit killt — nicht „0.1.0 hat nur
+einen Maintainer".
+
+---
+
+## Nur manuell beweisbar
 ## Nur manuell beweisbar
 ## Nur manuell beweisbar — `Plan.md` §15
 
