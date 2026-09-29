@@ -22,6 +22,8 @@ function context(signal: AbortSignal): ToolContext {
     signal,
     approve: async () => "allow-once",
     emit: () => {},
+    toolCallId: "call-1",
+    attempt: 1,
   }
 }
 

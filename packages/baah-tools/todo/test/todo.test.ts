@@ -20,6 +20,8 @@ function context(signal?: AbortSignal): ToolContext {
     signal: signal ?? new AbortController().signal,
     approve: async () => "allow-once",
     emit: () => {},
+    toolCallId: "call-1",
+    attempt: 1,
   };
 }
 
@@ -189,6 +191,23 @@ describe("todo tool", () => {
 
     await tool.execute(ctx, { todos: [{ content: "one", status: "pending" }] });
     expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not swallow a throwing onChange (AGENTS.md §5: no silent catches)", async () => {
+    // The README promises the throwing callback surfaces as a tool failure so
+    // the bug stays visible. A `try/catch` around the notification would turn a
+    // broken sidebar into a silent success, and nothing else in the suite
+    // would notice.
+    const store = createMemoryTodoStore({
+      onChange: () => {
+        throw new Error("sidebar is not mounted");
+      },
+    });
+    const tool = createTodoTool({ store, sessionId: "s1" });
+
+    await expect(
+      tool.execute(ctx, { todos: [{ content: "one", status: "pending" }] }),
+    ).rejects.toThrow(/sidebar is not mounted/);
   });
 
   it("hands a private copy to the store and to onChange", async () => {
