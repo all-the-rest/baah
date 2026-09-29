@@ -13,7 +13,7 @@
  */
 
 import { assertInsideRoot } from "../path.ts";
-import { WorkspaceError, type EntryKind } from "../workspace.ts";
+import { WorkspaceError } from "../workspace.ts";
 import { guardHandle } from "./errors.ts";
 
 /** Split a normalized root-relative path into its handle-sized segments. */

@@ -265,24 +265,45 @@ Entscheidung, keine Auslassung:
 - Die einzige saubere Lösung für einen gebrochenen Middlebox-Weg wäre ein
   **Proxy** — und der ist out of scope, siehe §2.
 
-**Was wir stattdessen bauen** — ein Detektor plus genau **einen** Fallback:
+**Was wir stattdessen bauen** — ein Detektor plus genau **einen** Fallback.
+Wichtig: „die ersten Deltas kommen spät" ist **kein** Fehlerindikator, sondern
+bei Reasoning-Modellen, Kaltstart und Rate-Limit-Queues der Normalfall. Gemessen
+wird deshalb die **Chunk-Signatur**, nicht die Latenz.
 
-| Symptom im Betrieb | Ursache | Reaktion |
+Gemessene Größen pro Turn: `chunkCount` (wie viele `read()`-Calls Daten
+lieferten), `firstDeltaMs`, `streamDurationMs` (erster bis letzter Delta),
+`bodyBytes`, und ob Reader/Fetch geworfen hat.
+
+| Klassifikation | Signatur | Reaktion |
 |---|---|---|
-| Deltas kommen alle am Ende auf einmal | Proxy puffert (Content-Length statt chunked) | Endpoint als „buffered" merken, UI stellt um, **kein** erneutes Senden |
-| Verbindung bricht mitten im Stream ab | Middlebox verkorkst Transfer-Encoding | **ein** Retry desselben Turns mit `stream: false`, dann sofort rendern |
-| `Failed to fetch` ohne alles | CORS / Netzwerk | Provider-Fehler, Key prüfen — vom Middlebox-Fall nicht zu unterscheiden |
+| **healthy** | ≥ 2 Chunks **und** `streamDurationMs` > ~200 ms | nichts — läuft normal |
+| **buffered** | 1 Chunk mit dem kompletten Body, oder `streamDurationMs` < ~150 ms bei nicht-trivialer Größe | als `buffered` merken; nach **2 aufeinanderfolgenden** Turn umschalten, sichtbar und umkehrbar |
+| **broken** | Reader wirft, oder `fetch` bricht mitten im Stream ab | **ein** Retry ohne Streaming, siehe Kostenregel unten |
+| **unknown / slow** | bis zu **20 s** keine Bytes, Verbindung aber noch offen | **niemals** automatisch degradieren. „Warte auf das Modell (Ns)" anzeigen + *manuelle* Aktion „ohne Streaming wiederholen" |
 
-- **Passive Erkennung:** kommen nach dem Request ~1,5 s lang keine Deltas, oder
-  kam die Antwort in einem Stück, gilt der Endpoint als `buffered`. Das Ergebnis
-  wird pro `provider + baseURL` gemerkt.
-- **Onboarding-Probe:** einmal beim Einrichten des Endpoints, damit es vor dem
-  ersten echten Turn bekannt ist.
+- **Onboarding-Probe:** einmal beim Einrichten des Endpoints — dieselbe
+  Chunk-Signatur-Messung auf einer winzigen Anfrage.
 - **Sichtbar und dauerhaft:** ein Hinweis, dass Antworten in dieser Umgebung am
-  Stück erscheinen. Ohne den Hinweis hält man die UI für kaputt.
+  Stück erscheinen. Ohne ihn hält man die UI für kaputt.
 - **Fallback-Implementierung:** `generateText` (ohne Stream) →
   `createUIMessageStream` mit synthetischen `text-delta`-Chunks. Kein eigener
   Transport, kein zweiter Codepfad im Loop.
+- **Erkenntnisse werden pro `provider + baseURL` gemerkt**, nicht pro Turn, und
+  in den Settings sichtbar und zurücksetzbar.
+
+**Kostenregel beim Retry — der entscheidende Punkt.** Ein Retry sendet die
+Anfrage erneut. Hat der Provider angefangen zu generieren, wird der erste
+Versuch **trotzdem abgerechnet** — wir würden also für denselben Turn doppelt
+bezahlen, ohne es zu merken. Daraus folgt:
+
+- **Auto-Retry nur bei `broken` mit null empfangenen Bytes** (Verbindung kam
+  nie zustande). Da ist keine Generierung passiert.
+- **Bereits Bytes empfangen und dann Abbruch** ⇒ **kein** Auto-Retry. Wir
+  zeigen den Teiltranscript, markieren den Turn als `interrupted` und lassen
+  den Nutzer entscheiden. Das ist exakt die Recovery aus §6.2.
+- **Maximal ein Auto-Retry pro Turn**, sessionweit protokolliert, damit kein
+  Retry-Schleifen entstehen.
+
 
 ### 5.5 Shell — von „nicht v1" zu „v1 möglich" (revidiert)
 

@@ -24,7 +24,6 @@ import {
   type WorkspaceDescription,
   type WorkspaceKind,
 } from "./directory-workspace.ts";
-import { isDirectoryHandle } from "./paths.ts";
 import { guardHandle } from "./errors.ts";
 
 /** Storage usage against the quota, for the eviction warning in the UI. */
@@ -102,11 +101,6 @@ export async function createOpfsWorkspace(
   const storage = storageManager();
 
   const opfsRoot = await guardHandle(directoryName, "directory", () => storage.getDirectory());
-  // Defensive: the platform already guarantees this, but a workspace with the
-  // wrong root kind would fail much later and much more confusingly.
-  if (!isDirectoryHandle(opfsRoot)) {
-    throw new Error(`The OPFS root is not a directory handle (got "${opfsRoot.kind}").`);
-  }
 
   // `create: true` — the sandbox directory is ours, there is nothing to pick.
   const root = await guardHandle(directoryName, "directory", () =>

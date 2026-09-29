@@ -5,6 +5,7 @@ import {
   createMemoryTodoStore,
   createTodoTool,
   DEFAULT_PRIORITY,
+  defaultTodoStore,
   MAX_TODOS,
   todoInputSchema,
   todoTool,
@@ -248,6 +249,21 @@ describe("todo tool", () => {
     expect(calls).toEqual(["get:s1", "set:s1", "get:s1"]);
     expect(first.changed).toBe(true);
     expect(second.changed).toBe(false);
+  });
+
+  it("ships a working default instance backed by its own store", async () => {
+    const result = await todoTool.execute(ctx, {
+      todos: [{ content: "default instance", status: "in_progress", priority: "high" }],
+    });
+
+    expect(result.changed).toBe(true);
+    expect((await defaultTodoStore.get("default")).map((todo) => todo.content)).toEqual([
+      "default instance",
+    ]);
+    // The second call is a no-op, so the demo store does not grow.
+    const again = await todoTool.execute(ctx, { todos: [...result.todos] });
+    expect(again.changed).toBe(false);
+    expect(await defaultTodoStore.get("default")).toHaveLength(1);
   });
 
   it("falls back to the default session key", async () => {
