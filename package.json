@@ -13,7 +13,8 @@
     "preview": "pnpm --filter @all-the.rest/baah-web preview",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
-    "check": "pnpm typecheck && pnpm test"
+    "check": "pnpm typecheck && pnpm test",
+    "e2e": "pnpm --filter @all-the.rest/baah-web e2e"
   },
   "devDependencies": {
     "typescript": "^7.0.2"

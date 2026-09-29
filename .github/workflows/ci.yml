@@ -1,0 +1,188 @@
+# CI for `baah` — a browser-only harness, so "the tests pass" means three
+# different things and all three are gates:
+#
+#   quality  every package typechecks, every unit test passes, everything builds
+#   e2e      the built app boots in a real browser against a faked provider
+#   ci       the aggregate. It exists so a cancelled run can never be mistaken
+#            for a green one.
+#
+# Deliberately absent: `paths:` filters, `if:` conditions on the e2e job, and
+# `continue-on-error` anywhere. A gate that can be skipped is not a gate.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: this workflow only ever reads the repository.
+permissions:
+  contents: read
+
+# A new push supersedes the run in flight. GitHub reports the cancelled run as
+# cancelled against *its own* commit, never as success, so the superseded
+# commit keeps a red (or neutral) check forever — it is never laundered into a
+# green tick. See the `ci` gate job for the other half of that argument.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: quality (typecheck, unit tests, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # No `version:` input on purpose: the action reads the `packageManager`
+      # field of the root package.json. One source of truth, so the pnpm version
+      # can never drift between the repo and CI.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          # The repo requires node >= 22 (engines.node); 22 is the LTS that
+          # satisfies it.
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and unit test
+        run: pnpm check
+
+      - name: Build
+        run: pnpm build
+
+      - name: Upload the built app
+        uses: actions/upload-artifact@v7
+        with:
+          name: baah-web-dist
+          # Not `apps/web/dist`: this repo's app lives at `packages/baah-web`.
+          path: packages/baah-web/dist
+          # A missing dist must fail the job. With the default ("warn") a build
+          # that produced nothing would still go green and upload an empty
+          # artifact.
+          if-no-files-found: error
+          retention-days: 7
+
+  e2e:
+    name: e2e (Playwright, faked provider, no network)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # No `needs:`, no `if:`, no `continue-on-error`. This job runs on every
+    # push and on every pull request, and a red e2e job is a red pipeline.
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `pnpm check` typechecks each package's own tsconfig, and
+      # `packages/baah-web/tsconfig.json` does not include `e2e/`. This step is
+      # what keeps the suite under the same strict settings as the rest of the
+      # repo (no `any`, `import type` for type-only imports, no `node:` imports)
+      # instead of letting it be transpiled and never checked.
+      - name: Typecheck the e2e suite
+        run: pnpm --filter @all-the.rest/baah-web exec tsc -p e2e/tsconfig.json
+
+      # Playwright's browser binaries land in ~/.cache/ms-playwright and are
+      # version-specific, so the cache is keyed against the lockfile: a
+      # Playwright bump changes the lockfile, which changes the key, which
+      # forces a fresh download instead of silently reusing the wrong build.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright Chromium
+        # `--with-deps` installs the OS libraries too; the cache above only
+        # covers the browser binaries, which is the part that is large and
+        # re-downloadable.
+        run: npx playwright install --with-deps chromium
+        working-directory: packages/baah-web
+
+      # The build and the static server both live in `webServer.command` in
+      # playwright.config.ts, so the artefact under test is the artefact CI
+      # built. `vite preview` serves `dist/` and nothing else: no proxy, no
+      # rewrite, no server in the product.
+      - name: Run the e2e suite
+        run: pnpm e2e
+
+      - name: Upload the Playwright report
+        # `!cancelled()` rather than `failure()`: on a cancelled run there is
+        # still usually a partial report worth having, and uploading it costs
+        # nothing. It never turns a failure into a success.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: test-results
+          retention-days: 7
+
+      - name: Upload traces, screenshots and videos from failures
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-failures
+          path: test-results/artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The aggregate gate.
+  #
+  # `cancel-in-progress: true` above cancels a run when a newer commit arrives.
+  # GitHub marks the cancelled run as cancelled for *that* commit, so the
+  # superseded commit never gets a green tick from the cancelled run. But a
+  # cancelled *job* leaves its aggregate in a state where the surviving green
+  # jobs could be read as "this commit is fine" — a partial result, assembled
+  # from different commits. This job removes that reading: it only succeeds when
+  # both jobs reported exactly `success` for this commit, and `if: always()`
+  # means it runs even when they were cancelled or skipped.
+  #
+  # Branch protection should require this one check, not `quality` and `e2e`
+  # separately.
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs: [quality, e2e]
+    steps:
+      - name: Require both jobs to have succeeded
+        env:
+          QUALITY: ${{ needs.quality.result }}
+          E2E: ${{ needs.e2e.result }}
+        run: |
+          echo "quality = $QUALITY"
+          echo "e2e     = $E2E"
+          if [ "$QUALITY" != "success" ]; then
+            echo "::error::quality did not succeed (result: $QUALITY)"
+            exit 1
+          fi
+          if [ "$E2E" != "success" ]; then
+            echo "::error::e2e did not succeed (result: $E2E)"
+            exit 1
+          fi
+          echo "both jobs succeeded"
