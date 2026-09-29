@@ -566,15 +566,18 @@ describe("walk", () => {
   it("yields the whole tree, depth first", async () => {
     const workspace = walkWorkspace();
     const seen: string[] = [];
-    for await (const entry of workspace.walk(".")) seen.push(entry.path);
+    const walked = workspace.walk(".");
+    for await (const entry of walked.entries) seen.push(entry.path);
 
     expect(seen).toEqual(["a.txt", "sub", "sub/b.txt", "sub/deep", "sub/deep/c.txt"]);
+    expect(walked.truncated).toBe(false);
+    expect(walked.visited).toBe(5);
   });
 
   it("starts at a subdirectory", async () => {
     const workspace = walkWorkspace();
     const seen: string[] = [];
-    for await (const entry of workspace.walk("sub")) seen.push(entry.path);
+    for await (const entry of workspace.walk("sub").entries) seen.push(entry.path);
 
     expect(seen).toEqual(["sub/b.txt", "sub/deep", "sub/deep/c.txt"]);
   });
@@ -582,15 +585,17 @@ describe("walk", () => {
   it("honours maxEntries", async () => {
     const workspace = walkWorkspace();
     const seen: string[] = [];
-    for await (const entry of workspace.walk(".", { maxEntries: 2 })) seen.push(entry.path);
+    const walked = workspace.walk(".", { maxEntries: 2 });
+    for await (const entry of walked.entries) seen.push(entry.path);
 
     expect(seen).toHaveLength(2);
+    expect(walked.truncated).toBe(true);
   });
 
   it("honours the filter and prunes a rejected directory", async () => {
     const workspace = walkWorkspace();
     const seen: string[] = [];
-    for await (const entry of workspace.walk(".", { filter: (e) => e.name !== "sub" })) {
+    for await (const entry of workspace.walk(".", { filter: (e) => e.name !== "sub" }).entries) {
       seen.push(entry.path);
     }
 
@@ -602,12 +607,16 @@ describe("walk", () => {
     const controller = new AbortController();
     const seen: string[] = [];
 
-    for await (const entry of workspace.walk(".", { signal: controller.signal })) {
+    const walked = workspace.walk(".", { signal: controller.signal });
+    for await (const entry of walked.entries) {
       seen.push(entry.path);
       controller.abort();
     }
 
     expect(seen).toHaveLength(1);
+    // The caller stopped it, not the cap. The search tools distinguish the two
+    // in their notes, and that distinction is only possible because of this.
+    expect(walked.truncated).toBe(false);
   });
 
   it("survives a tree deeper than the call stack would", async () => {
@@ -629,7 +638,7 @@ describe("walk", () => {
     const workspace = createFileSystemAccessWorkspace(handle);
 
     let count = 0;
-    for await (const entry of workspace.walk(".")) {
+    for await (const entry of workspace.walk(".").entries) {
       if (entry.path.endsWith("leaf.txt")) count += 1;
     }
 

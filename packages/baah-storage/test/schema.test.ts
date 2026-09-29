@@ -18,7 +18,9 @@ import {
   STEP_CORE_TABLES,
   STEP_FULL_TEXT_INDEX,
   STEP_INDEXES,
+  STEP_TOOL_CALL_IDENTITY,
   TABLE_NAMES,
+  TOOL_INVOCATIONS_TABLE,
 } from "../src/schema.ts";
 
 /** The `CREATE TABLE`/`CREATE VIRTUAL TABLE` name of a statement, if it is one. */
@@ -116,8 +118,20 @@ describe("connection pragmas", () => {
 describe("tables", () => {
   it("creates every table of Plan.md §6.1 plus the delta log and the FTS index", () => {
     // The FTS5 virtual table is a table as far as `sqlite_master` is concerned,
-    // so it belongs in the expected set.
-    expect(new Set(tables)).toEqual(new Set([...TABLE_NAMES, "parts_fts"]));
+    // so it belongs in the expected set. `tool_invocations_v4` is the rebuild's
+    // staging name: it exists only between the `CREATE` and the `RENAME`, and
+    // by the end of the step the database holds `tool_invocations` again.
+    expect(new Set(tables)).toEqual(
+      new Set([
+        ...TABLE_NAMES,
+        "parts_fts",
+        // The rebuild's two staging tables. Both are dropped again inside the
+        // same transaction; they exist only between a `CREATE` and the
+        // statement that removes them.
+        "tool_invocations_v4",
+        "approvals_tool_invocation_v3",
+      ]),
+    );
   });
 
   it("creates each table exactly once", () => {
@@ -131,10 +145,48 @@ describe("tables", () => {
     }
   });
 
-  it("is idempotent — every statement is IF NOT EXISTS", () => {
+  it("is idempotent — every creating statement is IF NOT EXISTS", () => {
+    // Everything except the four statements of the rebuild step, which cannot
+    // carry it: a `DROP TABLE`, an `ALTER … RENAME` and the two that surround
+    // the copy. They are protected by the transaction `applyMigrations()` runs
+    // each step in, which `migrations.test.ts` and the real-SQLite parity test
+    // both measure. Claiming idempotency that does not exist would be worse
+    // than naming the exception.
+    const REBUILD_STATEMENTS = STEP_TOOL_CALL_IDENTITY;
     for (const statement of SCHEMA_STATEMENTS) {
+      if (REBUILD_STATEMENTS.includes(statement)) continue;
       expect(statement).toMatch(/IF NOT EXISTS/i);
     }
+    // The exception is exactly the rebuild. Five of its thirteen statements
+    // create or drop something named (`CREATE TABLE` ×2, `DROP … IF EXISTS`
+    // ×2, the three re-created/new indexes) and carry `IF NOT EXISTS`; the
+    // other eight are the `PRAGMA`, the three `UPDATE`s, the two copies and
+    // the `RENAME`, none of which can.
+    const creating = REBUILD_STATEMENTS.filter((statement) => /IF NOT EXISTS/i.test(statement));
+    expect(creating).toHaveLength(5);
+    expect(REBUILD_STATEMENTS.filter((statement) => !/IF NOT EXISTS/i.test(statement)))
+      .toHaveLength(8);
+  });
+
+  it("declares the live tool_invocations shape in the rebuild step", () => {
+    // `STEP_CORE_TABLES` is a *released* migration and may not be edited, so it
+    // still describes `tool_invocations` as it was before the call key. The
+    // live shape is the rebuild, exported on its own so the two cannot drift.
+    const live = TOOL_INVOCATIONS_TABLE.replace("tool_invocations_v4", "tool_invocations");
+    expect(STEP_TOOL_CALL_IDENTITY).toContain(TOOL_INVOCATIONS_TABLE);
+
+    const columns = columnsOf(live);
+    // The four-part call key has to be *columns*, not just key computation:
+    // `Plan.md` §6.1 allows the latter, but a key the database cannot enforce
+    // is a key the in-memory backend and SQLite would disagree about.
+    for (const column of ["tool_call_id", "attempt", "occurrence", "output"]) {
+      expect(columns, column).toContain(column);
+    }
+    // And the status is `begun | done` — the crash window, made representable.
+    expect(live).toMatch(/status\s+TEXT\s+NOT NULL CHECK \(status IN \('begun', 'done'\)\)/);
+    expect(live).toMatch(
+      /UNIQUE \(session_id, attempt, tool_call_id, occurrence\)/,
+    );
   });
 
   it("declares the columns the typed helpers read", () => {
@@ -189,7 +241,8 @@ describe("tables", () => {
   it("keeps the rest of §6.1 intact", () => {
     expect(columnsOf(tableDdl("turns"))).toContain("heartbeat_at");
     expect(columnsOf(tableDdl("turns"))).toContain("lease_owner");
-    expect(columnsOf(tableDdl("tool_invocations"))).toContain("call_part_id");
+    // The *live* `tool_invocations`, which is the rebuild, not the frozen step.
+    expect(columnsOf(TOOL_INVOCATIONS_TABLE)).toContain("call_part_id");
     expect(columnsOf(tableDdl("approvals"))).toContain("decision");
     expect(columnsOf(tableDdl("todos"))).toContain("priority");
     expect(columnsOf(tableDdl("workspaces"))).toContain("root_handle_id");
@@ -243,7 +296,8 @@ describe("constraints", () => {
       file_handles: "workspaces",
     };
     for (const [child, parent] of Object.entries(cascades)) {
-      expect(tableDdl(child), `${child} must cascade from ${parent}`).toContain(
+      const ddl = child === "tool_invocations" ? TOOL_INVOCATIONS_TABLE : tableDdl(child);
+      expect(ddl, `${child} must cascade from ${parent}`).toContain(
         `REFERENCES ${parent}(id) ON DELETE CASCADE`,
       );
     }
@@ -282,13 +336,29 @@ describe("full-text index", () => {
 
 describe("indexes", () => {
   it("creates exactly the declared index set", () => {
-    const created = STEP_INDEXES.map((statement) => {
-      const match = /CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)/i.exec(statement);
-      if (match?.[1] === undefined) throw new Error(`Index name not found in: ${statement}`);
-      return match[1];
-    });
+    // Step 3 creates the eleven, and the rebuild step re-creates the two that
+    // died with the old table plus one for the new key. `INDEX_NAMES` lists
+    // all thirteen, and no statement is allowed to create a name that is not
+    // on that list.
+    const created = [...STEP_INDEXES, ...STEP_TOOL_CALL_IDENTITY]
+      .filter((statement) => /CREATE\s+INDEX/i.test(statement))
+      .map((statement) => {
+        const match = /CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)/i.exec(statement);
+        if (match?.[1] === undefined) throw new Error(`Index name not found in: ${statement}`);
+        return match[1];
+      });
+    // A rebuild re-creates two of them on purpose; the *final* set is what the
+    // database ends up with.
     expect(new Set(created)).toEqual(new Set(INDEX_NAMES));
-    expect(created.length).toBe(new Set(created).size);
+    expect(new Set(STEP_INDEXES.map((s) => /EXISTS\s+(\w+)/i.exec(s)?.[1] ?? "")))
+      .toEqual(new Set(INDEX_NAMES.filter((name) => name !== "idx_tool_invocations_call_key")));
+  });
+
+  it("indexes the replay lookup in the order the key is written", () => {
+    const statement = STEP_TOOL_CALL_IDENTITY.find((entry) =>
+      entry.includes("idx_tool_invocations_call_key"),
+    );
+    expect(statement).toContain("(session_id, attempt, tool_call_id, occurrence)");
   });
 
   it("indexes the reload check: streaming turns by heartbeat", () => {

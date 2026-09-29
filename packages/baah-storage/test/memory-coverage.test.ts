@@ -142,6 +142,39 @@ const IMPLEMENTED: {
     needsSeed: true,
     run: (db) => db.search({ query: "x", sessionId: "s1", limit: 10 }),
   },
+  {
+    name: "INSERT_TURN",
+    statement: sql.INSERT_TURN,
+    // The turn needs a session (a foreign key), but not a turn.
+    needsSeed: true,
+    run: (db) => db.appendTurn({ id: "t1", sessionId: "s1", startedAt: T0 }),
+  },
+  {
+    name: "SELECT_UNFINISHED_TURNS",
+    statement: sql.SELECT_UNFINISHED_TURNS,
+    needsSeed: true,
+    run: (db) => db.listUnfinishedTurns({ sessionId: "s1" }),
+  },
+  {
+    name: "INSERT_TOOL_INVOCATION_BEGUN",
+    statement: sql.INSERT_TOOL_INVOCATION_BEGUN,
+    needsSeed: true,
+    run: (db) =>
+      db.beginToolCall({ key: { sessionId: "s1", attempt: 1, toolCallId: "c1", occurrence: 0 }, toolName: "read", input: {} }),
+  },
+  {
+    name: "UPSERT_TOOL_INVOCATION_DONE",
+    statement: sql.UPSERT_TOOL_INVOCATION_DONE,
+    needsSeed: true,
+    run: (db) =>
+      db.recordToolCall({ key: { sessionId: "s1", attempt: 1, toolCallId: "c2", occurrence: 0 }, toolName: "read", output: {} }),
+  },
+  {
+    name: "SELECT_TOOL_CALL",
+    statement: sql.SELECT_TOOL_CALL,
+    needsSeed: true,
+    run: (db) => db.getToolCall({ sessionId: "s1", attempt: 1, toolCallId: "c1", occurrence: 0 }),
+  },
 ];
 
 /** A database with one session, one message and one part. */
@@ -162,11 +195,39 @@ async function seeded(): Promise<MemoryDatabase> {
  * a new fragment cannot slip in unnoticed: the test below fails unless it is
  * classified here.
  */
-const NOT_A_STATEMENT = new Set(["sessionParams", "messageParams", "partParams", "searchSql"]);
+const NOT_A_STATEMENT = new Set([
+  "sessionParams",
+  "messageParams",
+  "partParams",
+  "searchSql",
+  "turnParams",
+  "toolCallKeyParams",
+]);
+
+/**
+ * String exports of `sql.ts` that are *fragments* rather than statements: the
+ * column lists and the call-key predicate. They are interpolated into the
+ * statements above and are never sent on their own, so they have no in-memory
+ * driver — and, like the parameter builders, a new one has to be classified
+ * here or this file's contract stops being complete.
+ */
+const NOT_A_STATEMENT_STRING = new Set([
+  "SESSION_COLUMNS",
+  "MESSAGE_COLUMNS",
+  "PART_COLUMNS",
+  "TURN_COLUMNS",
+  "TOOL_INVOCATION_COLUMNS",
+  "TOOL_CALL_KEY_PREDICATE",
+]);
 
 function statementExports(): string[] {
   return Object.entries(sql)
-    .filter(([name, value]) => typeof value === "string" && !name.endsWith("COLUMNS"))
+    .filter(
+      ([name, value]) =>
+        typeof value === "string" &&
+        !name.endsWith("COLUMNS") &&
+        !NOT_A_STATEMENT_STRING.has(name),
+    )
     .map(([, value]) => canonical(value as string));
 }
 
@@ -214,9 +275,22 @@ describe("the in-memory engine implements every statement the operations layer r
     for (const name of NOT_A_STATEMENT) {
       expect(typeof (sql as Record<string, unknown>)[name], name).toBe("function");
     }
-    // The three column lists are fragments, not statements: they are
-    // interpolated into the ones above and are never sent on their own.
-    for (const name of ["SESSION_COLUMNS", "MESSAGE_COLUMNS", "PART_COLUMNS"]) {
+    // The string fragments are not statements either: they are interpolated
+    // into the ones above and never sent on their own. Classified the same way
+    // as the parameter builders, and asserted the same way — a new fragment
+    // cannot slip in unclassified.
+    const unclassifiedStrings = Object.entries(sql)
+      .filter(([name, value]) => typeof value === "string" && !name.endsWith("COLUMNS"))
+      .map(([name]) => name)
+      .filter((name) => !NOT_A_STATEMENT_STRING.has(name));
+    expect(unclassifiedStrings.sort()).toEqual(statementExports().length > 0 ? unclassifiedStrings.sort() : []);
+    expect(
+      Object.entries(sql)
+        .filter(([name]) => name.endsWith("COLUMNS"))
+        .map(([name]) => name)
+        .every((name) => NOT_A_STATEMENT_STRING.has(name)),
+    ).toBe(true);
+    for (const name of NOT_A_STATEMENT_STRING) {
       expect(typeof (sql as Record<string, unknown>)[name], name).toBe("string");
     }
   });
@@ -244,19 +318,29 @@ describe("the in-memory engine refuses what it cannot do", () => {
     // backend. A fresh memory database is at the current schema by definition.
     const db = createMemoryDatabase();
     expect(db.kind).toBe("memory");
-    expect(db.counts()).toEqual({ sessions: 0, messages: 0, parts: 0, partDeltas: 0 });
+    expect(db.counts()).toEqual({
+      sessions: 0,
+      turns: 0,
+      messages: 0,
+      parts: 0,
+      partDeltas: 0,
+      toolInvocations: 0,
+    });
   });
 
-  it("does not hold rows for the tables no public helper touches", () => {
-    // turns, tool_invocations, approvals, todos, workspaces, file_handles and
-    // settings have no typed operation yet. Wave 2 adds them together with
-    // their helpers; until then the memory backend has no store for them.
+  it("holds rows for exactly the tables a public helper can write", () => {
+    // `turns` and `tool_invocations` joined the list: they gained typed
+    // operations (`appendTurn` / `listUnfinishedTurns` and `beginToolCall` /
+    // `recordToolCall` / `getToolCall`). What is still absent is what has none:
+    // approvals, todos, workspaces, file_handles and settings.
     const db = createMemoryDatabase();
     expect(Object.keys(db.counts()).sort()).toEqual([
       "messages",
       "partDeltas",
       "parts",
       "sessions",
+      "toolInvocations",
+      "turns",
     ]);
   });
 

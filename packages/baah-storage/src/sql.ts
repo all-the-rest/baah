@@ -9,7 +9,14 @@
  * client never has to re-read what it just wrote.
  */
 
-import type { MessageInput, PartInput, SessionInput, SqlParam } from "./types.ts";
+import type {
+  MessageInput,
+  PartInput,
+  SessionInput,
+  SqlParam,
+  ToolCallKey,
+  TurnInput,
+} from "./types.ts";
 
 /** Column list, aliased to the camelCase field names of `Session`. */
 export const SESSION_COLUMNS = `
@@ -35,6 +42,28 @@ export const PART_COLUMNS = `
   created_at AS createdAt,
   updated_at AS updatedAt
 `;
+
+export const TURN_COLUMNS = `
+  id, session_id AS sessionId, seq, status, lease_owner AS leaseOwner,
+  heartbeat_at AS heartbeatAt,
+  started_at AS startedAt,
+  finished_at AS finishedAt,
+  error
+`;
+
+export const TOOL_INVOCATION_COLUMNS = `
+  id, session_id AS sessionId, message_id AS messageId,
+  call_part_id AS callPartId, result_part_id AS resultPartId,
+  tool_name AS toolName, tool_call_id AS toolCallId, attempt, occurrence,
+  args, status, output, result_preview AS resultPreview, error,
+  started_at AS startedAt,
+  finished_at AS finishedAt,
+  created_at AS createdAt,
+  updated_at AS updatedAt
+`;
+
+/** The `UNIQUE` key of `tool_invocations`, in column order. */
+export const TOOL_CALL_KEY_PREDICATE = `session_id = ? AND attempt = ? AND tool_call_id = ? AND occurrence = ?`;
 
 /**
  * `archived_at` is bound, not hardcoded: §6.1's CHECK says an archived session
@@ -223,3 +252,130 @@ export const FLUSH_DELTA_LOG_SQL = `
  */
 export const SELECT_DELTA_SEQ = `
   SELECT seq FROM part_deltas WHERE id = ? ORDER BY seq DESC LIMIT 1`;
+
+/* ------------------------------------------------------------------ */
+/* Turns and tool invocations                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `seq` is `MAX(seq) + 1` over the session, same rule as messages: two turns
+ * created in the same millisecond must still have a defined order, and
+ * `started_at` is display only (§6.2).
+ */
+export const INSERT_TURN = `
+  INSERT INTO turns
+    (id, session_id, seq, status, lease_owner, heartbeat_at, started_at, finished_at, error)
+  VALUES (
+    ?, ?,
+    COALESCE(?, (SELECT COALESCE(MAX(seq), -1) + 1 FROM turns WHERE session_id = ?)),
+    ?, ?, ?, ?, ?, ?
+  )
+  RETURNING ${TURN_COLUMNS}`;
+
+/**
+ * The reload anchor: everything that is not finished.
+ *
+ * `status NOT IN ('succeeded', 'failed')` is the definition the engine uses —
+ * a turn is unfinished while it is *neither*, so `interrupted` is included
+ * alongside `pending` and `streaming`. Writing it as a positive list of the two
+ * finished states means a status added to the CHECK later is unfinished by
+ * default, which is the direction that can be recovered from.
+ *
+ * `COALESCE(heartbeat_at, started_at)`: a turn that was created and never
+ * started has no heartbeat, and reporting it as "infinitely stale" would close
+ * a turn that may have been created a moment ago. Its own start is the honest
+ * answer, and the engine's 30 s threshold then applies to that.
+ */
+export const SELECT_UNFINISHED_TURNS = `
+  SELECT
+    id            AS turnId,
+    COALESCE(heartbeat_at, started_at) AS heartbeatAt,
+    started_at    AS startedAt
+  FROM turns
+  WHERE session_id = ? AND status NOT IN ('succeeded', 'failed')
+  ORDER BY seq ASC`;
+
+/**
+ * `beginToolCall`: write "may have run", and change nothing if the key is
+ * taken.
+ *
+ * `ON CONFLICT … DO NOTHING` rather than `DO UPDATE`, and the distinction
+ * matters: a `DO UPDATE` that wrote `status` would **downgrade a `done` record
+ * to `begun`**, and the next replay would then refuse to short-circuit a call
+ * that has already run — re-introducing, through the repair path, exactly the
+ * corruption this column exists to prevent. So the only writer of `begun` is
+ * the insert.
+ *
+ * `RETURNING` is absent for the same reason: a conflicting insert reports no
+ * row, and the caller reads the truth back with {@link SELECT_TOOL_CALL}.
+ */
+export const INSERT_TOOL_INVOCATION_BEGUN = `
+  INSERT INTO tool_invocations
+    (id, session_id, message_id, call_part_id, result_part_id, tool_name,
+     tool_call_id, attempt, occurrence, args, status, output, result_preview,
+     error, started_at, finished_at, created_at, updated_at)
+  VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, 'begun', NULL, NULL, NULL, ?, NULL, ?, ?)
+  ON CONFLICT (session_id, attempt, tool_call_id, occurrence) DO NOTHING`;
+
+/**
+ * `recordToolCall`: the call ran, and this is what it returned.
+ *
+ * An upsert, not an `UPDATE`, because the `begin` write is the one that can be
+ * lost: the engine fires it before the tool and the record after. If the
+ * process dies in between there is no row to update, and refusing to write one
+ * would discard the only claim the engine *can* back up — the tool really did
+ * return this. `args` stays NULL on that path: nobody passed the input, and
+ * inventing it would be worse than admitting it.
+ *
+ * `result_preview` gets a bounded copy for the UI; `output` gets the exact
+ * value, because a replay hands `output` back to the model as the tool's
+ * answer and a truncated string there is a lie about what the tool returned.
+ */
+export const UPSERT_TOOL_INVOCATION_DONE = `
+  INSERT INTO tool_invocations
+    (id, session_id, message_id, call_part_id, result_part_id, tool_name,
+     tool_call_id, attempt, occurrence, args, status, output, result_preview,
+     error, started_at, finished_at, created_at, updated_at)
+  VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, NULL, 'done', ?, ?, NULL, ?, ?, ?, ?)
+  ON CONFLICT (session_id, attempt, tool_call_id, occurrence) DO UPDATE SET
+    tool_name      = excluded.tool_name,
+    status         = 'done',
+    output         = excluded.output,
+    result_preview = excluded.result_preview,
+    finished_at    = excluded.finished_at,
+    updated_at     = excluded.updated_at
+  RETURNING ${TOOL_INVOCATION_COLUMNS}`;
+
+/**
+ * The replay lookup, and the only read that decides whether a tool re-runs.
+ *
+ * It projects `status` and `output` and nothing else: the engine needs to know
+ * *which* of the two states the call is in and, for `done`, what it returned.
+ * Reading a full row here would tempt a caller to branch on `result_preview` or
+ * `finished_at`, and those are display fields that do not decide anything.
+ */
+export const SELECT_TOOL_CALL = `
+  SELECT status, output FROM tool_invocations
+  WHERE ${TOOL_CALL_KEY_PREDICATE}
+  LIMIT 1`;
+
+/** The key's positional parameters, in the order every statement above wants. */
+export function toolCallKeyParams(key: ToolCallKey): SqlParam[] {
+  return [key.sessionId, key.attempt, key.toolCallId, key.occurrence];
+}
+
+/** Positional parameters for {@link INSERT_TURN}. */
+export function turnParams(input: TurnInput): SqlParam[] {
+  return [
+    input.id,
+    input.sessionId,
+    input.seq ?? null,
+    input.sessionId,
+    input.status ?? "pending",
+    input.leaseOwner ?? null,
+    input.heartbeatAt ?? null,
+    input.startedAt,
+    input.finishedAt ?? null,
+    input.error ?? null,
+  ];
+}

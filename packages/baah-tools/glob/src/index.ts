@@ -1,8 +1,10 @@
 import {
   assertInsideRoot,
+  DEFAULT_MAX_ENTRIES,
   defineTool,
   relativePath,
   ToolError,
+  walkMayBeIncomplete,
   type DirEntry,
 } from "@all-the.rest/baah-core";
 import { createIgnoreFilter } from "@all-the.rest/baah-core/ignore";
@@ -11,20 +13,6 @@ import { z } from "zod";
 
 /** Default number of paths returned per call (reference: `DEFAULT_SEARCH_LIMIT`). */
 export const DEFAULT_GLOB_LIMIT = 100;
-
-/**
- * Mirror of `baah-core`'s `DEFAULT_MAX_ENTRIES` — the number of entries
- * `Workspace.walk` yields before it gives up (`packages/baah-core/src/
- * workspace.ts:214`, `workspace/directory-workspace.ts:77`).
- *
- * **Stopgap.** `walk` returns `AsyncIterable<DirEntry>` and cannot say "I
- * stopped early", so the only way to notice the cap from here is to count the
- * entries that came out. That is a duplicated limit constant, and it is
- * conservative in the safe direction: a workspace with exactly this many
- * entries is reported as possibly-incomplete. It is replaced by a
- * `walkTruncated` flag on the walk itself — see the report.
- */
-export const WALK_ENTRY_LIMIT = 50_000;
 
 export const globInputSchema = z.object({
   pattern: z
@@ -76,10 +64,13 @@ export interface GlobOutput {
   /** `true` when `limit` cut the list, i.e. the search itself was complete. */
   truncated: boolean;
   /**
-   * `true` when the walk stopped at its entry cap, so `total` and `files`
+   * `true` when the walk did not see every entry, so `total` and `files`
    * cover only the part of the tree that was visited. An empty result with
    * `searchTruncated: false` means "no match in what I looked at"; with `true`
    * it means "I stopped looking".
+   *
+   * Deliberately over-reporting: a workspace of exactly the walk's entry cap
+   * sets it, although that walk saw everything. See `walkMayBeIncomplete`.
    */
   searchTruncated: boolean;
   /** Model-facing explanation: why the list is short or empty. */
@@ -100,7 +91,7 @@ function buildHint(
     return (
       `These ${shown} of ${total} matches do not cover the whole tree: the walk ` +
       "stopped before it had seen every entry (an abort, or the " +
-      `${WALK_ENTRY_LIMIT}-entry cap). Narrow \`path\` and search a subtree — this ` +
+      `${DEFAULT_MAX_ENTRIES}-entry cap). Narrow \`path\` and search a subtree — this ` +
       "is not a complete answer."
     );
   }
@@ -149,33 +140,31 @@ export const globTool = defineTool<GlobInput, GlobOutput>({
     const files: string[] = [];
     const notes: string[] = [];
     let total = 0;
-    let visited = 0;
-    // Set by the two checks below: the walk-cap check inside the loop, and the
-    // post-loop abort check. There is no initial value on purpose — a partial
-    // result is a *fact about the loop*, never about the state of a signal read
-    // before it.
-    let searchTruncated = false;
-    for await (const entry of context.workspace.walk(path, {
+    // The walk owns the answer to "did you see everything?". This tool no
+    // longer counts entries and no longer knows the cap: both used to be
+    // duplicated here and both drifted apart from core.
+    const walk = context.workspace.walk(path, {
       signal: context.signal,
       filter: (candidate: DirEntry) => !isIgnored(candidate.path, candidate.kind),
-    })) {
-      visited += 1;
+    });
+    for await (const entry of walk.entries) {
       if (entry.kind === "file" && isMatch(relativePath(path, entry.path))) {
         total += 1;
         if (files.length < limit) files.push(entry.path);
       }
-      // `Workspace.walk` yields exactly `WALK_ENTRY_LIMIT` entries before it
-      // returns, so reaching that count means the walk may have been cut here:
-      // everything after this point was never looked at. The entry that hits
-      // the count is still processed — it *was* yielded.
-      if (visited >= WALK_ENTRY_LIMIT) {
-        searchTruncated = true;
-        notes.push(
-          `The workspace walk stopped at its ${WALK_ENTRY_LIMIT}-entry cap; ` +
-            "entries after that point were never visited.",
-        );
-        break;
-      }
+    }
+    // The conservative reading, from the module that knows the cap. A walk that
+    // finished *exactly* at the cap is reported here even though it saw
+    // everything: the direction of the error is deliberately one-way, because a
+    // model that is told "possibly incomplete" once too often learns to ignore
+    // the field, and one told "complete" too often acts on a search that was
+    // not.
+    let searchTruncated = walkMayBeIncomplete(walk);
+    if (walk.truncated) {
+      notes.push(
+        `The workspace walk stopped at its ${DEFAULT_MAX_ENTRIES}-entry cap; ` +
+          "entries after that point were never visited.",
+      );
     }
     // An abort that lands during the walk ends the iteration without yielding
     // the rest. `walk` checks the signal at the top of each step, so this is

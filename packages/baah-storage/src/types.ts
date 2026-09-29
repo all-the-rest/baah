@@ -105,13 +105,70 @@ export type StreamStatus =
   | "failed"
   | "aborted";
 
-export type ToolInvocationStatus =
-  | "pending"
-  | "awaiting_approval"
-  | "running"
-  | "completed"
-  | "failed"
-  | "aborted";
+/**
+ * `tool_invocations.status` (`Plan.md` §6.1 as refined).
+ *
+ * Exactly two values, and the pair is the whole point. The column used to hold
+ * a six-value lifecycle vocabulary that neither of the two writers could use
+ * honestly: `beginToolCall` runs *before* the tool and `recordToolCall`
+ * *after*, so "began, outcome unknown" had no representation — and in a crash
+ * window between the two, the only answer a store could give was "never ran",
+ * which re-runs the tool. For a `write` tool that is not a retry but a second
+ * append to the user's file (measured: `log === ["x", "x"]` against a
+ * transcript showing one write).
+ *
+ * `done` is the only state that short-circuits a replay.
+ */
+export type ToolInvocationStatus = "begun" | "done";
+
+/**
+ * The four-part identity a recorded tool call is keyed by
+ * (`Plan.md` §6.1, `agent/tools.ts#ToolCallKey`).
+ *
+ * Structurally identical to the engine's own type on purpose: `AGENTS.md` §4
+ * forbids a pointer from core to storage, so the two cannot share a
+ * declaration, and a *structural* match is what lets `StorageDatabase` be
+ * handed to the engine as its `TurnStore` without an adapter that could drift.
+ * Every component closes a measured failure:
+ *
+ * | part | failure without it |
+ * |---|---|
+ * | `sessionId` | two sessions that mint the same id share one record |
+ * | `attempt` | a retry is a new turn; the old record silences a legitimate call |
+ * | `toolCallId` | — the provider's own id, the only half that identifies anything |
+ * | `occurrence` | a provider that reuses an id twice loses the second call, silently |
+ */
+export interface ToolCallKey {
+  sessionId: string;
+  /** 1-based attempt number, so a retry's records stay its own. */
+  attempt: number;
+  toolCallId: string;
+  /** 0-based: how many calls with this id have already begun in this attempt. */
+  occurrence: number;
+}
+
+/**
+ * What is known about a recorded call — and the status is the type.
+ *
+ * A union rather than a field, so reading `output` off a `begun` record is a
+ * compile error instead of a runtime `undefined` that a caller forwards to the
+ * model as if it were the tool's answer.
+ */
+export type ToolCallRecord = { status: "begun" } | { status: "done"; output: unknown };
+
+/** A turn a reload may have left open (`Plan.md` §6.1). */
+export interface UnfinishedTurn {
+  turnId: string;
+  /**
+   * The `heartbeat_at` the writer last renewed, ISO-8601 (`AGENTS.md` §5).
+   * Falls back to `started_at` when the turn never got a heartbeat — a turn
+   * that has not been touched is not *more* alive than one that has, and
+   * `heartbeatAgeMs` reads an unparsable value as maximally stale, which is
+   * the recoverable direction.
+   */
+  heartbeatAt: string;
+  startedAt: string;
+}
 
 /** `Plan.md` §7.5 — deliberately only three values. */
 export type ApprovalDecision = "once" | "always" | "reject";
@@ -204,8 +261,16 @@ export interface ToolInvocation {
   callPartId: string | null;
   resultPartId: string | null;
   toolName: string;
+  /** Part of {@link ToolCallKey}, and part of the table's `UNIQUE`. */
+  toolCallId: string;
+  attempt: number;
+  occurrence: number;
   args: string | null;
+  /** `begun` = may have run. `done` = ran, and `output` is its answer. */
   status: ToolInvocationStatus;
+  /** JSON text of the exact output, or NULL when there was none. */
+  output: string | null;
+  /** Display copy; may be shortened. Never replayed. */
   resultPreview: string | null;
   error: string | null;
   startedAt: string | null;
@@ -325,6 +390,49 @@ export interface PartInput {
 }
 
 /**
+ * A turn row.
+ *
+ * `status` is part of the input rather than being derived, so a turn can be
+ * written as already finished — which is what `listUnfinishedTurns` has to be
+ * able to exclude, and what a restart replay of a completed turn needs.
+ */
+export interface TurnInput {
+  id: string;
+  sessionId: string;
+  startedAt: string;
+  /** Assigned as `MAX(seq) + 1` within the session when omitted (`Plan.md` §6.2). */
+  seq?: number;
+  status?: TurnStatus;
+  leaseOwner?: string | null;
+  /** ISO-8601. `null` means "never renewed". */
+  heartbeatAt?: string | null;
+  finishedAt?: string | null;
+  error?: string | null;
+}
+
+/**
+ * "This call is about to run."
+ *
+ * Written **before** the tool executes. Afterwards would only record "ran
+ * successfully", which leaves a crash in between indistinguishable from
+ * "never ran" — and a tool that re-runs in that window writes twice, asks
+ * twice, or overwrites a newer `todo` list with a stale one while reporting a
+ * change that never happened.
+ */
+export interface BeginToolCallInput {
+  key: ToolCallKey;
+  toolName: string;
+  input: unknown;
+}
+
+/** "This call ran, and here is what it returned." */
+export interface RecordToolCallInput {
+  key: ToolCallKey;
+  toolName: string;
+  output: unknown;
+}
+
+/**
  * One buffered streaming flush (`Plan.md` §6.2): a short transaction that
  * upserts the part and appends to the delta log.
  */
@@ -410,6 +518,55 @@ export interface StorageDatabase {
   listParts(messageId: string): Promise<Part[]>;
 
   flushDelta(input: FlushDeltaInput): Promise<FlushDeltaResult>;
+
+  /* ---------------------------------------------------------------- */
+  /* The turn anchor and the replay key                              */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The write half of the reload anchor.
+   *
+   * `listUnfinishedTurns` is the read; without a way to write a turn there is
+   * nothing to read, and no way to test the threshold the engine applies.
+   * `seq` is allocated per session like every other table (§6.2), because the
+   * turn order is `seq` and never `started_at`.
+   */
+  appendTurn(input: TurnInput): Promise<Turn>;
+  /**
+   * Every turn of a session that is neither `succeeded` nor `failed`
+   * (Plan.md §6.1 — the reload/interrupt anchor).
+   *
+   * Ordered by `seq`. A caller measures `heartbeatAt` against its own clock
+   * and decides what to do; this never closes a turn by itself, because a
+   * fresh heartbeat means somebody *else* is still working on it.
+   */
+  listUnfinishedTurns(input: { sessionId: string }): Promise<UnfinishedTurn[]>;
+
+  /**
+   * Record "may have run", keyed on the full {@link ToolCallKey}.
+   *
+   * Idempotent: a second `begin` for a key that already exists leaves the row
+   * alone, and in particular never downgrades a `done` record to `begun`.
+   */
+  beginToolCall(input: BeginToolCallInput): Promise<void>;
+  /**
+   * Record "ran, and here is the output" under the same key.
+   *
+   * Upserts: a call whose `begin` never landed is still recorded, because the
+   * only claim being made is one the engine can back up — the tool returned
+   * this.
+   */
+  recordToolCall(input: RecordToolCallInput): Promise<void>;
+  /**
+   * The record of a call, or `undefined` if it was never begun.
+   *
+   * **The status is the point.** Absent it, a row written by `beginToolCall`
+   * and a row written by `recordToolCall` both read back as "no record", and
+   * "began, outcome unknown" is *unrepresentable* — which is precisely the
+   * case in which re-running corrupts the user's files. `status: "done"` is
+   * the only state that short-circuits.
+   */
+  getToolCall(key: ToolCallKey): Promise<ToolCallRecord | undefined>;
 
   close(): Promise<void>;
 }

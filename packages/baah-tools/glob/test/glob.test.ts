@@ -1,4 +1,4 @@
-import { createMemoryWorkspace, type ToolContext } from "@all-the.rest/baah-core";
+import { createMemoryWorkspace, type ToolContext, type Workspace } from "@all-the.rest/baah-core";
 import { describe, expect, it, vi } from "vitest";
 
 import { globTool } from "../src/index.ts";
@@ -252,14 +252,27 @@ describe("glob tool", () => {
     };
     const base = createMemoryWorkspace(tree);
     let seen = 0;
-    const workspace = {
+    const workspace: Workspace = {
       ...base,
-      async *walk(directory = ".", options = {}) {
-        for await (const entry of base.walk(directory, options)) {
-          seen += 1;
-          if (seen === 3) controller.abort();
-          yield entry;
-        }
+      walk(directory = ".", options = {}) {
+        const inner = base.walk(directory, options);
+        return {
+          entries: {
+            async *[Symbol.asyncIterator]() {
+              for await (const entry of inner.entries) {
+                seen += 1;
+                if (seen === 3) controller.abort();
+                yield entry;
+              }
+            },
+          },
+          get truncated() {
+            return inner.truncated;
+          },
+          get visited() {
+            return inner.visited;
+          },
+        };
       },
     };
 

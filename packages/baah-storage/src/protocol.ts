@@ -310,6 +310,74 @@ export const partRowSchema = z.object({
   updatedAt: z.string(),
 });
 
+const turnStatusSchema = z.enum([
+  "pending",
+  "streaming",
+  "succeeded",
+  "failed",
+  "interrupted",
+]);
+
+/** `begun | done` — see `ToolInvocationStatus` in `types.ts` for why. */
+const toolInvocationStatusSchema = z.enum(["begun", "done"]);
+
+export const turnRowSchema = z.object({
+  id: z.string(),
+  sessionId: z.string(),
+  seq: z.number().int(),
+  status: turnStatusSchema,
+  leaseOwner: z.string().nullable(),
+  heartbeatAt: z.string().nullable(),
+  startedAt: z.string(),
+  finishedAt: z.string().nullable(),
+  error: z.string().nullable(),
+});
+
+export const toolInvocationRowSchema = z.object({
+  id: z.string(),
+  sessionId: z.string(),
+  messageId: z.string().nullable(),
+  callPartId: z.string().nullable(),
+  resultPartId: z.string().nullable(),
+  toolName: z.string(),
+  toolCallId: z.string(),
+  attempt: z.number().int(),
+  occurrence: z.number().int(),
+  args: z.string().nullable(),
+  status: toolInvocationStatusSchema,
+  output: z.string().nullable(),
+  resultPreview: z.string().nullable(),
+  error: z.string().nullable(),
+  startedAt: z.string().nullable(),
+  finishedAt: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+
+/**
+ * What the replay lookup reads back.
+ *
+ * `output` is the JSON *text* the column holds, not a parsed value: the storage
+ * layer never parses JSON columns (see the note at the top of `types.ts`), and
+ * a row that came back unparsable has to be an error the caller sees rather
+ * than a silent `undefined` handed to the model as a tool's answer.
+ */
+export const toolCallRowSchema = z.object({
+  status: toolInvocationStatusSchema,
+  output: z.string().nullable(),
+});
+
+/** The projection of `SELECT_UNFINISHED_TURNS`. */
+export const unfinishedTurnRowSchema = z.object({
+  turnId: z.string(),
+  heartbeatAt: z.string(),
+  startedAt: z.string(),
+});
+
 export type SessionRow = z.infer<typeof sessionRowSchema>;
 export type MessageRow = z.infer<typeof messageRowSchema>;
 export type PartRow = z.infer<typeof partRowSchema>;
+export type TurnRow = z.infer<typeof turnRowSchema>;
+export type ToolInvocationRow = z.infer<typeof toolInvocationRowSchema>;
+export type ToolCallRow = z.infer<typeof toolCallRowSchema>;
+export type UnfinishedTurnRow = z.infer<typeof unfinishedTurnRowSchema>;

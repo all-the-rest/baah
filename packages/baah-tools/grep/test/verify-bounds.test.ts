@@ -217,11 +217,24 @@ describe("the scanner honours the abort signal", () => {
     const base = createMemoryWorkspace({ "big.ts": `hit\n${"x".repeat(MAX_FILE_BYTES)}` });
     const workspace: Workspace = {
       ...base,
-      async *walk(directory = ".", options = {}) {
-        for await (const entry of base.walk(directory, options)) {
-          const { size: _size, ...rest } = entry;
-          yield rest;
-        }
+      walk(directory = ".", options = {}) {
+        const inner = base.walk(directory, options);
+        return {
+          entries: {
+            async *[Symbol.asyncIterator]() {
+              for await (const entry of inner.entries) {
+                const { size: _size, ...rest } = entry;
+                yield rest;
+              }
+            },
+          },
+          get truncated() {
+            return inner.truncated;
+          },
+          get visited() {
+            return inner.visited;
+          },
+        };
       },
       async readText(path) {
         const content = await base.readText(path);

@@ -20,12 +20,14 @@
 
 import { dirnamePath } from "../path.ts";
 import {
+  DEFAULT_MAX_ENTRIES,
   isWorkspaceRoot,
   WorkspaceError,
   type DirEntry,
   type FileStat,
   type RemoveOptions,
   type WalkOptions,
+  type WalkResult,
   type Workspace,
 } from "../workspace.ts";
 import { guardHandle, isMissingError, translateHandleError } from "./errors.ts";
@@ -73,8 +75,6 @@ export interface DirectoryWorkspaceOptions {
 }
 
 const DEFAULT_MAX_OPEN_FILE_HANDLES = 16;
-/** Same default as `createMemoryWorkspace`, so both behave alike. */
-const DEFAULT_MAX_ENTRIES = 50_000;
 
 function toDirEntry(handle: FileSystemHandle, path: string): DirEntry {
   return { path, name: handle.name, kind: handle.kind };
@@ -141,6 +141,19 @@ interface WalkFrame {
   /** `""` for the root, otherwise `"<dir path>/"`. */
   readonly prefix: string;
   iterator?: AsyncIterator<FileSystemHandle>;
+  /**
+   * `true` once the cursor has been closed, so the release path can never run
+   * `return()` twice on the same cursor. A double `return()` is harmless on a
+   * generator and undefined behaviour on a hand-written iterator.
+   */
+  released?: boolean;
+}
+
+/** Closes a directory cursor, at most once. */
+async function releaseFrame(frame: WalkFrame): Promise<void> {
+  if (frame.released === true) return;
+  frame.released = true;
+  await frame.iterator?.return?.();
 }
 
 export function createDirectoryWorkspace(
@@ -245,55 +258,97 @@ export function createDirectoryWorkspace(
     );
   };
 
-  const walk = async function* (
-    directory = ".",
-    walkOptions: WalkOptions = {},
-  ): AsyncGenerator<DirEntry> {
-    const maxEntries = walkOptions.maxEntries ?? DEFAULT_MAX_ENTRIES;
-    const start = resolveWorkspacePath(".", directory);
-    const startHandle = await resolveDirectory(root, start);
+  /**
+   * The walk, as a {@link WalkResult}.
+   *
+   * **Synchronous on purpose.** Resolving the root directory handle needs an
+   * `await`, but it happens *inside* the generator, on the first `next()` — so
+   * calling `walk()` touches no filesystem at all and a caller that decides not
+   * to iterate costs nothing. An `async` return type would have made every
+   * consumer `await` a value that is already available.
+   */
+  const walk = (directory = ".", walkOptions: WalkOptions = {}): WalkResult => {
+    const result: WalkResult = {
+      entries: { async *[Symbol.asyncIterator]() {} },
+      truncated: false,
+      visited: 0,
+    };
 
-    const stack: WalkFrame[] = [
-      { handle: startHandle, prefix: isWorkspaceRoot(start) ? "" : `${start}/` },
-    ];
-    let visited = 0;
+    result.entries = {
+      async *[Symbol.asyncIterator]() {
+        const maxEntries = walkOptions.maxEntries ?? DEFAULT_MAX_ENTRIES;
+        const start = resolveWorkspacePath(".", directory);
 
-    try {
-      while (stack.length > 0) {
-        if (walkOptions.signal?.aborted) return;
+        const stack: WalkFrame[] = [];
 
-        const frame = stack[stack.length - 1];
-        if (frame === undefined) return;
-        frame.iterator ??= frame.handle.values();
+        /**
+         * Resolving the root can *fail* (a missing directory, a `TypeMismatch`
+         * from the platform). Resolving it here rather than in `walk()` keeps
+         * that a rejection of the iteration, which is what it was before —
+         * and it still has to release anything opened on the way out, so the
+         * `finally` covers the whole body including this.
+         */
+        try {
+          const startHandle = await resolveDirectory(root, start);
+          stack.push({ handle: startHandle, prefix: isWorkspaceRoot(start) ? "" : `${start}/` });
 
-        const next = await frame.iterator.next();
-        if (next.done === true) {
-          stack.pop();
-          continue;
+          while (stack.length > 0) {
+            if (walkOptions.signal?.aborted) return;
+
+            const frame = stack[stack.length - 1];
+            if (frame === undefined) return;
+            frame.iterator ??= frame.handle.values();
+
+            const next = await frame.iterator.next();
+            if (next.done === true) {
+              // Close the exhausted cursor too, not only the abandoned ones:
+              // `values()` hands out a real iterator whose `return()` is the
+              // documented way to release the directory, and a cursor that
+              // merely ran to its end still has to be released by whoever
+              // opened it.
+              const finished = stack.pop();
+              if (finished !== undefined) await releaseFrame(finished);
+              continue;
+            }
+
+            const handle = next.value;
+            const path = `${frame.prefix}${handle.name}`;
+            const entry = toDirEntry(handle, path);
+
+            // Documented contract of `WalkOptions.filter`: `false` on a directory
+            // skips its whole subtree. (Ignore-filtering lives in the search
+            // tools — they pass the filter in, we only honour it.)
+            if (walkOptions.filter !== undefined && !walkOptions.filter(entry)) continue;
+
+            // Checked before the yield, so `truncated` means "there was another
+            // entry and we did not take it" — a fact about the tree, not about a
+            // counter that happened to land on the limit. Exactly the rule the
+            // memory walk applies, which is what keeps the two interchangeable.
+            if (result.visited >= maxEntries) {
+              result.truncated = true;
+              return;
+            }
+            result.visited += 1;
+            yield entry;
+
+            if (isDirectoryHandle(handle)) stack.push({ handle, prefix: `${path}/` });
+          }
+        } finally {
+          // Release the cursors of every directory we descended into. This runs
+          // on the normal end, on `maxEntries`, on an abort, on a throw — and,
+          // because the `for await … of` protocol calls `return()` on the
+          // iterator when the *consumer* breaks out early, on that too: the
+          // generator is suspended at `yield`, the protocol resumes it with a
+          // return completion, and this block is what runs.
+          while (stack.length > 0) {
+            const frame = stack.pop();
+            if (frame !== undefined) await releaseFrame(frame);
+          }
         }
+      },
+    };
 
-        const handle = next.value;
-        const path = `${frame.prefix}${handle.name}`;
-        const entry = toDirEntry(handle, path);
-
-        // Documented contract of `WalkOptions.filter`: `false` on a directory
-        // skips its whole subtree. (Ignore-filtering lives in the search
-        // tools — they pass the filter in, we only honour it.)
-        if (walkOptions.filter !== undefined && !walkOptions.filter(entry)) continue;
-
-        visited += 1;
-        if (visited > maxEntries) return;
-        yield entry;
-
-        if (isDirectoryHandle(handle)) stack.push({ handle, prefix: `${path}/` });
-      }
-    } finally {
-      // Release the cursors of every directory we descended into.
-      while (stack.length > 0) {
-        const frame = stack.pop();
-        await frame?.iterator?.return?.();
-      }
-    }
+    return result;
   };
 
   return {

@@ -26,6 +26,8 @@ import {
   INSERT_MESSAGE,
   INSERT_PART,
   INSERT_SESSION,
+  INSERT_TOOL_INVOCATION_BEGUN,
+  INSERT_TURN,
   SEARCH_SQL_ALL_SESSIONS,
   SEARCH_SQL_BY_SESSION,
   SELECT_DELTA_SEQ,
@@ -34,10 +36,15 @@ import {
   SELECT_PARTS,
   SELECT_SESSION,
   SELECT_SESSIONS,
+  SELECT_TOOL_CALL,
+  SELECT_UNFINISHED_TURNS,
   UPSERT_PART,
+  UPSERT_TOOL_INVOCATION_DONE,
   messageParams,
   partParams,
   sessionParams,
+  toolCallKeyParams,
+  turnParams,
 } from "./sql.ts";
 import {
   messageRowSchema,
@@ -45,20 +52,30 @@ import {
   partRowSchema,
   searchHitSchema,
   sessionRowSchema,
+  toolCallRowSchema,
+  turnRowSchema,
+  unfinishedTurnRowSchema,
 } from "./protocol.ts";
 import type {
+  BeginToolCallInput,
   FlushDeltaInput,
   FlushDeltaResult,
   Message,
   MessageInput,
   Part,
   PartInput,
+  RecordToolCallInput,
   SearchHit,
   SearchInput,
   Session,
   SessionInput,
   SessionStatus,
   SqlParam,
+  ToolCallKey,
+  ToolCallRecord,
+  Turn,
+  TurnInput,
+  UnfinishedTurn,
 } from "./types.ts";
 
 /** Outcome of one statement inside a transaction. */
@@ -140,6 +157,59 @@ export function requireSessionStatus(status: SessionInput["status"]): SessionSta
   );
 }
 
+/**
+ * How much of a recorded tool output the `result_preview` column keeps.
+ *
+ * The preview exists for a UI row; `output` holds the exact value and is what a
+ * replay hands back. A cap on the preview is therefore free — and it is a cap,
+ * not a lossy re-encode: `output` is never derived from it.
+ */
+export const RESULT_PREVIEW_CHARS = 400;
+
+/**
+ * JSON-encode a tool output for the `output` column.
+ *
+ * `JSON.stringify` returns `undefined` — not a string — for `undefined` and for
+ * a function or a symbol. Binding that would be a type error, and coercing it
+ * to `"null"` would turn "the tool returned nothing" into "the tool returned
+ * `null`", which a replay would then hand to the model as its answer. `NULL` in
+ * the column is kept, and read back, as `undefined`, so the round trip is
+ * exact in both directions.
+ */
+export function encodeToolOutput(value: unknown): string | null {
+  if (value === undefined) return null;
+  const encoded = JSON.stringify(value);
+  return encoded === undefined ? null : encoded;
+}
+
+/**
+ * The inverse of {@link encodeToolOutput}.
+ *
+ * A row whose `output` cannot be parsed is a `sql_error`, never a silent
+ * `undefined`: a replay that answered `undefined` would tell the model the tool
+ * produced nothing, which is the same lie the `status` column was added to stop.
+ */
+export function decodeToolOutput(text: string | null): unknown {
+  if (text === null) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new StorageError(
+      "sql_error",
+      "tool_invocations.output is not valid JSON: the record cannot be replayed honestly.",
+      { reason: error instanceof Error ? error.message : String(error) },
+    );
+  }
+}
+
+/** The bounded display copy. Never replayed. */
+export function toolOutputPreview(value: unknown): string {
+  const encoded = encodeToolOutput(value) ?? "";
+  return encoded.length <= RESULT_PREVIEW_CHARS
+    ? encoded
+    : `${encoded.slice(0, RESULT_PREVIEW_CHARS)}…`;
+}
+
 async function firstRow(engine: StorageEngine, sql: string, params: readonly SqlParam[]) {
   const rows = await engine.all(sql, params);
   return rows[0];
@@ -202,6 +272,11 @@ export interface StorageOperations {
   listParts(messageId: string): Promise<Part[]>;
   flushDelta(input: FlushDeltaInput): Promise<FlushDeltaResult>;
   search(input: SearchInput): Promise<SearchHit[]>;
+  appendTurn(input: TurnInput): Promise<Turn>;
+  listUnfinishedTurns(input: { sessionId: string }): Promise<UnfinishedTurn[]>;
+  beginToolCall(input: BeginToolCallInput): Promise<void>;
+  recordToolCall(input: RecordToolCallInput): Promise<void>;
+  getToolCall(key: ToolCallKey): Promise<ToolCallRecord | undefined>;
 }
 
 export function createStorageOperations(engine: StorageEngine): StorageOperations {
@@ -324,6 +399,76 @@ export function createStorageOperations(engine: StorageEngine): StorageOperation
         input.sessionId === undefined ? [input.query, limit] : [input.query, input.sessionId, limit];
       const rows = await engine.all(sql, params);
       return rows.map((row, index) => narrow(searchHitSchema, row, `search[${index}]`));
+    },
+
+    async appendTurn(input) {
+      return single(engine, INSERT_TURN, turnParams(input), turnRowSchema, "appendTurn");
+    },
+
+    async listUnfinishedTurns(input) {
+      return many(
+        engine,
+        SELECT_UNFINISHED_TURNS,
+        [input.sessionId],
+        unfinishedTurnRowSchema,
+        "listUnfinishedTurns",
+      );
+    },
+
+    async beginToolCall(input) {
+      const now = nowIso();
+      // `args` is JSON like every other JSON column, and the *input* is the
+      // thing that is worth keeping: it is what a "verify, do not repeat"
+      // instruction to the model needs to be about.
+      const args = encodeToolOutput(input.input);
+      // The order is the statement's column order: id, session_id, tool_name,
+      // tool_call_id, attempt, occurrence, args, started_at, created_at,
+      // updated_at. `finished_at` is NULL here — the call has not returned.
+      await engine.run(INSERT_TOOL_INVOCATION_BEGUN, [
+        newId(),
+        input.key.sessionId,
+        input.toolName,
+        input.key.toolCallId,
+        input.key.attempt,
+        input.key.occurrence,
+        args,
+        now,
+        now,
+        now,
+      ]);
+    },
+
+    async recordToolCall(input) {
+      const now = nowIso();
+      const output = encodeToolOutput(input.output);
+      // The order is the statement's column order: id, session_id,
+      // tool_name, tool_call_id, attempt, occurrence, output, result_preview,
+      // then the four timestamps. All four are the write time — a call has one
+      // start, one finish and one update, and they are the same instant here.
+      await engine.run(UPSERT_TOOL_INVOCATION_DONE, [
+        newId(),
+        input.key.sessionId,
+        input.toolName,
+        input.key.toolCallId,
+        input.key.attempt,
+        input.key.occurrence,
+        output,
+        toolOutputPreview(input.output),
+        now,
+        now,
+        now,
+        now,
+      ]);
+    },
+
+    async getToolCall(key) {
+      const row = await firstRow(engine, SELECT_TOOL_CALL, toolCallKeyParams(key));
+      if (row === undefined) return undefined;
+      const parsed = narrow(toolCallRowSchema, row, "getToolCall");
+      // The union, not a loose object: reading `output` off a `begun` record is
+      // a compile error, which is the point of the status column.
+      if (parsed.status === "begun") return { status: "begun" };
+      return { status: "done", output: decodeToolOutput(parsed.output) };
     },
   };
 }

@@ -78,7 +78,7 @@ Suche selbst war vollständig.
 |---|---|---|
 | `bytes` | `Read stopped at the 16777216-byte budget (16 MiB).` | `MAX_TOTAL_BYTES` = 16 MiB. Eine Datei, die die Grenze reißen *würde*, wird weder gelesen noch durchsucht. `bytesRead <= maxBytes` ist eine Invariante, kein Zufall — das war vorher falsch (gemessen: `bytesRead = 17,510,495` bei `maxBytes = 16,777,216`). |
 | Datei zu groß | — | `MAX_FILE_BYTES` = 1 MiB. Wird in `filesSkipped` gezählt, und der `hint` nennt die Ursache und die zwei Abhilmen, die wirken (`path`/`include` verengen, oder die Datei direkt mit `read` öffnen). Früher stand dort Advice, die diese Datei nie sichtbar gemacht hätte. |
-| `walk` | `The workspace walk stopped at its 50000-entry cap; …` | `WALK_ENTRY_LIMIT` = 50 000, spiegelt `DEFAULT_MAX_ENTRIES` in `baah-core`. **Stopgap:** `Workspace.walk` ist ein `AsyncIterable` und kann nicht sagen, dass es aufgehört hat. Beide Suchwerkzeuge zählen deshalb die gelieferten Einträge. Konservativ in die sichere Richtung: ein Workspace mit *genau* 50 000 Einträgen wird als möglicherweise unvollständig gemeldet. |
+| `walk` | `The workspace walk stopped at its 50000-entry cap; …` bzw. `The workspace walk used its whole 50000-entry budget, so entries beyond it may exist and were not visited.` | `DEFAULT_MAX_ENTRIES` in `baah-core` — **eine** Quelle, importiert und nicht gespiegelt. `Workspace.walk` liefert inzwischen ein `WalkResult` mit `truncated` (`true` nur, wenn der Walk am Cap stehen blieb, obwohl noch Einträge da waren) und `visited`; dieses Werkzeug zählt nichts mehr selbst. Die konservative Verschiebung bleibt, liegt aber in `walkMayBeIncomplete()` im Walk-Modul: ein Workspace mit *genau* 50 000 Einträgen wird weiterhin als möglicherweise unvollständig gemeldet, obwohl sein Walk fertig war. Der Fehler ist absichtlich einseitig. |
 | `timeout` | `Matching stopped after 5000 ms.` | `SEARCH_TIMEOUT_MS` = 5 s, geprüft **vor jeder Zeile**. |
 | `abort` | je nach Schleife verschieden: `Search aborted — the walk stopped before it had seen every entry.`, `Search aborted after N of M candidate files were read.`, `Search aborted; all N read files were handed to the matcher, which stopped part-way through.` | `ToolContext.signal`. Drei Abbruchstellen (Walk, Read-Loop, Matcher), drei Wortlaute — der Grund wird genannt, weil ein Abort (neu starten) und ein Cap (`path` verengen) verschiedene nächste Schritte bedeuten. Auch ein Abort, der während des letzten Reads landet, wird berichtet; das war vorher unsichtbar. |
 
@@ -141,8 +141,8 @@ Sequenz (wie picomatch).
 beabsichtigt, nicht vergessen: sein Walk ist `async` und yielded zwischen den
 Einträgen, kann also im Gegensatz zum synchronen Regex-Scan des `grep` den Main
 Thread nicht in einem Schritt blockieren. Begrenzt wird er über
-`WALK_ENTRY_LIMIT` und `signal`, beides in `glob/test/verify-walk-cap.test.ts`
-und `glob/test/glob.test.ts` belegt. Offen bleibt der Fall, in dem ein
+`DEFAULT_MAX_ENTRIES` (aus `baah-core`) und `signal`, beides in
+`glob/test/verify-walk-cap.test.ts` und `glob/test/glob.test.ts` belegt. Offen bleibt der Fall, in dem ein
 `values()`-Aufruf eines echten Verzeichnis-Handles selbst hängt.
 
 ## Abhängigkeiten

@@ -17,6 +17,7 @@ import {
   STEP_CORE_TABLES,
   STEP_FULL_TEXT_INDEX,
   STEP_INDEXES,
+  STEP_TOOL_CALL_IDENTITY,
 } from "./schema.ts";
 import type { SqlValue } from "./types.ts";
 
@@ -56,11 +57,27 @@ export interface MigrationResult {
  *
  * Step 3 is separated from step 1 so a database can be inspected (or repaired)
  * even if the FTS5 virtual table cannot be created.
+ *
+ * Step 4 is the first **rebuild** rather than a plain `CREATE … IF NOT
+ * EXISTS`: it replaces `tool_invocations` so that `status` can become
+ * `begun | done` and so that the four-part call key can carry a real `UNIQUE`
+ * constraint. `ALTER TABLE … ADD COLUMN` cannot add a table constraint in
+ * SQLite, and it cannot change a `CHECK` at all.
+ *
+ * **Its idempotency comes from the transaction, not from its statements.**
+ * Everything in a step runs inside one `BEGIN IMMEDIATE` … `COMMIT`, so a
+ * failure anywhere — including a re-run that would duplicate a copied row —
+ * rolls the whole rebuild back, and the version is recorded only after the
+ * commit succeeded. `schema_migrations` is therefore the single authority on
+ * "has this run", and a second `applyMigrations()` does no work at all. The
+ * earlier steps still carry `IF NOT EXISTS` on every statement as a second
+ * line of defence; this one cannot, and saying so is better than pretending.
  */
 export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: "core_schema", statements: STEP_CORE_TABLES },
   { version: 2, name: "full_text_index", statements: STEP_FULL_TEXT_INDEX },
   { version: 3, name: "query_indexes", statements: STEP_INDEXES },
+  { version: 4, name: "tool_call_identity", statements: STEP_TOOL_CALL_IDENTITY },
 ];
 
 /** Newest version the code knows about. */

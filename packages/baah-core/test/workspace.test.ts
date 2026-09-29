@@ -75,26 +75,49 @@ describe("walk", () => {
       "README.md": "r",
     });
     const all: string[] = [];
-    for await (const entry of ws.walk(".")) all.push(entry.path);
+    const walked = ws.walk(".");
+    for await (const entry of walked.entries) all.push(entry.path);
 
     expect(all).toContain("src/a.ts");
     expect(all).toContain("README.md");
+    expect(walked.truncated).toBe(false);
+    expect(walked.visited).toBe(4);
 
     const onlyTs: string[] = [];
-    for await (const entry of ws.walk(".", { filter: (e) => e.path.endsWith(".ts") })) {
+    const filtered = ws.walk(".", { filter: (e) => e.path.endsWith(".ts") });
+    for await (const entry of filtered.entries) {
       onlyTs.push(entry.path);
     }
     expect(onlyTs.sort()).toEqual(["src/a.ts", "src/b.ts"]);
+    // The filter runs *before* the cap is charged, so `visited` counts what was
+    // yielded, not what was examined.
+    expect(filtered.visited).toBe(2);
   });
 
   it("stops when the signal is aborted", async () => {
     const ws = createMemoryWorkspace({ "a.txt": "a", "b.txt": "b", "c.txt": "c" });
     const controller = new AbortController();
     const seen: string[] = [];
-    for await (const entry of ws.walk(".", { signal: controller.signal })) {
+    const walked = ws.walk(".", { signal: controller.signal });
+    for await (const entry of walked.entries) {
       seen.push(entry.path);
       controller.abort();
     }
     expect(seen).toHaveLength(1);
+    // An abort is not truncation: the caller aborted it and the walk did not
+    // run out of tree. Reporting it as `truncated` would blame the cap for
+    // something the caller's own signal did.
+    expect(walked.truncated).toBe(false);
+    expect(walked.visited).toBe(1);
+  });
+
+  it("produces a complete result object before anything is iterated", () => {
+    // `DirectoryWorkspace.walk` resolves the root handle lazily, on the first
+    // `next()`. The result is therefore usable — and honest about having seen
+    // nothing — before the first entry exists.
+    const ws = createMemoryWorkspace({ "a.txt": "a" });
+    const walked = ws.walk(".");
+    expect(walked.truncated).toBe(false);
+    expect(walked.visited).toBe(0);
   });
 });

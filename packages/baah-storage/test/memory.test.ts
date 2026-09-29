@@ -409,11 +409,11 @@ describe("deleteSession cascade", () => {
       flushedAt: T0,
     });
 
-    expect(db.counts()).toEqual({ sessions: 2, messages: 2, parts: 2, partDeltas: 1 });
+    expect(db.counts()).toMatchObject({ sessions: 2, messages: 2, parts: 2, partDeltas: 1 });
 
     await db.deleteSession("doomed");
 
-    expect(db.counts()).toEqual({ sessions: 1, messages: 0, parts: 0, partDeltas: 0 });
+    expect(db.counts()).toMatchObject({ sessions: 1, messages: 0, parts: 0, partDeltas: 0 });
     expect(await db.getSession("doomed")).toBeNull();
     expect(await db.listMessages("doomed")).toEqual([]);
     expect(await db.listParts("m1")).toEqual([]);

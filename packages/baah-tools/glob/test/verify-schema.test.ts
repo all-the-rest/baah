@@ -20,7 +20,8 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_GLOB_LIMIT, WALK_ENTRY_LIMIT, globInputSchema } from "../src/index.ts";
+import { DEFAULT_GLOB_LIMIT, globInputSchema } from "../src/index.ts";
+import { DEFAULT_MAX_ENTRIES } from "@all-the.rest/baah-core";
 
 describe("parameter names and required/optional status match the reference", () => {
   it("glob: pattern required; path, hidden, limit optional", () => {
@@ -111,10 +112,10 @@ describe("the walk is bounded, but not by a wall clock", () => {
     // justification is that there is nothing to time out: the walk is async and
     // yields between entries, so unlike `grep`'s synchronous regex scan it
     // cannot block the main thread in one step. It is bounded instead by
-    // `WALK_ENTRY_LIMIT` and by `signal` — both covered in
+    // the walk's own entry cap and by `signal` — both covered in
     // verify-walk-cap.test.ts and glob.test.ts. A directory-handle walk that
     // stalls on a single slow `values()` is the case this leaves open.
     expect(globInputSchema.safeParse({ pattern: "*" }).success).toBe(true);
-    expect(WALK_ENTRY_LIMIT).toBeGreaterThan(0);
+    expect(DEFAULT_MAX_ENTRIES).toBeGreaterThan(0);
   });
 });

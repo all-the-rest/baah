@@ -91,7 +91,7 @@ const fixedNow = (): string => "2026-09-29T12:00:00.000Z";
 describe("the migration list", () => {
   it("is ordered by version with no gaps and no duplicates", () => {
     const versions = MIGRATIONS.map((migration) => migration.version);
-    expect(versions).toEqual([1, 2, 3]);
+    expect(versions).toEqual([1, 2, 3, 4]);
     expect(LATEST_SCHEMA_VERSION).toBe(Math.max(...versions));
   });
 
@@ -102,12 +102,30 @@ describe("the migration list", () => {
     }
   });
 
-  it("makes every statement idempotent, so a replay cannot fail", () => {
-    for (const migration of MIGRATIONS) {
+  it("makes every statement of every *creating* step idempotent", () => {
+    // Steps 1-3 only create things, so `IF NOT EXISTS` on each statement means a
+    // replay cannot fail. Step 4 is a rebuild and cannot be — see the next test.
+    for (const migration of MIGRATIONS.filter((entry) => entry.version < 4)) {
       for (const statement of migration.statements) {
-        expect(statement, statement.slice(0, 60)).toMatch(/IF NOT EXISTS/i);
+        expect(statement, `${migration.name}: ${statement.slice(0, 60)}`).toMatch(/IF NOT EXISTS/i);
       }
     }
+  });
+
+  it("protects the rebuild step by its transaction, and says so", () => {
+    // Step 4 replaces a table: `DROP TABLE`, an `ALTER … RENAME` and a copy.
+    // None of those can carry `IF NOT EXISTS`, and pretending otherwise would
+    // be a false promise. What protects it is that every statement of a
+    // migration runs inside one `BEGIN IMMEDIATE` … `COMMIT`, so a failure
+    // anywhere — including a replay that would duplicate a copied row — rolls
+    // the whole rebuild back and the version is never recorded. The two tests
+    // in `describe("idempotency")` measure that, and
+    // `tool-call-identity.test.ts` measures it against a real SQLite.
+    const rebuild = MIGRATIONS.find((migration) => migration.version === 4);
+    expect(rebuild?.name).toBe("tool_call_identity");
+    expect(rebuild?.statements.some((statement) => /DROP TABLE/i.test(statement))).toBe(true);
+    expect(rebuild?.statements.some((statement) => /ALTER TABLE/i.test(statement))).toBe(true);
+    expect(rebuild?.statements.some((statement) => /INSERT OR IGNORE/i.test(statement))).toBe(true);
   });
 });
 
@@ -117,17 +135,18 @@ describe("applyMigrations", () => {
     const result = applyMigrations(host, fixedNow);
 
     expect(result.version).toBe(LATEST_SCHEMA_VERSION);
-    expect(result.applied.map((entry) => entry.version)).toEqual([1, 2, 3]);
+    expect(result.applied.map((entry) => entry.version)).toEqual([1, 2, 3, 4]);
     expect(result.applied.map((entry) => entry.name)).toEqual([
       "core_schema",
       "full_text_index",
       "query_indexes",
+      "tool_call_identity",
     ]);
     expect(result.applied.every((entry) => entry.appliedAt === fixedNow())).toBe(true);
 
     // One BEGIN and one COMMIT per migration, and no rollback.
-    expect(host.executed.filter((sql) => sql.startsWith("BEGIN"))).toHaveLength(3);
-    expect(host.executed.filter((sql) => sql === "COMMIT")).toHaveLength(3);
+    expect(host.executed.filter((sql) => sql.startsWith("BEGIN"))).toHaveLength(4);
+    expect(host.executed.filter((sql) => sql === "COMMIT")).toHaveLength(4);
     expect(host.executed.filter((sql) => sql === "ROLLBACK")).toHaveLength(0);
     expect(host.wasInTransaction()).toBe(false);
   });
@@ -148,18 +167,24 @@ describe("applyMigrations", () => {
     applyMigrations(host, fixedNow);
 
     const userVersions = host.executed.filter((sql) => sql.startsWith("PRAGMA user_version"));
-    expect(userVersions).toEqual(["PRAGMA user_version=1;", "PRAGMA user_version=2;", "PRAGMA user_version=3;"]);
+    expect(userVersions).toEqual([
+      "PRAGMA user_version=1;",
+      "PRAGMA user_version=2;",
+      "PRAGMA user_version=3;",
+      "PRAGMA user_version=4;",
+    ]);
   });
 
   it("records every applied version exactly once", () => {
     const host = createRecordingHost();
     applyMigrations(host, fixedNow);
 
-    expect(host.appliedVersions()).toEqual([1, 2, 3]);
+    expect(host.appliedVersions()).toEqual([1, 2, 3, 4]);
     expect(host.recorded).toEqual([
       { version: 1, name: "core_schema", appliedAt: fixedNow() },
       { version: 2, name: "full_text_index", appliedAt: fixedNow() },
       { version: 3, name: "query_indexes", appliedAt: fixedNow() },
+      { version: 4, name: "tool_call_identity", appliedAt: fixedNow() },
     ]);
   });
 
@@ -186,10 +211,11 @@ describe("idempotency", () => {
     expect(second.applied).toEqual([]);
     expect(second.version).toBe(LATEST_SCHEMA_VERSION);
     // The only statement a no-op call runs is the `IF NOT EXISTS` bootstrap —
-    // not even a BEGIN, so it never takes the write lock.
+    // not even a BEGIN, so it never takes the write lock. This is the guarantee
+    // the rebuild step leans on: a second open cannot re-run `DROP TABLE`.
     const added = host.executed.slice(afterFirst);
     expect(added).toEqual([SCHEMA_MIGRATIONS_TABLE]);
-    expect(host.appliedVersions()).toEqual([1, 2, 3]);
+    expect(host.appliedVersions()).toEqual([1, 2, 3, 4]);
   });
 
   it("survives being applied ten times without duplicate rows", () => {
@@ -198,8 +224,8 @@ describe("idempotency", () => {
       const result = applyMigrations(host, fixedNow);
       expect(result.version).toBe(LATEST_SCHEMA_VERSION);
     }
-    expect(host.appliedVersions()).toEqual([1, 2, 3]);
-    expect(host.recorded).toHaveLength(3);
+    expect(host.appliedVersions()).toEqual([1, 2, 3, 4]);
+    expect(host.recorded).toHaveLength(4);
   });
 
   it("applies only the versions a previous install did not record", () => {
@@ -215,11 +241,18 @@ describe("idempotency", () => {
 
     const result = applyMigrations(host, fixedNow);
 
-    expect(result.applied.map((entry) => entry.version)).toEqual([3]);
-    expect(result.version).toBe(3);
-    // The bootstrap `IF NOT EXISTS` + the third migration's statements +
-    // BEGIN / the bookkeeping INSERT / user_version / COMMIT.
-    expect(host.executed.length - before).toBe(MIGRATIONS[2]!.statements.length + 5);
+    expect(result.applied.map((entry) => entry.version)).toEqual([3, 4]);
+    expect(result.version).toBe(4);
+    // The bootstrap `IF NOT EXISTS` once, then per pending migration its own
+    // statements plus exactly four frames of bookkeeping: BEGIN, the
+    // `schema_migrations` INSERT, `PRAGMA user_version` and COMMIT.
+    const BOOKKEEPING_PER_MIGRATION = 4;
+    expect(host.executed.length - before).toBe(
+      1 +
+        BOOKKEEPING_PER_MIGRATION * 2 +
+        MIGRATIONS[2]!.statements.length +
+        MIGRATIONS[3]!.statements.length,
+    );
   });
 
   it("re-runs a full install on a database with no recorded versions", () => {
@@ -260,8 +293,8 @@ describe("failure handling", () => {
     );
     const result = applyMigrations(retry, fixedNow);
 
-    expect(result.applied.map((entry) => entry.version)).toEqual([2, 3]);
-    expect(result.version).toBe(3);
+    expect(result.applied.map((entry) => entry.version)).toEqual([2, 3, 4]);
+    expect(result.version).toBe(4);
   });
 });
 

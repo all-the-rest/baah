@@ -54,11 +54,15 @@ export {
 export {
   clampSearchLimit,
   createStorageOperations,
+  decodeToolOutput,
   DEFAULT_SEARCH_LIMIT,
+  encodeToolOutput,
   MAX_SEARCH_LIMIT,
   requireSessionStatus,
+  RESULT_PREVIEW_CHARS,
   streamingPart,
   toPartInput,
+  toolOutputPreview,
   type StorageEngine,
   type StorageOperations,
   type StatementOutcome,
@@ -66,25 +70,30 @@ export {
 } from "./operations.ts";
 
 export {
+  closeRequestSchema,
   flushDeltaRequestSchema,
   openRequestSchema,
+  partRowSchema,
+  messageRowSchema,
   queryRequestSchema,
   rpcRequestSchema,
   rpcResponseSchema,
   runRequestSchema,
-  searchRequestSchema,
-  txRequestSchema,
-  closeRequestSchema,
-  storageErrorPayloadSchema,
-  partRowSchema,
-  messageRowSchema,
-  sessionRowSchema,
   searchHitSchema,
+  searchRequestSchema,
+  sessionRowSchema,
+  storageErrorPayloadSchema,
+  toolCallRowSchema,
+  toolInvocationRowSchema,
+  turnRowSchema,
+  txRequestSchema,
+  unfinishedTurnRowSchema,
   type RpcRequest,
   type RpcResponse,
 } from "./protocol.ts";
 
 export {
+  APPROVALS_INVOCATION_PARK_TABLE,
   INDEX_NAMES,
   PRAGMAS,
   SCHEMA_MIGRATIONS_TABLE,
@@ -92,7 +101,20 @@ export {
   STEP_CORE_TABLES,
   STEP_FULL_TEXT_INDEX,
   STEP_INDEXES,
+  STEP_TOOL_CALL_IDENTITY,
   TABLE_NAMES,
+  TOOL_INVOCATIONS_TABLE,
 } from "./schema.ts";
+
+export {
+  INSERT_TOOL_INVOCATION_BEGUN,
+  INSERT_TURN,
+  SELECT_TOOL_CALL,
+  SELECT_UNFINISHED_TURNS,
+  TOOL_CALL_KEY_PREDICATE,
+  toolCallKeyParams,
+  turnParams,
+  UPSERT_TOOL_INVOCATION_DONE,
+} from "./sql.ts";
 
 export type * from "./types.ts";

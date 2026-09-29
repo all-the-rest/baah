@@ -30,6 +30,7 @@ import {
   txResultSchema,
 } from "./protocol.ts";
 import type {
+  BeginToolCallInput,
   FlushDeltaInput,
   FlushDeltaResult,
   Message,
@@ -38,6 +39,7 @@ import type {
   Part,
   PartInput,
   QueryResult,
+  RecordToolCallInput,
   RunResult,
   SearchHit,
   SearchInput,
@@ -47,6 +49,11 @@ import type {
   SqlParam,
   SqlStatement,
   StorageDatabase,
+  ToolCallKey,
+  ToolCallRecord,
+  Turn,
+  TurnInput,
+  UnfinishedTurn,
   TxResult,
 } from "./types.ts";
 
@@ -260,6 +267,26 @@ export class WorkerStorageDatabase implements StorageDatabase {
 
   listParts(messageId: string): Promise<Part[]> {
     return this.#operations.listParts(messageId);
+  }
+
+  appendTurn(input: TurnInput): Promise<Turn> {
+    return this.#operations.appendTurn(input);
+  }
+
+  listUnfinishedTurns(input: { sessionId: string }): Promise<UnfinishedTurn[]> {
+    return this.#operations.listUnfinishedTurns(input);
+  }
+
+  beginToolCall(input: BeginToolCallInput): Promise<void> {
+    return this.#operations.beginToolCall(input);
+  }
+
+  recordToolCall(input: RecordToolCallInput): Promise<void> {
+    return this.#operations.recordToolCall(input);
+  }
+
+  getToolCall(key: ToolCallKey): Promise<ToolCallRecord | undefined> {
+    return this.#operations.getToolCall(key);
   }
 
   /**

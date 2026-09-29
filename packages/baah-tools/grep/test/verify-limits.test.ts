@@ -7,10 +7,16 @@
  * proves nothing about the fix, and these are the tests that would catch its
  * undoing.
  */
-import { createMemoryWorkspace, type ToolContext, type Workspace } from "@all-the.rest/baah-core";
+import {
+  createMemoryWorkspace,
+  DEFAULT_MAX_ENTRIES,
+  type ToolContext,
+  type WalkResult,
+  type Workspace,
+} from "@all-the.rest/baah-core";
 import { describe, expect, it } from "vitest";
 
-import { MAX_FILE_BYTES, MAX_TOTAL_BYTES, WALK_ENTRY_LIMIT, grepTool } from "../src/index.ts";
+import { executeGrep, MAX_FILE_BYTES, MAX_TOTAL_BYTES, grepTool } from "../src/index.ts";
 
 /**
  * A workspace whose `walk` does NOT report sizes.
@@ -30,11 +36,24 @@ function sizelessWorkspace(files: Record<string, string>): Workspace {
   const base = createMemoryWorkspace(files);
   return {
     ...base,
-    async *walk(directory = ".", options = {}) {
-      for await (const entry of base.walk(directory, options)) {
-        const { size: _size, ...rest } = entry;
-        yield rest;
-      }
+    walk(directory = ".", options = {}) {
+      const inner = base.walk(directory, options);
+      return {
+        entries: {
+          async *[Symbol.asyncIterator]() {
+            for await (const entry of inner.entries) {
+              const { size: _size, ...rest } = entry;
+              yield rest;
+            }
+          },
+        },
+        get truncated() {
+          return inner.truncated;
+        },
+        get visited() {
+          return inner.visited;
+        },
+      };
     },
   };
 }
@@ -333,14 +352,11 @@ describe("the walk cap (50 000 entries) — now reported", () => {
   })();
 
   it("FIXED: a truncated search no longer claims the needle is absent", async () => {
-    // `Workspace.walk` stops after 50 000 visited entries
-    // (`DEFAULT_MAX_ENTRIES`, packages/baah-core/src/workspace.ts:214 and
-    // workspace/directory-workspace.ts:77) and cannot report that it did.
-    // `grep` counts the entries it received and treats reaching
-    // `WALK_ENTRY_LIMIT` as "possibly incomplete", which is the only thing a
-    // caller can do without a change in core. The result is still empty — the
-    // tail genuinely was not searched — but it no longer says the pattern does
-    // not match anywhere.
+    // The walk stops after `DEFAULT_MAX_ENTRIES` entries and now *reports* that
+    // it did (`WalkResult.truncated`). `grep` reads the flag instead of
+    // counting what it received, and no longer holds a copy of the cap. The
+    // result is still empty — the tail genuinely was not searched — but it no
+    // longer says the pattern does not match anywhere.
     const result = await grepTool.execute(context(BIG), { pattern: "hit" });
 
     expect(result.filesScanned).toBe(50_000);
@@ -375,12 +391,25 @@ describe("the walk cap (50 000 entries) — now reported", () => {
     let seen = 0;
     const workspace: Workspace = {
       ...base,
-      async *walk(directory = ".", options = {}) {
-        for await (const entry of base.walk(directory, options)) {
-          seen += 1;
-          if (seen === 3) controller.abort();
-          yield entry;
-        }
+      walk(directory = ".", options = {}) {
+        const inner = base.walk(directory, options);
+        return {
+          entries: {
+            async *[Symbol.asyncIterator]() {
+              for await (const entry of inner.entries) {
+                seen += 1;
+                if (seen === 3) controller.abort();
+                yield entry;
+              }
+            },
+          },
+          get truncated() {
+            return inner.truncated;
+          },
+          get visited() {
+            return inner.visited;
+          },
+        };
       },
     };
 
@@ -417,23 +446,93 @@ describe("the walk cap (50 000 entries) — now reported", () => {
     expect(result.filesScanned).toBe(0);
   });
 
-  it("the mirror constant tracks baah-core's, by construction", async () => {
-    // `WALK_ENTRY_LIMIT` duplicates a constant in core. Pinned behaviourally:
-    // one file below the cap is complete, one above it is not. If core changes
-    // `DEFAULT_MAX_ENTRIES`, this is the test that has to move with it — and
-    // the signal that the duplication has become wrong.
+  it("the walk's own flag is what the tool reads", async () => {
+    // This replaced "the mirror constant tracks baah-core's, by construction".
+    // The tool no longer holds a number, so the property to pin is the flag
+    // itself: `truncated` is `true` only when the walk refused an entry it
+    // could have yielded.
+    const drain = async (result: WalkResult): Promise<number> => {
+      let count = 0;
+      for await (const _entry of result.entries) count += 1;
+      return count;
+    };
+
+    const three = { "a.ts": "nothing\n", "b.ts": "nothing\n", "c.ts": "nothing\n" };
+    const under = createMemoryWorkspace(three).walk(".");
+    const exactly = createMemoryWorkspace(three).walk(".", { maxEntries: 3 });
+    const over = createMemoryWorkspace(three).walk(".", { maxEntries: 2 });
+
+    expect(await drain(under)).toBe(3);
+    expect(under.truncated).toBe(false);
+    expect(await drain(exactly)).toBe(3);
+    expect(exactly.truncated).toBe(false);
+    expect(await drain(over)).toBe(2);
+    expect(over.truncated).toBe(true);
+  });
+
+  it("the conservative bias: a tree exactly at the cap is reported as possibly-incomplete", async () => {
+    // The bias survives, deliberately and one-way. The walk here *finished* —
+    // `DEFAULT_MAX_ENTRIES` files and nothing beyond — and `grep` still refuses
+    // to call the answer complete, because a consumer that landed exactly on
+    // the cap cannot rule out that something else capped it. Reporting "no
+    // match" for a search that stopped is the lie this whole mechanism exists
+    // to prevent; over-reporting costs the model one extra `path`.
+    const exact: Record<string, string> = {};
+    for (let index = 0; index < DEFAULT_MAX_ENTRIES; index += 1) {
+      exact[`f${String(index).padStart(5, "0")}.ts`] = "nothing\n";
+    }
+
+    const walked = createMemoryWorkspace(exact).walk(".");
+    const result = await grepTool.execute(context(exact), { pattern: "hit" });
+
+    // The two halves, asserted apart.
+    expect(walked.truncated).toBe(false);
+    expect(result.searchTruncated).toBe(true);
+    expect(result.hint).not.toMatch(/No line matches/);
+  });
+
+  it("the walk cap the tool applies is core's, by construction", async () => {
+    // There is no number left in this package to go out of step, so the pin is
+    // behavioural against the imported constant: just below the cap the search
+    // is complete, two above it is not. If `DEFAULT_MAX_ENTRIES` ever changes in
+    // core, this follows it without being edited.
     const below: Record<string, string> = {};
-    for (let index = 0; index < WALK_ENTRY_LIMIT - 1; index += 1) {
+    for (let index = 0; index < DEFAULT_MAX_ENTRIES - 1; index += 1) {
       below[`f${String(index).padStart(5, "0")}.ts`] = "nothing\n";
     }
-    const above: Record<string, string> = { ...below, "zzz.ts": "nothing\n" };
+    const above: Record<string, string> = { ...below, "zzz.ts": "nothing\n", "zzy.ts": "nothing\n" };
 
     const complete = await grepTool.execute(context(below), { pattern: "hit" });
     const capped = await grepTool.execute(context(above), { pattern: "hit" });
 
-    expect(complete.filesScanned).toBe(WALK_ENTRY_LIMIT - 1);
+    expect(complete.filesScanned).toBe(DEFAULT_MAX_ENTRIES - 1);
     expect(complete.searchTruncated).toBe(false);
-    expect(capped.filesScanned).toBe(WALK_ENTRY_LIMIT);
+    expect(capped.filesScanned).toBe(DEFAULT_MAX_ENTRIES);
     expect(capped.searchTruncated).toBe(true);
+  });
+
+  it("`walkMaxEntries` reaches the walk, so a test does not need 50 000 files", async () => {
+    // The seam moved with the contract: it used to be `walkEntryLimit`, a cap
+    // the tool applied to its *own* counter. It is now the walk's own
+    // `maxEntries`, and the conservative reading is taken against it — so
+    // lowering it to 2 flags a 3-file workspace, and raising it above the file
+    // count does not.
+    const files: Record<string, string> = { "a.ts": "hit\n", "b.ts": "hit\n", "c.ts": "hit\n" };
+
+    const capped = await executeGrep(context(files), { pattern: "hit" }, { walkMaxEntries: 2 });
+    expect(capped.filesScanned).toBe(2);
+    expect(capped.searchTruncated).toBe(true);
+    expect(capped.note).toMatch(/entry cap/);
+
+    const whole = await executeGrep(context(files), { pattern: "hit" }, { walkMaxEntries: 3 });
+    // Exactly at the cap: the walk finished, and the bias still flags it.
+    expect(whole.filesScanned).toBe(3);
+    expect(whole.searchTruncated).toBe(true);
+    expect(whole.note).toMatch(/budget/);
+
+    const below = await executeGrep(context(files), { pattern: "hit" }, { walkMaxEntries: 4 });
+    expect(below.filesScanned).toBe(3);
+    expect(below.searchTruncated).toBe(false);
+    expect(below.note).toBeUndefined();
   });
 });

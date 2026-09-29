@@ -78,7 +78,7 @@ describe("the open path", () => {
     expect(response.result).toMatchObject({
       filename: "/baah.sqlite3",
       vfsName: "opfs-sahpool",
-      schemaVersion: 3,
+      schemaVersion: 4,
     });
 
     // The pragmas ran on the real connection, in the order `PRAGMAS` fixes.

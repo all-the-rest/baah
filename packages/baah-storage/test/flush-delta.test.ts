@@ -81,7 +81,7 @@ describe("a retried flush", () => {
     await db.flushDelta(payload);
     await db.flushDelta(payload);
 
-    expect(db.counts()).toEqual({ sessions: 1, messages: 1, parts: 1, partDeltas: 1 });
+    expect(db.counts()).toMatchObject({ sessions: 1, messages: 1, parts: 1, partDeltas: 1 });
   });
 
   it("does not advance the delta sequence on a retry", async () => {
@@ -169,7 +169,7 @@ describe("a rolled back flush", () => {
       }),
     ).rejects.toThrow(/FOREIGN KEY constraint/i);
 
-    expect(db.counts()).toEqual({ sessions: 0, messages: 0, parts: 0, partDeltas: 0 });
+    expect(db.counts()).toMatchObject({ sessions: 0, messages: 0, parts: 0, partDeltas: 0 });
   });
 
   it("is retryable after the cause is fixed", async () => {

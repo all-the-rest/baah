@@ -2,8 +2,10 @@ import {
   assertInsideRoot,
   basenamePath,
   byteLength,
+  DEFAULT_MAX_ENTRIES,
   defineTool,
   ToolError,
+  walkMayBeIncomplete,
   type ToolContext,
   type Workspace,
 } from "@all-the.rest/baah-core";
@@ -49,20 +51,6 @@ export const MAX_TOTAL_BYTES = 16 * 1024 * 1024;
  * `README.md`.
  */
 export const SEARCH_TIMEOUT_MS = 5_000;
-
-/**
- * Mirror of `baah-core`'s `DEFAULT_MAX_ENTRIES` — the number of entries
- * `Workspace.walk` yields before it gives up (`packages/baah-core/src/
- * workspace.ts:214`, `workspace/directory-workspace.ts:77`).
- *
- * **Stopgap.** `walk` returns `AsyncIterable<DirEntry>` and cannot say "I
- * stopped early", so the only way to notice the cap from here is to count the
- * entries that came out. That is a duplicated limit constant, and it is
- * conservative in the safe direction: a workspace with exactly this many
- * entries is reported as possibly-incomplete. It is replaced by a
- * `walkTruncated` flag on the walk itself — see the report.
- */
-export const WALK_ENTRY_LIMIT = 50_000;
 
 export const grepInputSchema = z.object({
   pattern: z
@@ -152,6 +140,11 @@ export interface GrepOutput {
    * This is the field a model must read before concluding "no matches". An
    * empty result with `searchTruncated: false` means "no match in what I
    * looked at"; with `true` it means "I stopped looking".
+   *
+   * Deliberately over-reporting for the walk cause: a workspace of exactly the
+   * walk's entry cap sets it, although that walk saw everything. The direction
+   * of the error is one-way on purpose — see `walkMayBeIncomplete` in
+   * `baah-core`.
    */
   searchTruncated: boolean;
   /** Model-facing explanation: why the list is short or empty. */
@@ -294,8 +287,14 @@ function compareMatches(a: GrepMatch, b: GrepMatch): number {
 export interface ExecuteGrepOptions {
   /** Overrides `SEARCH_TIMEOUT_MS`. */
   timeoutMs?: number;
-  /** Overrides `WALK_ENTRY_LIMIT`. */
-  walkEntryLimit?: number;
+  /**
+   * Overrides the walk's `maxEntries`.
+   *
+   * Handed to `Workspace.walk` itself — the tool has no cap of its own any
+   * more — and passed on to `walkMayBeIncomplete`, so the conservative reading
+   * is taken against the cap that was actually applied.
+   */
+  walkMaxEntries?: number;
 }
 
 export async function executeGrep(
@@ -307,7 +306,7 @@ export async function executeGrep(
   const limit = input.limit ?? DEFAULT_GREP_LIMIT;
   const literal = input.literal ?? false;
   const caseSensitive = input.caseSensitive ?? true;
-  const walkEntryLimit = options.walkEntryLimit ?? WALK_ENTRY_LIMIT;
+  const walkMaxEntries = options.walkMaxEntries ?? DEFAULT_MAX_ENTRIES;
 
   // Validate before touching the filesystem: an invalid regex is a model
   // mistake, not a search failure, and `literal` never compiles one. The
@@ -336,36 +335,41 @@ export async function executeGrep(
   }
 
   const candidates: Candidate[] = [];
-  let visited = 0;
-  let walkTruncated = false;
-  for await (const entry of context.workspace.walk(path, {
+  // The walk owns the answer to "did you see everything?". This tool no longer
+  // counts entries and no longer holds a copy of the cap: both used to be
+  // duplicated here, and a duplicated cap is a cap that drifts.
+  const walk = context.workspace.walk(path, {
     signal: context.signal,
+    maxEntries: walkMaxEntries,
     filter: (visitedEntry) => !isIgnored(visitedEntry.path, visitedEntry.kind),
-  })) {
-    visited += 1;
+  });
+  for await (const entry of walk.entries) {
     if (entry.kind === "file" && isIncluded(entry.path)) {
       candidates.push({
         path: entry.path,
         ...(entry.size !== undefined ? { size: entry.size } : {}),
       });
     }
-    // `Workspace.walk` yields exactly `walkEntryLimit` entries before it
-    // returns, so reaching that count means the walk may have been cut here:
-    // files after this point were never considered as candidates. The entry
-    // that hits the count is still processed — it *was* yielded.
-    if (visited >= walkEntryLimit) {
-      walkTruncated = true;
-      notes.push(
-        `The workspace walk stopped at its ${walkEntryLimit}-entry cap; entries after that point were never visited.`,
-      );
-      break;
-    }
+  }
+  // Conservative on purpose: a walk that finished *exactly* at the cap also
+  // reports as possibly-incomplete. The judgement lives in the walk's own
+  // module, because that is the only place that knows both the cap it applied
+  // and how many entries it handed out.
+  const walkIncomplete = walkMayBeIncomplete(walk, walkMaxEntries);
+  if (walk.truncated) {
+    notes.push(
+      `The workspace walk stopped at its ${walkMaxEntries}-entry cap; entries after that point were never visited.`,
+    );
+  } else if (walkIncomplete) {
+    notes.push(
+      `The workspace walk used its whole ${walkMaxEntries}-entry budget, so entries beyond it may exist and were not visited.`,
+    );
   }
   // An abort that lands during the walk ends the iteration without yielding
   // the rest. `walk` checks the signal at the top of each step, so this is the
   // only place that can observe it for the entries already seen — and it also
   // covers a signal that was aborted on entry, where nothing was seen at all.
-  if (context.signal.aborted && !walkTruncated) {
+  if (context.signal.aborted && !walkIncomplete) {
     notes.push("Search aborted — the walk stopped before it had seen every entry.");
   }
   candidates.sort((a, b) => a.path.localeCompare(b.path));
@@ -387,7 +391,7 @@ export async function executeGrep(
   const causes: IncompleteCause[] = [];
   if (search.truncated && search.stoppedBy === "timeout") causes.push("timeout");
   if (scan.stoppedBy === "bytes") causes.push("bytes");
-  if (walkTruncated) causes.push("walk");
+  if (walkIncomplete) causes.push("walk");
   if (scan.stoppedBy === "abort" || (search.truncated && search.stoppedBy === "abort")) {
     causes.push("abort");
   }
