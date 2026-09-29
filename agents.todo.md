@@ -30,11 +30,21 @@
 - [x] **Tools `glob`, `grep`** — `766c0f7`, 47 Tests
 - [x] **Workspaces (OPFS, File System Access) + Permission-Engine** — `917f223`, 87 Tests
 - [x] **Persistenz `baah-storage`** (Schema, Migrationen, Worker-RPC, Memory-Backend) — `fa7fb6e`, 270 Tests
-- [ ] **Verify: `glob`/`grep`** — eigener Verify-Agent, adversarial. **offen**
-- [ ] **Verify: Workspaces + Permission** — eigener Verify-Agent. **offen**
-- [ ] **Verify: `todo`/`question`** — eigener Verify-Agent. **offen**
-- [~] **Agent-Engine** (`ToolLoopAgent`, Classification, Backoff, Approval) — Build-Agent läuft
+- [~] **Verify: `glob`/`grep`** — Verify-Agent läuft. Prüft u. a., ob der
+      grep-wasm-Pfad im Bundle überhaupt eine plausible URL auflöst und ob der
+      JS-Fallback wirklich *gleichwertig* durch dasselbe Entry-Point läuft.
+- [!] **Verify: Workspaces + Permission** — **bewusst zurückgestellt.** Der Block
+      liegt in `packages/baah-core`, wo der Engine-Agent gerade schreibt. Ein
+      `pnpm test` im Core-Paket würde dessen halbfertige Tests mitlaufen lassen;
+      der Verify-Bericht zeigte dann Fremdfehler. Nach dem Engine-Block.
+- [~] **Verify: `todo`/`question`** — Verify-Agent läuft. Kernfrage vorab:
+      sind das überhaupt *Tools*? Im Vorbild ist ihr Inhalt **injizierter Text**,
+      kein Callable-Tool — falls `Plan.md` das so sagt, sind die 28 Tests gegen
+      eine Form gebaut, die nicht verdrahtet wird.
+- [~] **Agent-Engine** (`ToolLoopAgent`, Classification, Backoff, Approval) — Build-Agent läuft.
+      `stream/classify.ts` + `stream/backoff.ts` stehen, `agent/*` + `provider/*` fehlen.
 - [ ] **Verify: Agent-Engine** — eigener Verify-Agent, danach Mutationstest. **offen**
+      **Hängt an der Reihenfolge:** Core-Paket, gleiche Paketgrenze wie oben.
 
 ## Welle 2 — Engine verdrahten + Oberfläche
 
