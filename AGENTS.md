@@ -234,6 +234,33 @@ Während Build-Subagenten schreiben, gilt im Repo:
 - Faustregel vor jedem Orchestrator-Commit: `git status --short` muss genau
   die Dateien zeigen, die der aktuelle Commit enthalten soll.
 
+### 7.2b Append-only-Dateien werden nie mit `write` überschrieben
+
+`Plan.md` und `AGENTS.md` sind **wachsende Spezifikationen**. Sie werden
+ausschließlich **ergänzt**, nie ersetzt.
+
+- **Verboten:** ein Write-Tool auf eine dieser Dateien, um einen neuen
+  Abschnitt anzuhängen. `write` **ersetzt** den gesamten Inhalt.
+- **Richtig:** `edit` mit einem eindeutigen Anker am Ende der Datei, oder
+  `cat >> datei <<'EOF' … EOF`.
+- **Nach jedem Schreibvorgang gegenprüfen:** `wc -l` gegen den Wert **vor** dem
+  Schreiben. Sinkt die Zeilenzahl, wurde Inhalt zerstört.
+- Passiert es trotzdem: `git show <letzter-guter-commit>:<datei> > <datei>` und
+  die Ergänzungen erneut anhängen. Deshalb wird `Plan.md` in **jeder** Session
+  mit voller Historie committet, nicht erst am Ende.
+
+> **Vorfall in Welle 1 (2026-09-29):** `Plan.md` hatte 1.220 Zeilen. Ein
+> `write`-Aufruf, der nur den neuen Abschnitt §15 enthalten sollte, hat die
+> Datei auf 78 Zeilen reduziert — und ein zweiter auf 116. Die Spec §§6–14 waren
+> weg, **während ein Build-Agent gegen §6.1 programmierte**. Aufgefallen ist es
+> erst durch den Verify-Agenten, der die Diffs gegen §6.1 nicht fand und
+> nachfragte. Wiederhergestellt aus `d02a2c3` und um §15/§16 ergänzt.
+>
+> **Lehre:** Ein Subagent, der „ein Dokument liest, das es nicht gibt",
+> fällt nicht auf, sondern erfindet. Die Verifikation muss nicht nur den Code
+> prüfen, sondern auch, ob die Spezifikation, gegen die geprüft wird,
+> überhaupt noch existiert.
+
 Subagenten bekommen **nicht** die ganze `Plan.md`, sondern den relevanten
 Ausschnitt + Regeln — sonst arbeiten sie am Ziel vorbei.
 
