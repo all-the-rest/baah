@@ -94,7 +94,7 @@ verifiziert (§12).
 | `edit` | `@all-the.rest/baah-tool-edit` ✅ | write | exakter String-Ersatz; Fehler bei 0 Treffern; `>1` nur mit `replaceAll`; literale `$`-Sequenzen | ✅ fertig |
 | `list` | `@all-the.rest/baah-tool-list` ✅ | read | `dirHandle.values()`; Verzeichnisse zuerst, `limit`/`total`/`truncated` | ✅ fertig |
 | `glob` | `@all-the.rest/baah-tool-glob` | read | Walker über `values()` + **`picomatch@4`** (zero deps); Pfad-Index im Worker, damit es nach dem ersten Walk sofort ist | ✅ |
-| `grep` | `@all-the.rest/baah-tool-grep` | read | **`grep-wasm`** (echtes ripgrep als WASM, in-memory-API, wendet `.gitignore` an) + **JS-`RegExp`-Fallback**; Kandidatenliste über `ignore@7` | ✅ |
+| `grep` | `@all-the.rest/baah-tool-grep` | read | **JS-`RegExp`-Scanner als einzige Engine** (`grep-wasm` entfernt, Begründung §14.5); Kandidatenliste über `ignore@7`; `signal` + 5-s-Timeout; Hidden-Files wie im Vorbild | ✅ |
 | `patch` | `@all-the.rest/baah-tool-patch` | write | optionaler Mehr-Hunk-Editor auf `edit`-Basis | später |
 
 ### Tier 2 — Arbeitsorganisation und Delegation
@@ -1247,7 +1247,7 @@ und API-Key-Steuer zahlst du?".** Es gibt einen header-freien, quelloffenen Weg
 | Fähigkeit | 2026 möglich? | Paket |
 |---|---|---|
 | Echter Bash-Interpreter im Browser | ✅ **ohne Header** | **`just-bash@3.4.2`** (Apache-2.0) |
-| ripgrep als WASM, in-memory-Dateien | ✅ | **`grep-wasm@0.1.0`** (MIT/Unlicense) |
+| ripgrep als WASM, in-memory-Dateien | ❌ | **verworfen** — die Messung ergab zwei ungleiche Engines, also einen stillen Dialektwechsel. Siehe §14.5 |
 | `git status`/`log`/`commit` serverfrei | ✅ | `isomorphic-git@1.42.3` |
 | Untrusted JS sandboxen | ✅ ohne Header | `quickjs-emscripten@0.32.0` |
 | Tree-sitter-Parsing | ✅ | `web-tree-sitter@0.27.0` + Grammatik-Pakete |
@@ -1291,9 +1291,36 @@ im Speicher** entgegen — es läuft **nicht** selbst über einen
 `{path, content}` übergeben. Nicht enthalten: `-v`, `-c`, `-m`, `-A/-B/-C`,
 `-o`, Multiline, Binärsuche.
 
-**Risiko:** Version `0.1.0`, ein Maintainer. Deshalb ist der
-JS-`RegExp`-Scanner **kein Notnagel, sondern ein gleichwertiger Pfad** — und
-`grep-wasm` wird hinter eine Fähigkeitsprüfung gehängt, nicht vorausgesetzt.
+**Risiko:** Version `0.1.0`, ein Maintainer. ~~Deshalb ist der
+JS-`RegExp`-Scanner kein Notnagel, sondern ein gleichwertiger Pfad.~~
+
+**Korrigiert, weil die Verifikation es gemessen hat — diese Behauptung war
+falsch.** Die beiden Engines sind *nicht* gleichwertig: `\p{L}+` liefert auf
+ripgrep 6 Treffer und auf dem JS-Scanner 0, Lookaround und Backreferences nimmt
+nur eine von beiden an. Der Fallback war damit **kein Sicherheitsnetz, sondern ein
+stiller Dialektwechsel** — und das ist *schlimmer* als gar keine zweite Engine,
+denn das Ergebnis sieht in beiden Fällen identisch aus.
+
+→ **Entscheidung (umgesetzt): `grep-wasm` entfernt, nicht deaktiviert.** Die
+Begründung, die ich jetzt für die tragfähige halte, ist **nicht** die
+Schema-Argumentation und auch nicht „war langsam und ungenutzt":
+
+| Begründung | trägt? |
+|---|---|
+| „`0.1.0`, ein Maintainer" | Risiko, aber kein Beweis |
+| „lief nie — in keinem Test" | Symptom |
+| „kein Schemaparameter bildet eine ripgrep-Fähigkeit ab" | **wahr, aber nicht das stärkste** — das gilt ebenso für ein gut gewähltes Schema |
+| **„der Fallback log nicht mit, welche Sprache geantwortet hat"** | **das Entscheidende** |
+
+Die Abhängigkeit wurde also **nicht entfernt, weil sie ungenutzt war, sondern
+weil sie unehrlich war**: ein Tool, das ein Ergebnis liefert und nicht sagt,
+welche von zwei Query-Sprachen es war, ist ein Tool, das eine Behauptung über
+Vollständigkeit aufstellt, die es nicht einlösen kann.
+
+Der Scanner bleibt der **einzige** Motor, und sein Dialekt steht jetzt im
+`description`-Feld, damit das Modell ihn kennt (`Rust-regex-Teilmenge; kein
+Lookaround, keine Backreferences`). Die Naht bleibt: falls ripgrep zurückkommt,
+als **opt-in Accelerator mit Äquivalenztest** gegen den JS-Scanner.
 
 **Sucharchitektur (entschieden):** Beim Öffnen des Workspace einen **Pfad-Index**
 (`path`, `size`, `mtime`) im Worker aufbauen und persistieren. `glob`/`list`

@@ -1,5 +1,5 @@
 import { createMemoryWorkspace, type ToolContext } from "@all-the.rest/baah-core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { globTool } from "../src/index.ts";
 
@@ -10,6 +10,10 @@ function context(files: Record<string, string>, cwd = "."): ToolContext {
     signal: new AbortController().signal,
     approve: async () => "allow-once",
     emit: () => {},
+    // `ToolContext` carries replay bookkeeping (baah-core grew it while this
+    // package was being written); no search tool reads either field.
+    toolCallId: "test-call",
+    attempt: 1,
   };
 }
 
@@ -133,6 +137,8 @@ describe("glob tool", () => {
     expect(result.files).toHaveLength(2);
     expect(result.total).toBe(4);
     expect(result.truncated).toBe(true);
+    // `truncated` is about `limit`; the search itself looked at everything.
+    expect(result.searchTruncated).toBe(false);
     expect(result.hint).toMatch(/Narrow the pattern/);
     expect(result.hint).toContain("2 of 4");
   });
@@ -146,14 +152,26 @@ describe("glob tool", () => {
     expect(result.hint).toMatch(/No file matches/);
   });
 
-  it("sorts deterministically", async () => {
-    const ctx = context(TREE);
+  it("walks in directory order, not workspace order, and sorts what it returns", async () => {
+    // The workspace enumerates in insertion order, which is not a contract
+    // (`createMemoryWorkspace` sorts, a `FileSystemDirectoryHandle` does not).
+    // The tool must produce the same list either way, and it must be sorted.
+    const insertionOrdered: Record<string, string> = {
+      "z/last.ts": "x\n",
+      "a/first.ts": "x\n",
+      "m/middle.ts": "x\n",
+    };
+    const shuffled: Record<string, string> = {
+      "m/middle.ts": "x\n",
+      "z/last.ts": "x\n",
+      "a/first.ts": "x\n",
+    };
 
-    const first = await globTool.execute(ctx, { pattern: "**/*" });
-    const second = await globTool.execute(ctx, { pattern: "**/*" });
+    const one = await globTool.execute(context(insertionOrdered), { pattern: "**/*.ts" });
+    const two = await globTool.execute(context(shuffled), { pattern: "**/*.ts" });
 
-    expect(first.files).toEqual(second.files);
-    expect(first.files).toEqual([...first.files].sort((a, b) => a.localeCompare(b)));
+    expect(one.files).toEqual(["a/first.ts", "m/middle.ts", "z/last.ts"]);
+    expect(two.files).toEqual(one.files);
   });
 
   it("refuses to escape the workspace root", async () => {
@@ -179,17 +197,110 @@ describe("glob tool", () => {
     expect(globTool.inputSchema.safeParse({ pattern: "*" }).success).toBe(true);
   });
 
-  it("is a read-only tool", () => {
+  it("declares itself read-only, and the permission layer believes it", () => {
     expect(globTool.access).toBe("read");
-    expect(globTool.id).toBe("glob");
+    // Not a restatement of the literal: a read tool must run without an
+    // approval request. `read` is what `PermissionEngine` keys off.
+    const controller = new AbortController();
+    const approve = vi.fn(async () => "deny" as const);
+    const ctx: ToolContext = { ...context(TREE), approve, signal: controller.signal };
+
+    const gate = async () => {
+      const result = await globTool.execute(ctx, { pattern: "**/*.ts" });
+      return result;
+    };
+
+    // The tool never calls `approve`; the assertion is that a denying approver
+    // cannot make the tool fail, i.e. nothing in the read path is gated.
+    return gate().then((result) => {
+      expect(approve).not.toHaveBeenCalled();
+      expect(result.files).toContain("src/a.ts");
+    });
   });
 
-  it("stops when the abort signal fires", async () => {
+  it("stops when the abort signal fires, and says the result is partial", async () => {
     const controller = new AbortController();
     const ctx: ToolContext = { ...context(TREE), signal: controller.signal };
     controller.abort();
 
     const result = await globTool.execute(ctx, { pattern: "**/*" });
     expect(result.files).toEqual([]);
+    expect(result.total).toBe(0);
+    // An aborted walk visited nothing. Reporting `total: 0` without this flag
+    // would claim "the workspace has no matching files".
+    expect(result.searchTruncated).toBe(true);
+    // The flag alone is not enough: the model also has to be told *why*, and
+    // `note` is the only field that carries the reason. A truncation flag with
+    // no explanation is a flag the model learns to skim.
+    expect(result.note).toMatch(/aborted/i);
+    expect(result.hint).toMatch(/not a complete answer/);
+  });
+
+  it("an abort that lands mid-walk is reported, not just one that precedes it", async () => {
+    // A signal that is already aborted on entry is the easy case. This one
+    // fires after the third entry, so the walk yields a few matches and then
+    // stops — the result is non-empty *and* partial, and the flag is the only
+    // thing that says so. Without it the model reads `total: 3` as the number
+    // of matching files in the workspace.
+    const controller = new AbortController();
+    const tree: Record<string, string> = {
+      "a.ts": "x\n",
+      "b.ts": "x\n",
+      "c.ts": "x\n",
+      "d.ts": "x\n",
+      "e.ts": "x\n",
+    };
+    const base = createMemoryWorkspace(tree);
+    let seen = 0;
+    const workspace = {
+      ...base,
+      async *walk(directory = ".", options = {}) {
+        for await (const entry of base.walk(directory, options)) {
+          seen += 1;
+          if (seen === 3) controller.abort();
+          yield entry;
+        }
+      },
+    };
+
+    const result = await globTool.execute(
+      { ...context(tree), workspace, signal: controller.signal },
+      { pattern: "**/*.ts" },
+    );
+
+    expect(seen).toBeGreaterThanOrEqual(3);
+    expect(result.total).toBeLessThan(5);
+    expect(result.searchTruncated).toBe(true);
+    expect(result.hint).toMatch(/entry cap|complete answer/);
+    expect(result.note).toMatch(/aborted/i);
+  });
+
+  it("the walk-cap truncation is explained, not just flagged", async () => {
+    // The `note` names the cap and its size, so a model reading a partial
+    // result knows the ceiling it hit and can search a subtree instead of
+    // re-running the same glob.
+    const result = await globTool.execute(context(TREE), { pattern: "**/*", limit: 1 });
+
+    expect(result.searchTruncated).toBe(false);
+    expect(result.hint).not.toMatch(/complete answer/);
+
+    // Now the same tool over a tree that is past the cap.
+    const big: Record<string, string> = {};
+    for (let index = 0; index < 50_001; index += 1) {
+      big[`f${String(index).padStart(5, "0")}.ts`] = "x\n";
+    }
+    const capped = await globTool.execute(context(big), { pattern: "**/*.ts", limit: 1 });
+
+    expect(capped.searchTruncated).toBe(true);
+    expect(capped.note).toMatch(/50000/);
+    expect(capped.hint).toMatch(/not a complete answer/);
+    // `note` and `hint` must not contradict each other: one says an abort, the
+    // other blames the cap, and the model has no way to pick between them.
+    expect(capped.note).not.toMatch(/aborted/i);
+  });
+
+  it("reports searchTruncated: false for a complete search", async () => {
+    const result = await globTool.execute(context(TREE), { pattern: "**/*" });
+    expect(result.searchTruncated).toBe(false);
   });
 });

@@ -13,6 +13,10 @@ function context(files: Record<string, string>, cwd = "."): ToolContext {
     signal: new AbortController().signal,
     approve: async () => "allow-once",
     emit: () => {},
+    // `ToolContext` carries replay bookkeeping (baah-core grew it while this
+    // package was being written); no search tool reads either field.
+    toolCallId: "test-call",
+    attempt: 1,
   };
 }
 
@@ -136,13 +140,50 @@ describe("grep tool", () => {
     expect(result.matches).toHaveLength(1);
   });
 
-  it("skips node_modules, build output, hidden and binary files", async () => {
+  it("skips node_modules, build output and binary files", async () => {
     const result = await grepTool.execute(context(TREE), { pattern: "needle|secret" });
 
     expect(result.filesSkipped).toBeGreaterThanOrEqual(1);
     expect(result.matches.map((m) => m.path)).not.toContain("node_modules/pkg/index.js");
     expect(result.matches.map((m) => m.path)).not.toContain("dist/bundle.js");
-    expect(result.matches.map((m) => m.path)).not.toContain(".env");
+  });
+
+  it("searches dotfiles, like the reference's unconditional `--hidden`", async () => {
+    // This was a functional gap: `.env` sat in the test tree and was never
+    // searched. The reference passes `--hidden` to ripgrep unconditionally
+    // (`ripgrep.ts:221`), so `.github/workflows/*.yml` is exactly the kind of
+    // thing an agent must be able to grep.
+    const result = await grepTool.execute(context(TREE), { pattern: "NEEDLE=secret" });
+
+    expect(result.matches.map((m) => m.path)).toEqual([".env"]);
+  });
+
+  it("still skips `.git`, `node_modules` and the default-ignore set when hidden", async () => {
+    // "Hidden" and "ignored" are different: flipping `includeHidden` must not
+    // un-ignore the floor. `.git` is in `DEFAULT_IGNORED_DIRECTORIES`, so it
+    // stays out even though a dot-directory.
+    const ctx = context({
+      ".github/workflows/ci.yml": "runs: on push\n",
+      ".git/config": "[core]\n",
+      ".env": "TOKEN=1\n",
+      ".config/app.json": "{}\n",
+    });
+
+    const result = await grepTool.execute(ctx, { pattern: "." });
+
+    const paths = result.matches.map((m) => m.path);
+    expect(paths).toContain(".github/workflows/ci.yml");
+    expect(paths).toContain(".env");
+    expect(paths).toContain(".config/app.json");
+    expect(paths).not.toContain(".git/config");
+  });
+
+  it("`include` reaches a dotfile, since the filter no longer hides it", async () => {
+    const ctx = context({ ".github/workflows/ci.yml": "runs: on push\n", "a.ts": "runs\n" });
+
+    const result = await grepTool.execute(ctx, { pattern: "runs", include: "*.yml" });
+
+    expect(result.matches.map((m) => m.path)).toEqual([".github/workflows/ci.yml"]);
   });
 
   it("counts a NUL-containing file as skipped", async () => {
@@ -215,78 +256,51 @@ describe("grep tool", () => {
   });
 });
 
-describe("grep engines", () => {
+describe("the match scanner", () => {
   const FILES: GrepFile[] = [
     { path: "src/a.ts", content: "const alpha = 1;\nconst beta = 2;\nconst ALPHA = 3;\n" },
     { path: "src/b.ts", content: "function gamma() {\n  return 'alpha';\n}\n" },
   ];
 
-  it("the JS RegExp engine finds regex matches with file and line", () => {
-    const matches = searchWithRegExp({
-      files: FILES,
-      pattern: "alpha",
-      caseSensitive: true,
-    });
+  it("finds regex matches with file and line", () => {
+    const result = searchWithRegExp({ files: FILES, pattern: "alpha", caseSensitive: true });
 
-    expect(matches).toEqual([
+    expect(result.truncated).toBe(false);
+    expect(result.matches).toEqual([
       { path: "src/a.ts", line: 1, text: "const alpha = 1;" },
       { path: "src/b.ts", line: 2, text: "  return 'alpha';" },
     ]);
   });
 
-  it("the JS RegExp engine honours case sensitivity", () => {
-    const matches = searchWithRegExp({
-      files: FILES,
-      pattern: "alpha",
-      caseSensitive: false,
-    });
+  it("honours case sensitivity", () => {
+    const result = searchWithRegExp({ files: FILES, pattern: "alpha", caseSensitive: false });
 
-    expect(matches.map((m) => `${m.path}:${m.line}`)).toEqual(["src/a.ts:1", "src/a.ts:3", "src/b.ts:2"]);
+    expect(result.matches.map((m) => `${m.path}:${m.line}`)).toEqual([
+      "src/a.ts:1",
+      "src/a.ts:3",
+      "src/b.ts:2",
+    ]);
   });
 
-  it("the JS RegExp engine rejects an invalid pattern with a clear error", () => {
+  it("rejects an invalid pattern with a clear error", () => {
     expect(() =>
       searchWithRegExp({ files: FILES, pattern: "(", caseSensitive: true }),
     ).toThrow(/Invalid regular expression/);
   });
 
-  it("the tool result equals the JS engine for the same case", async () => {
+  it("the tool's result equals the scanner's result for the same files", async () => {
+    // A real end-to-end-vs-unit check: the tool reads the workspace, filters,
+    // sorts and caps, and the answer still has to be the scanner's answer.
     const ctx = context({
       "src/a.ts": FILES[0]!.content,
       "src/b.ts": FILES[1]!.content,
     });
 
     const result = await grepTool.execute(ctx, { pattern: "alpha" });
-    const expected = searchWithRegExp({
-      files: FILES,
-      pattern: "alpha",
-      caseSensitive: true,
-    });
+    const expected = searchWithRegExp({ files: FILES, pattern: "alpha", caseSensitive: true });
 
-    expect(result.matches).toEqual(expected);
-  });
-
-  it("reports which engine ran", async () => {
-    const ctx = context({ "a.ts": "needle\n" });
-    const result = await grepTool.execute(ctx, { pattern: "needle" });
-
-    expect(["grep-wasm", "javascript"]).toContain(result.engine);
-    if (result.engine === "javascript") {
-      expect(result.note).toMatch(/grep-wasm unavailable/);
-    }
-  });
-
-  it("does not fetch the WASM module when there is nothing to scan", async () => {
-    // Every file is filtered out, so no engine is even attempted and no
-    // "grep-wasm unavailable" noise is attached to a legitimate empty result.
-    const ctx = context({ "node_modules/pkg/index.js": "needle\n" });
-
-    const result = await grepTool.execute(ctx, { pattern: "needle" });
-
-    expect(result.filesScanned).toBe(0);
-    expect(result.engine).toBe("javascript");
-    expect(result.note).toBeUndefined();
-    expect(result.hint).toMatch(/No line matches/);
+    expect(result.matches).toEqual(expected.matches);
+    expect(result.searchTruncated).toBe(false);
   });
 });
 

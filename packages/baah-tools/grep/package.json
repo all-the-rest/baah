@@ -12,7 +12,6 @@
   },
   "dependencies": {
     "@all-the.rest/baah-core": "workspace:*",
-    "grep-wasm": "^0.1.0",
     "ignore": "^7.0.10",
     "zod": "^4.6.5"
   },
