@@ -206,7 +206,7 @@ pnpm build       # Produktions-Build
   eigene Test-Suite, 52 Tests gesamt.
 - ✅ **Recherche:** Dateizugriff, Browser-Datenbank, Vorbild-Innenleben,
   AI SDK, Shell-/Such-Alternativen — belegt in [`Plan.md`](Plan.md) §14.
-- 🔜 **Nächste Phase:** OPFS-Workspace, SQLite-Worker, Loop-Skelett,
+- 🔜 **Nächste Phase:** Welle 1 — SQLite-Worker, Workspace-Implementierungen, `glob`/`grep`;
   `glob`/`grep`.
 
 Die vollständige Roadmap und die Herleitung jeder Entscheidung stehen in

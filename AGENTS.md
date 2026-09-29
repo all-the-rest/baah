@@ -112,21 +112,23 @@ Weitere Regeln:
 ## 4. Repo-Layout
 
 ```
-apps/web/                React-SPA (UI, Routing, Worker-Registrierung)
-  src/                   UI-Code
-packages/core/           Harness-Engine: Agent-Loop, Tool-Registry,
-                         Workspace-Abstraktion, Storage-Adapter.
-                         Node-frei, worker-tauglich, unit-getestet.
-packages/tools/<id>/     EIN Package pro Tool ("read", "grep", "edit", …).
-Plan.md                  Spezifikation (Ziel, Architektur, Phasen)
-AGENTS.md                diese Regeln
+packages/baah-web/         React-SPA (UI, Onboarding, Transcript, Settings)
+  src/                     UI-Code
+packages/baah-core/        Harness-Engine: Agent-Loop, Tool-Registry,
+                           Workspace-Abstraktion. Node-frei, worker-tauglich,
+                           unit-getestet.
+packages/baah-storage/     Persistenz: SQLite-WASM im Web Worker, Schema,
+                           Migrationen, Drizzle-Zugriff.
+packages/baah-tools/<id>/  EIN Package pro Tool ("read", "grep", "edit", …).
+Plan.md                    Spezifikation (Ziel, Architektur, Phasen)
+AGENTS.md                  diese Regeln
 ```
 
-- **Schichtregel:** `apps/web` → `packages/tools/*` → `packages/core`.
+- **Schichtregel:** `baah-web` → `baah-tools/*` + `baah-storage` → `baah-core`.
   Abhängigkeiten zeigen **nie** zurück. `core` kennt weder React noch DOM-UI,
-  noch die konkreten Tools.
+  noch die konkreten Tools, noch `baah-storage`.
 - **Ein Tool = ein Package.** Konvention:
-  - Verzeichnis `packages/tools/<id>/`, Paketname `@all-the.rest/baah-tool-<id>`.
+  - Verzeichnis `packages/baah-tools/<id>/`, Paketname `@all-the.rest/baah-tool-<id>`.
   - `src/index.ts` exportiert die Definition als benannten Export
     (`export const readTool`) **und** als `default`.
   - Das Tool ist ein `ToolDefinition` aus `@all-the.rest/baah-core` (`defineTool({...})`):
@@ -177,27 +179,67 @@ pnpm check        # = pnpm typecheck && pnpm test
   Unit-Test bewiesen werden ⇒ dafür ein manuelles Prüfskript/Schrittliste in
   `Plan.md` §9 pflegen und im PR/Commit referenzieren.
 
-## 7. Orchestrierung & Subagenten
+## 7. Orchestrierung, Wellen & Subagenten
 
 Der Haupt-Agent ist **Orchestrator**, nicht Implementierer größerer Teile.
-Für jede größere Arbeitseinheit (Feature-Slice aus `Plan.md` §8):
 
-1. **Implementer-Subagent** bekommt: Ziel, betroffene Dateien, Akzeptanzkriterien,
-   die relevanten `AGENTS.md`-Regeln und den Verifikationsbefehl.
-2. **Verifier-Subagent** (separate, unabhängige Session) prüft anschließend
-   gegen dieselben Akzeptanzkriterien: Tests laufen lassen, Code lesen,
-   Grenzfälle suchen, Regelverstöße melden.
-3. **Regel:** Niemals lässt man denselben Subagenten seine eigene Arbeit
-   verifizieren. Implementierung und Verifikation sind getrennte Sessions.
-4. Der Orchestrator führt zusammen, behebt Integrationsbrüche und committet.
+### 7.1 Wellen
+
+Die Umsetzung läuft in **Wellen**. Jede Welle hat ein klares Fertig-Kriterium
+und wird erst verifiziert abgeschlossen, bevor die nächste beginnt.
+
+| Welle | Inhalt | Fertig, wenn |
+|---|---|---|
+| **0** | Fundament, Recherche, Rename, Veröffentlichung | ✅ erledigt |
+| **1** | Persistenz (`baah-storage`), Workspace-Implementierungen, Tier-1-Suche (`glob`/`grep`), Tier-2-Basis (`todo`/`question`) | Tests grün, Workspace-Implementierungen erfüllen `Workspace`, Schemata migrierbar |
+| **2** | Agent-Loop, Onboarding, Transcript, Tool-/Approval-Karten, Settings, Export/Import | Durchlauf 0 → Chat im Browser |
+| **3** | E2E (Playwright, gefälschte OpenAI-kompatible Antworten) + UI-Verifikation | E2E grün, Screenshots geprüft, Befunde behoben |
+| **4** | `shell`, `git`, `task`/Subagent, `webfetch`, Service-Worker-Infrastruktur, `AGENTS.md`-Injektion | jeweils mit Tests |
+
+Regeln für Wellen:
+
+- **Welle 1 endet mit einem unabhängigen Verify-Subagenten**, bevor Welle 2
+  startet. Kein „wird schon passen".
+- Welle 1 wird **parallel** gebaut, aber nur mit **disjunkten Dateibesitzern**.
+  Der Orchestrator legt vorher alle `package.json` an und installiert **einmal** —
+  parallele `pnpm install`-Läufe zerstreiten am Lockfile.
+
+### 7.2 Build und Verify sind getrennte Subagenten
+
+Für **jeden Aufgabenblock** einer Welle:
+
+1. **Build-Subagent** bekommt: Ziel, die exakt zugewiesenen Dateien,
+   Akzeptanzkriterien, die relevanten `AGENTS.md`-Regeln, den Verifikationsbefehl.
+   Er committet **nicht**.
+2. **Verify-Subagent** — **eigene Session, nie dieselbe wie Build** — prüft gegen
+   dieselben Akzeptanzkriterien: Tests ausführen, Code lesen, Grenzfälle suchen,
+   Regelverstöße melden, eigene Probe-Tests schreiben und wieder löschen.
+3. Der Orchestrator behebt die Befunde, committet und meldet.
+
+**Regel:** Ein Subagent darf seine eigene Arbeit nie verifizieren.
 
 Subagenten bekommen **nicht** die ganze `Plan.md`, sondern den relevanten
 Ausschnitt + Regeln — sonst arbeiten sie am Ziel vorbei.
 
+### 7.3 Fortschritt melden
+
+Der Orchestrator meldet **am Ende jeder Welle** und bei jedem Abschluss eines
+Aufgabenblocks zwei getrennte Zahlen:
+
+| Kennzahl | Bedeutung | Frage, die sie beantwortet |
+|---|---|---|
+| **Completion %** | Fertigstellung | Wie viel des Ziels aus `Plan.md` §1 (DoD) ist gebaut und verifiziert? |
+| **Change %** | Planstabilität | Wie viel des ursprünglichen Plans wurde durch die Arbeit revidiert — neue Entscheidungen, verworfene Annahmen, verschobener Scope? |
+
+**Regel:** Beide Zahlen werden **geschätzt, aber begründet** — mit den Werten pro
+Welle und den konkreten Entscheidungen, aus denen die Change-% abgeleitet sind.
+Eine Zahl ohne Begründung ist wertlos; `Completion` ohne `Change` verdeckt,
+wie viel Plan unterwegs neu erfunden wurde.
+
 ## 8. Git
 
 - Kleine, thematische Commits; ein Commit = eine logische Änderung.
-- `main` bleibt lauffähig (`pnpm check` grün).
+- `main` bleibt lauffähig (# = pnpm typecheck && pnpm testgrün).
 - `node_modules/`, `dist/`, Testartefakte sind gitignored — nie committen.
 - Kein `git push` ohne ausdrückliche Anweisung des Nutzers.
 

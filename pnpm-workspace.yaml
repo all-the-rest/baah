@@ -1,8 +1,11 @@
 packages:
   - packages/baah-web
-
   - packages/baah-core
+  - packages/baah-storage
   - packages/baah-tools/*
+
+allowBuilds:
+  esbuild: true
 
 minimumReleaseAgeExclude:
   - '@ai-sdk/gateway@4.0.100'
