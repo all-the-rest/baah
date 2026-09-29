@@ -10,5 +10,7 @@ export * from "./path.ts";
 export * from "./registry.ts";
 export * from "./tool.ts";
 export * from "./workspace.ts";
+export * from "./ignore.ts";
+export * from "./permission.ts";
 
 export const CORE_PACKAGE = "@all-the.rest/baah-core";

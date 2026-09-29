@@ -12,4 +12,11 @@ export default defineConfig({
   define: {
     "import.meta.env.BAAH_BROWSER_ONLY": JSON.stringify("true"),
   },
+  optimizeDeps: {
+    // Both packages load a .wasm binary through `import.meta.url`. Vite's
+    // dependency pre-bundling rewrites that URL and the module then fails to
+    // fetch the binary, so neither may be pre-bundled.
+    // See packages/baah-tools/grep/README.md and packages/baah-storage/README.md.
+    exclude: ["grep-wasm", "@sqlite.org/sqlite-wasm"],
+  },
 });

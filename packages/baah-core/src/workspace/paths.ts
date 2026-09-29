@@ -65,6 +65,10 @@ export function isDirectoryHandle(handle: FileSystemHandle): handle is FileSyste
 /**
  * Walk to a directory, optionally creating the missing segments.
  *
+ * The path is normalised and checked against the root first, so `a/../b`
+ * resolves to `b` and `..` is refused instead of being looked up as a literal
+ * directory name.
+ *
  * `"."` returns the root itself, untouched.
  */
 export async function resolveDirectory(
@@ -72,7 +76,7 @@ export async function resolveDirectory(
   path: string,
   options: { readonly create?: boolean } = {},
 ): Promise<FileSystemDirectoryHandle> {
-  const segments = toSegments(path);
+  const segments = toSegments(resolveWorkspacePath(".", path));
   if (segments.length === 0) return root;
 
   let current = root;
@@ -105,21 +109,22 @@ export async function resolveFile(
   path: string,
   options: { readonly create?: boolean } = {},
 ): Promise<ResolvedFile> {
-  const segments = toSegments(path);
+  const target = resolveWorkspacePath(".", path);
+  const segments = toSegments(target);
   const name = segments.pop();
   if (name === undefined) {
-    throw new WorkspaceError(`Cannot write to the workspace root: ${path}`, "unsupported");
+    throw new WorkspaceError(`Cannot write to the workspace root: ${target}`, "unsupported");
   }
 
   const parent = await resolveDirectory(root, segments.join("/"));
-  const handle = await guardHandle(path, "file", () =>
+  const handle = await guardHandle(target, "file", () =>
     parent.getFileHandle(name, options.create ? { create: true } : undefined),
   );
   if (handle.kind !== "file") {
-    throw new WorkspaceError(`Not a file: ${path}`, "not_a_file");
+    throw new WorkspaceError(`Not a file: ${target}`, "not_a_file");
   }
 
-  return { path, name, parent, handle };
+  return { path: target, name, parent, handle };
 }
 
 /** `mkdir -p` for handles: every missing segment becomes a directory. */
