@@ -65,6 +65,7 @@ mit KI“, sondern gezielt **dieses Tool-Set** nach — nur eben web-first.
 | **Vollständiges LSP/Debugging** | Nicht Teil des Basis-Sets. |
 | **Multi-User, Accounts, Cloud-Sync** | Wäre wieder ein Server. Export/Import (§8) deckt den Umzug ab. |
 | **Headless-Browser-Steuerung** | Ein Browser steuert sich nicht selbst; das ist ein Feature *anderer* Harnesses. |
+| **Streaming-Proxy / Long-Polling-Transport** | Siehe §5.4. Ein Proxy wäre die einzige saubere Lösung für einen gebrochenen Middlebox-Weg — er wäre aber wieder ein Server, dem man den API-Key anvertrauen müsste. **Wann sich ein Proxy lohnt:** hinter einem Firmen-Gateway, das Streaming zerlegt, oder für Provider ohne CORS. Beides ist bewusste Tragweite, keine Lücke. |
 
 ## 3. Harte Constraints
 
@@ -252,7 +253,38 @@ erwartet ein Firefox-Nutzer Speicherungen auf der Platte, die nicht passieren.
   aufbauen, mit Ignore-Liste, Byte-Cap und Binär-Sniffing (§14.1).
 
 
-### 5.4 Shell — von „nicht v1" zu „v1 möglich" (revidiert)
+### 5.4 Stream-Transport: Streaming ist der einzige Weg
+
+**Streaming (SSE) ist Default und einziger Transport.** Es gibt bewusst
+**keinen** zweiten „Long-Polling"-Transport — das ist eine begründete
+Entscheidung, keine Auslassung:
+
+- Eine OpenAI-kompatible API hat **keine Job-ID**, die man pollen könnte. Es
+  gibt keine Anfrageform, die einen kaputten Stream-Middlebox überlebt, außer
+  gar nicht zu streamen.
+- Die einzige saubere Lösung für einen gebrochenen Middlebox-Weg wäre ein
+  **Proxy** — und der ist out of scope, siehe §2.
+
+**Was wir stattdessen bauen** — ein Detektor plus genau **einen** Fallback:
+
+| Symptom im Betrieb | Ursache | Reaktion |
+|---|---|---|
+| Deltas kommen alle am Ende auf einmal | Proxy puffert (Content-Length statt chunked) | Endpoint als „buffered" merken, UI stellt um, **kein** erneutes Senden |
+| Verbindung bricht mitten im Stream ab | Middlebox verkorkst Transfer-Encoding | **ein** Retry desselben Turns mit `stream: false`, dann sofort rendern |
+| `Failed to fetch` ohne alles | CORS / Netzwerk | Provider-Fehler, Key prüfen — vom Middlebox-Fall nicht zu unterscheiden |
+
+- **Passive Erkennung:** kommen nach dem Request ~1,5 s lang keine Deltas, oder
+  kam die Antwort in einem Stück, gilt der Endpoint als `buffered`. Das Ergebnis
+  wird pro `provider + baseURL` gemerkt.
+- **Onboarding-Probe:** einmal beim Einrichten des Endpoints, damit es vor dem
+  ersten echten Turn bekannt ist.
+- **Sichtbar und dauerhaft:** ein Hinweis, dass Antworten in dieser Umgebung am
+  Stück erscheinen. Ohne den Hinweis hält man die UI für kaputt.
+- **Fallback-Implementierung:** `generateText` (ohne Stream) →
+  `createUIMessageStream` mit synthetischen `text-delta`-Chunks. Kein eigener
+  Transport, kein zweiter Codepfad im Loop.
+
+### 5.5 Shell — von „nicht v1" zu „v1 möglich" (revidiert)
 
 Ursprünglich hatte ich Shell vertagt. Die Recherche (§14.5) hat das widerlegt:
 es gibt eine **header-freie, quelloffene** Option, die auf unserem

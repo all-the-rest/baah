@@ -17,6 +17,9 @@ importers:
       ai:
         specifier: ^7.0.122
         version: 7.0.122(zod@4.6.5)
+      ignore:
+        specifier: ^7.0.10
+        version: 7.0.10
       zod:
         specifier: ^4.6.5
         version: 4.6.5
