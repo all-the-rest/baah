@@ -1,0 +1,21 @@
+{
+  "name": "opencode-harness-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "packageManager": "pnpm@12.4.2",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @ohw/web dev",
+    "build": "pnpm -r build",
+    "preview": "pnpm --filter @ohw/web preview",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}
