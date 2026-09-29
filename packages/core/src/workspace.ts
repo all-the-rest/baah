@@ -46,6 +46,18 @@ export interface Workspace {
   stat(path: string): Promise<FileStat | null>;
   exists(path: string): Promise<boolean>;
   readText(path: string): Promise<string>;
+  /**
+   * Write `content` as UTF-8 text, creating the file if needed and creating
+   * any missing parent directories on the way (like `mkdir -p`). An existing
+   * file is overwritten.
+   *
+   * Implementations MUST reject:
+   * - the workspace root itself (`.`),
+   * - a target that is an existing **directory**,
+   * - a path whose parent segment is an existing **file**.
+   *
+   * Tools rely on this contract instead of re-implementing it.
+   */
   writeText(path: string, content: string): Promise<void>;
   list(path: string): Promise<DirEntry[]>;
   remove(path: string, options?: RemoveOptions): Promise<void>;
@@ -60,6 +72,18 @@ export class WorkspaceError extends Error {
     super(message);
     this.name = "WorkspaceError";
   }
+}
+
+const encoder = new TextEncoder();
+
+/** UTF-8 byte length. `String#length` counts UTF-16 units, which is not a size. */
+export function byteLength(value: string): number {
+  return encoder.encode(value).length;
+}
+
+/** `"."`, `""` and `"/"` all denote the workspace root, which is not writable. */
+export function isWorkspaceRoot(path: string): boolean {
+  return path === "." || path === "" || path === "/";
 }
 
 interface MemoryNode {
@@ -87,7 +111,11 @@ export function createMemoryWorkspace(
     let current = "";
     for (const segment of segments) {
       current = current === "" ? segment : `${current}/${segment}`;
-      if (!nodes.has(current)) {
+      const existing = nodes.get(current);
+      if (existing && existing.kind !== "directory") {
+        throw new WorkspaceError(`Not a directory: ${current}`, "not_a_directory");
+      }
+      if (!existing) {
         nodes.set(current, { kind: "directory", content: "", lastModified: 0 });
       }
     }
@@ -116,7 +144,7 @@ export function createMemoryWorkspace(
       if (!node) return null;
       return {
         kind: node.kind,
-        size: node.kind === "file" ? node.content.length : 0,
+        size: node.kind === "file" ? byteLength(node.content) : 0,
         lastModified: node.lastModified,
       };
     },
@@ -130,6 +158,16 @@ export function createMemoryWorkspace(
     },
 
     async writeText(path, content) {
+      if (isWorkspaceRoot(path)) {
+        throw new WorkspaceError(
+          `Cannot write to the workspace root: ${path}`,
+          "unsupported",
+        );
+      }
+      const existing = nodes.get(path);
+      if (existing && existing.kind === "directory") {
+        throw new WorkspaceError(`Not a file: ${path}`, "not_a_file");
+      }
       ensureParents(path);
       nodes.set(path, { kind: "file", content, lastModified: Date.now() });
     },
@@ -149,7 +187,7 @@ export function createMemoryWorkspace(
           path: childPath,
           name: first,
           kind,
-          ...(kind === "file" ? { size: node.content.length } : {}),
+          ...(kind === "file" ? { size: byteLength(node.content) } : {}),
         });
       }
       return [...seen.values()].sort((a, b) => a.path.localeCompare(b.path));
@@ -186,7 +224,7 @@ export function createMemoryWorkspace(
           path: key,
           name: key.slice(key.lastIndexOf("/") + 1),
           kind: node.kind,
-          ...(node.kind === "file" ? { size: node.content.length } : {}),
+          ...(node.kind === "file" ? { size: byteLength(node.content) } : {}),
         };
         if (options.filter && !options.filter(entry)) continue;
         visited += 1;

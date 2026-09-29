@@ -66,8 +66,15 @@ describe("assertInsideRoot", () => {
     expect(assertInsideRoot("sub", "a.ts")).toBe("sub/a.ts");
   });
 
-  it("treats a leading / as workspace-root relative", () => {
+  it("treats a leading / as workspace-root relative, regardless of cwd", () => {
     expect(assertInsideRoot(".", "/src/a.ts")).toBe("src/a.ts");
+    expect(assertInsideRoot("sub", "/src/a.ts")).toBe("src/a.ts");
+    expect(assertInsideRoot("deep/nested", "/src/a.ts")).toBe("src/a.ts");
+  });
+
+  it("resolves relative paths against cwd", () => {
+    expect(assertInsideRoot("sub", "a.ts")).toBe("sub/a.ts");
+    expect(assertInsideRoot("sub", "../a.ts")).toBe("a.ts");
   });
 
   it("rejects escapes", () => {

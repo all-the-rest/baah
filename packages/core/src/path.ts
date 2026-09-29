@@ -104,12 +104,13 @@ export function assertInsideRoot(root: string, target: string): string {
   const rootDir = normalizedRoot === "/" ? "." : normalizedRoot;
 
   const targetPath = normalizePath(target);
-  const relativeTarget = isAbsolutePath(targetPath)
-    ? normalizePath(targetPath.slice(1) || ".")
-    : targetPath;
 
-  const combined =
-    rootDir === "." ? relativeTarget : normalizePath(`${rootDir}/${relativeTarget}`);
+  // A leading "/" means "from the workspace root", regardless of cwd.
+  const combined = isAbsolutePath(targetPath)
+    ? normalizePath(targetPath.slice(1) || ".")
+    : rootDir === "."
+      ? targetPath
+      : normalizePath(`${rootDir}/${targetPath}`);
 
   if (combined === ".." || combined.startsWith("../")) {
     throw new Error(`Path escapes the workspace root: ${target}`);
