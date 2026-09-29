@@ -1572,6 +1572,114 @@ durch zod.
 | 11 zusätzliche `CHECK`-Constraints | Härtung; `parts.type IN (text, reasoning, tool)` ist dagegen **vom Plan gefordert** |
 | 11 Indizes | §6.1 listet keine; aus dem Hot-Path abgeleitet |
 
+#### Nachtrag: `tool_invocations` nach der Migration 4 (Build-Block W2-A)
+
+`Plan.md` §6.1 nannte für `tool_invocations` weder den Aufrufschlüssel noch den neuen
+Status. Beides nachgetragen — **angehängt, nicht überschrieben** (`AGENTS.md` §7.2b).
+
+| Spalte | Zweck |
+|---|---|
+| `session_id` | Session-Scoping des Kurzschlusses (existierte schon als Spalte) |
+| `attempt` | 1-basierter Versuchszähler |
+| `tool_call_id` | die Id des Aufrufs, **nicht** die Zeilen-Id |
+| `occurrence` | trennt zwei Aufrufe, die dieselbe `toolCallId` tragen |
+| `status` | **`begun` \| `done`** — genau zwei Werte |
+| `output` | was ein Replay zurückgibt. **Nicht** `result_preview`. |
+| `result_preview` | bleibt, für die UI |
+
+```sql
+UNIQUE (session_id, attempt, tool_call_id, occurrence)
+```
+
+**Spalten, nicht nur Key-Berechnung.** §6.1 ließ die Frage offen („gehören in die
+Key-Berechnung des Stores, nicht zwingend in die Tabelle"). Geschlossen, weil ein
+Schlüssel, den die Datenbank nicht erzwingen kann, einer ist, über den SQLite und die
+In-Memory-Map sich uneinig werden *dürfen* — und genau das war schon zweimal passiert.
+
+**`status` auf zwei Werte verengt.** Es waren sechs (`pending`, `awaiting_approval`,
+`running`, `completed`, `failed`, `aborted`) — und **das war das Crash-Fenster**:
+`beginToolCall` und `recordToolCall` schrieben in dasselbe Feld, also war „begonnen,
+Ausgang unbekannt" nicht darstellbar. §7.5 modelliert eine offene Freigabe über
+`approvals.decision IS NULL` und braucht keinen Lifecycle-Wert.
+
+**`recordToolCall` ist ein Upsert, `beginToolCall` ist `DO NOTHING` — asymmetrisch, aus
+Grund.** Ein `DO UPDATE` auf `begin` würde ein `done` auf `begun` herabstufen, und der
+nächste Replay liefe das Tool noch einmal. Nur ein Insert darf `begun` schreiben. Und
+`record` verwirft nichts: das `begin` ist die_write, die verloren gehen *kann*; die
+einzige Aussage, die die Engine belegen kann, ist „das Tool hat das zurückgegeben".
+
+#### Migration 4 ist ein **Rebuild** — und dafür braucht es eine SQLite-Falle
+
+Erste Rebuild-Migration im Paket. Ein Rebuild kann `IF NOT EXISTS` nicht tragen;
+Idempotenz kommt aus der Transaktion plus `schema_migrations`, **gemessen** (5×
+`applyMigrations` auf echtem SQLite: identische Rows, identisches `sqlite_master`,
+4 Versionszeilen).
+
+**Die Falle, die beim *Messen* gefunden wurde und beim Lesen nicht:** `DROP TABLE` auf
+eine Tabelle, auf die andere zeigen, ist ein implizites `DELETE FROM` — und
+`ON DELETE CASCADE` **feuert trotzdem**. `PRAGMA defer_foreign_keys` hilft **nicht**: es
+vertreagt die Constraint-*Prüfung*, nicht den Kaskaden, und danach ist nichts mehr zu
+prüfen. Ohne Parkplatz-Tabelle hätte die Migration **jede `approvals`-Zeile
+stillschweigend gelöscht**.
+
+Die Parkplatz-Tabelle selbst war in der ersten Fassung **zweimal** getötet: erst von
+`approvals`, dann von ihrem eigenen kaskadierenden Fremdschlüssel. Beide Varianten sind
+als Test festgenagelt. **Wer die nächste schreibt, kopiert nicht die DDL — er liest
+diesen Absatz.**
+
+Die Kopie ist absichtlich **verlustbehaftet in die sichere Richtung**: nur `completed` ist
+Evidenz für ein Ergebnis, also nur das wird `done`; alles andere wird `begun`. Und
+`output` bleibt **NULL** statt `result_preview` — ein gekürzter Präview, der einem Replay
+als Antwort des Tools zurückgegeben wird, ist dieselbe Lüge, die die Spalte beseitigt.
+
+Die Migration ist fest an **Version 4** gebunden. Ein späterer Schemaumbau braucht
+Version 5, nicht eine neue `CREATE TABLE`-Zeile in Schritt 1.
+
+#### `Workspace.walk` meldet jetzt seine eigene Trunkierung
+
+```ts
+export const DEFAULT_MAX_ENTRIES: number;   // 50_000, jetzt exportiert
+export interface WalkResult {
+  entries: AsyncIterable<DirEntry>;
+  truncated: boolean;   // true, wenn ein Eintrag DA war und nicht genommen wurde
+  visited: number;
+}
+walk(directory?, options?): WalkResult;      // synchron, siehe Kommentar im Code
+```
+
+`truncated` ist wörtlich umgesetzt: der Cap wird **vor** dem `yield` geprüft. Es ist
+also eine Aussage über den **Baum**, nicht über einen Zähler, der zufällig auf der
+Grenze landete. **Ein Abbruch ist keine Trunkierung** (der Aufrufer hat ihn ausgelöst,
+er weiß es) und ein Baum mit **genau** `maxEntries` ist es auch nicht.
+
+`walkMayBeIncomplete(result, maxEntries?)` wohnt **im Walk**, nicht in den Tools: nur der
+Walk kennt **beides**, was die Beurteilung braucht — den angewandten Cap und die
+herausgegebene Eintrittszahl. Ein Tool, das eines von beidem neu ableitet, wäre eine
+**dritte** Kopie einer Zahl, die zweimal auseinandergelaufen ist.
+
+Die Verzerrung überberichtet **weiter absichtlich**: `visited >= maxEntries ⇒ true`, auch
+wenn der Walk fertig war. Ein Modell, dem einmal zu oft „vollständig" gesagt wird, handelt
+auf einer Teilsuche.
+
+#### Beschlossen: der `TurnStore`-Adapter gehört in `baah-storage`
+
+`StorageDatabase` erfüllt die vier neuen Methoden bereits strukturell identisch zu
+`TurnStore`; `flushDelta` (Signatur), `finishTurn` und `heartbeat` passen **nicht**.
+Der Adapter geht **nicht** in `baah-web`: sonst bekommt die Engine einen zweiten Weg in
+die Datenbank, und die beiden Wege driften auseinander wie die beiden Klassifikatoren.
+
+#### Was §16.1 jetzt nicht mehr stimmt
+
+§16.1 sagt, für `turns`, `tool_invocations` u. a. gebe es „noch keine typisierte
+Operation ⇒ Welle 2 ergänzt jede". Das gilt nicht mehr. Abweichungen, die §16.1 noch
+nicht kannte: `tool_call_id`, `attempt`, `occurrence`, `output`, der Wegwerf von
+`ToolInvocationStatus`, und `appendTurn` (dazugekommen, weil `listUnfinishedTurns` sonst
+nichts zu lesen hatte).
+
+Ein Turn ohne `heartbeat_at` meldet `COALESCE(heartbeat_at, started_at)` — ein Leerstring
+parst als „unendlich alt" und würde einen eben erzeugten Turn sofort schließen.
+
+
 ### 16.2 Tools: Injektions-Verträge
 
 `todo` und `question` brauchen Zustand bzw. UI, den ein Tool nicht besitzen

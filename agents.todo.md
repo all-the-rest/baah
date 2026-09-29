@@ -59,7 +59,7 @@ das gerade ein anderer Agent hält.
 
 | Block | Besitz | Status |
 |---|---|---|
-| **A** — `Workspace.walk`-Vertrag + Storage-Implementierung der neuen Engine-Verträge + Core-Barrel | `baah-core/{workspace*,index.ts,test}`, `baah-storage/**`, `baah-tools/{glob,grep}/**` | 🟡 läuft |
+| **A** — `Workspace.walk`-Vertrag + Storage-Implementierung der neuen Engine-Verträge + Core-Barrel | `baah-core/{workspace*,index.ts,test}`, `baah-storage/**`, `baah-tools/{glob,grep}/**` | ✅ `dbbb62d`, 869 → **969 Tests** |
 | **B** — Runtime-Layer in `baah-web` ohne UI: Settings-Store, Provider-Verdrahtung, Tool-Registry, `flushDelta`-Aufrufstelle, 20-s-Watchdog | `baah-web/src/{runtime,state,providers,lib}/**` | ⏸ wartet auf A **und** auf den CI-Agenten |
 | **C** — React-UI: Onboarding, Transcript, Tool-/Approval-Karten, Diff-Vorschau, Todo-Sidebar, Settings, Export/Import | `baah-web/src/{components,App.tsx}` | ⏸ wartet auf B |
 
@@ -73,10 +73,22 @@ kostet mehr als eine Welle Verzögerung. → **B startet, wenn der CI-Agent gela
 `agent`, `provider` und `stream` **nicht** — Welle 2 konnte die Engine gar nicht
 konsumieren. Block A fixt es.
 
+- [!] **B braucht noch einen Entscheid von mir — den habe ich gefällt, er steht in B:**
+      der **`TurnStore`-Adapter gehört in `baah-storage`**, nicht in `baah-web`. Sonst
+      bekommt die Engine einen zweiten Weg in die Datenbank, und die beiden Wege driften
+      auseinander wie die beiden Klassifikatoren es getan haben.
 - [ ] **Tool-Registry befüllen**: alle 8 Tools in eine Registry, eine Instanz pro Session
-- [ ] **Engine ↔ Storage verdrahten**: `onStepEnd` → `flushDelta`, Turn-Ende → `idle`-Nachricht
-- [ ] **Reload-Recovery**: Turns mit `status = 'streaming'` und altem Heartbeat beim Start auf `interrupted` setzen, Teilttext behalten
-- [ ] **Tool-Idempotenz**: ausgeführte `toolCallId`s persistieren, beim Replay kurzschließen
+- [x] **Engine ↔ Storage verdrahten**: `onStepEnd` → `flushDelta`, Turn-Ende → `idle`-Nachricht.
+      ⚠️ **`flushDelta` wird vom Loop bis heute nicht aufgerufen** — die Aufrufstelle ist
+      **Block B**, nicht die Engine. Wie `onProgress` liegt sie an der Naht fuer die App.
+- [~] **Reload-Recovery**: `listUnfinishedTurns` existiert, `STALE_HEARTBEAT_MS` und
+      `recoverStaleTurns` sind implementiert und **beidseitig getestet** (30 s: `>=` ist
+      stale). Offen bleibt der **Aufruf beim Start** — das ist Block B.
+- [x] **Tool-Idempotenz**: `tool_invocations.status` ist `begun | done`, der
+      **Vier-Teil-Schlüssel** ist `UNIQUE` in der Tabelle (nicht nur in der Arithmetik des
+      Stores), `beginToolCall` ist `DO NOTHING` und `recordToolCall` ein Upsert.
+      `begun`-ohne-`done` wird als **Ergebnis unbekannt** gemeldet, weder neu ausgeführt
+      noch still übersprungen.
 - [ ] **Provider-Registry**: OpenAI, Anthropic (mit `anthropic-dangerous-direct-browser-access`), Google, OpenAI-kompatibel
 - [ ] **Modellkatalog** via `@opencode-ai/models` **lazy** laden (Snapshot ist 6,35 MB)
 - [ ] **Stream-Detektor** anbinden: Chunk-Signatur messen, `buffered` pro `provider+baseURL` merken
@@ -557,6 +569,71 @@ Review — die dritte Runde, in der ein Test den Agenten belogen hat statt umgek
 
 ---
 
+
+## W2-A: SQLite-Falle, die beim Messen auffiel — nicht beim Lesen
+
+`DROP TABLE` auf eine Tabelle, auf die andere zeigen, ist ein **implizites `DELETE
+FROM`**, und `ON DELETE CASCADE` **feuert trotzdem**. `PRAGMA defer_foreign_keys` hilft
+**nicht**: es vertagt die Constraint-*Prüfung*, nicht den Kaskaden, und danach ist nichts
+mehr zu prüfen.
+
+Ohne Parkplatz-Tabelle hätte Migration 4 **jede `approvals`-Zeile stillschweigend
+gelöscht**. Die Parkplatz-Tabelle in der ersten Fassung war **zweimal** getötet: erst von
+`approvals`, dann von ihrem **eigenen** kaskadierenden Fremdschlüssel. Beide Varianten
+sind als Test festgenagelt.
+
+→ **Für die nächste Rebuild-Migration: nicht die DDL kopieren, den Absatz lesen.**
+
+## W2-A: Entscheidungen, die ich getroffen habe
+
+- **`ToolInvocationStatus` auf `begun | done` verengt** — akzeptiert. Die sechs
+  Lifecycle-Werte **waren** das Crash-Fenster: `begin` und `record` schrieben in dasselbe
+  Feld. §7.5 modelliert eine offene Freigabe über `approvals.decision IS NULL` und braucht
+  keinen Lifecycle-Wert. Der Agent hat die Typ-Änderung von sich aus **als semantische
+  Änderung an einem exportierten Typ** markiert — das war korrekt und ist hier notiert.
+- **`walk` bleibt synchron, `truncated`/`visited` sind veränderliche Felder** — akzeptiert.
+  Die Begründung trägt: `DirectoryWorkspace.walk` löst das Wurzel-Handle **im Generator
+  beim ersten `next()`** auf, `walk()` berührt also gar kein Dateisystem. Ein `async`
+  Rückgabetyp ließe jeden Aufrufer auf einen Wert warten, den es schon gibt. Und
+  `truncated` ist erst **nach** der `for await` sinnvoll lesbar — genau dann, wenn ein
+  Aufrufer fragt.
+- **Vier `counts()`-Assertions von `toEqual` auf `toMatchObject` aufgeweicht** — akzeptiert,
+  **nach eigener Prüfung**: `memory-coverage.test.ts:321` nagelt die vollständige Form fest,
+  `:337` prüft die Schlüsselmenge explizit. Die Abdeckung ist **umgezogen**, nicht
+  verschwunden — und vier Kopien des ganzen Objekts waren strukturell schlechter als eine
+  an der richtigen Stelle.
+- **Cursor-Freigabe**: getestet über ein **Ledger am Fake-Handle**, nicht über ein
+  Generator-`finally`, das sich selbst meldet. Der Fake ist ein handgeschriebener Iterator,
+  dessen Zähler sich nur bewegen, wenn der **Aufrufer** `return()` aufruft. Ebenso: der
+  **erschöpfte** Cursor wird mitfreigegeben — `values()` liefert einen echten Iterator,
+  dessen `return()` der dokumentierte Weg zum Schließen ist.
+
+## W2-A: was das Messgerät des Agenten geliefert hat
+
+**Der Agent hat sein eigenes Harness als defekt gemeldet, unaufgefordert.** Es stellte nur
+die Dateien wieder her, die es in seiner Edit-Liste kannte. Eine Mutation hatte eine
+**zweite Edit-Stelle**, die stehen blieb und **jeden danach laufenden Mutanten
+verunreinigte**. Sichtbar wurde es, weil die Killer **die falschen Tests** waren. Er baute
+das Harness auf einen Vollbaum-Snapshot um und maß neu. Zweite Korrektur: eine Mutation
+lief mit `&&`, die Core-Suite schlug fehl, also liefen die zwei Tool-Suiten **nie** — und er
+hätte „ein Killer" gemeldet, wo fünf sind.
+
+→ Das ist die **dritte** Instanz dieser Sitzung, in der ein Test oder ein Messgerät den
+Agenten belogen hat statt umgekehrt. Alle drei Fälle fielen auf, weil jemand **gefragt
+hat, welcher Test welchen Mutanten tötet** — nicht, weil der Lauf grün war.
+
+**W2-A: `write`/`edit`-Idempotenz ist nur gegen `TurnStore` getestet, nie gegen die echte
+DB.** Ein Tool schreibt, der Idempotenz-Pfad wird aber nur über den Mock geprüft.
+
+## W2-A: neu offen
+
+- [ ] **`TurnStore`-Adapter** (`flushDelta`-Signatur, `finishTurn`, `heartbeat`) →
+      `baah-storage`. Block B oder ein eigener Agent.
+- [ ] **`Plan.md` §6.1 Drift** ist nachgetragen (§16.1 „Nachtrag: `tool_invocations`" in
+      `Plan.md`), inkl. der SQLite-Kaskadenfalle.
+- [ ] **`write`/`edit` gegen die echte DB testen**, nicht nur gegen den Mock.
+
+---
 
 ## Nur manuell beweisbar — `Plan.md` §15
 
