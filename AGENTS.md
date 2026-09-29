@@ -302,6 +302,22 @@ Welle und den konkreten Entscheidungen, aus denen die Change-% abgeleitet sind.
 Eine Zahl ohne Begründung ist wertlos; `Completion` ohne `Change` verdeckt,
 wie viel Plan unterwegs neu erfunden wurde.
 
+## 7.4 Arbeitsliste
+
+[`agents.todo.md`](agents.todo.md) ist die **Arbeitsliste** und hat Vorrang vor
+jedem neuen Plan. Beim Start einer Welle wird sie gelesen und die Punkte der
+Welle abgearbeitet; danach wird dort abgehakt, mit Commit-Referenz.
+
+Verhältnis der drei Dateien:
+
+| Datei | Rolle | Wann schreiben |
+|---|---|---|
+| `Plan.md` | **Was** — Spezifikation, Architektur, Recherche | wenn sich eine Entscheidung ändert |
+| `AGENTS.md` | **Wie** — verbindliche Regeln | wenn eine Regel falsch war oder fehlte |
+| `agents.todo.md` | **Jetzt** — offene konkrete Punkte | nach **jeder** erledigten Einheit |
+
+Eine erledigte Einheit wird **hier** abgehakt und nicht in `AGENTS.md`.
+
 ## 8. Git
 
 - Kleine, thematische Commits; ein Commit = eine logische Änderung.
