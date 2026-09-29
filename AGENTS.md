@@ -71,6 +71,44 @@ aktuelle Version prüfen (`npm view <pkg> version`) und im jeweiligen
 `package.json` eintragen. Downgrades/Upgrades einzelner Kernpakete gehören in
 die Commit-Message.
 
+## 3.1 AI SDK — verbindliche Konventionen (v7)
+
+Wir schreiben **AI SDK v7** (`ai@7.x`, `@ai-sdk/react@4.x`). Die v6-Namen sind
+teils noch Aliase, werden aber **nicht** verwendet:
+
+| Nicht verwenden (v6) | Verwenden (v7) |
+|---|---|
+| `onFinish` | `onEnd` |
+| `onStepFinish` | `onStepEnd` |
+| `stepCountIs` | `isStepCount` |
+| `fullStream` | `stream` |
+| `experimental_telemetry` | `telemetry` |
+| `needsApproval` (am Tool) | `toolApproval` (am Agent/Call) |
+| `addToolResult` | `addToolOutput` |
+| `system` | `instructions` |
+| `experimental_context` | `context` / `runtimeContext` |
+
+Weitere Regeln:
+
+- **Loop nicht selbst bauen.** `ToolLoopAgent` + `DirectChatTransport` laufen
+  in-process im Browser. Der Agent-Loop ist **kein** Eigenbau.
+- **`UIMessage[]` ist der Speicher-Wahrheitsanspruch**, nicht `ModelMessage[]`.
+  `ModelMessage[]` wird pro Request aus den UIMessages berechnet.
+- **Kein `@ai-sdk/rsc`** (RSC-only). Kein `pipeUIMessageStreamToResponse`
+  (braucht Node `ServerResponse`).
+- **Telemetrie explizit aus:** `telemetry: { isEnabled: false }`.
+- **Keys explizit übergeben** — im Browser gibt es keinen `process.env`-Fallback.
+- **Anthropic** braucht `headers: { "anthropic-dangerous-direct-browser-access": "true" }`;
+  das SDK setzt den Header **nicht** selbst.
+- **Resume ist unmöglich.** `reconnectToStream()` liefert immer `null`. Unfertige
+  Turns werden als `interrupted` markiert und per `regenerate` wiederholt —
+  niemals „fortsetzen" versprechen.
+- **Checkpoints per `onStepEnd`**, nicht erst am Turn-Ende.
+- **Tool-Idempotenz beim Replay:** ausgeführte `toolCallId`s persistieren und
+  kurzschließen, sonst wirkt ein Tool beim Wiederholen doppelt.
+- **Kein Provider-Proxy.** Ein Provider, der CORS nicht erlaubt, ist nicht
+  unterstützt (§2).
+
 ## 4. Repo-Layout
 
 ```
