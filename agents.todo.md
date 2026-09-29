@@ -53,6 +53,26 @@
 
 ## Welle 2 — Engine verdrahten + Oberfläche
 
+**Blockaufteilung mit disjunkten Pfadbesitzern.** Reihenfolge ist erzwungen, nicht
+gewählt: A muss landen, bevor B den Store bauen kann, und B braucht `package.json`,
+das gerade ein anderer Agent hält.
+
+| Block | Besitz | Status |
+|---|---|---|
+| **A** — `Workspace.walk`-Vertrag + Storage-Implementierung der neuen Engine-Verträge + Core-Barrel | `baah-core/{workspace*,index.ts,test}`, `baah-storage/**`, `baah-tools/{glob,grep}/**` | 🟡 läuft |
+| **B** — Runtime-Layer in `baah-web` ohne UI: Settings-Store, Provider-Verdrahtung, Tool-Registry, `flushDelta`-Aufrufstelle, 20-s-Watchdog | `baah-web/src/{runtime,state,providers,lib}/**` | ⏸ wartet auf A **und** auf den CI-Agenten |
+| **C** — React-UI: Onboarding, Transcript, Tool-/Approval-Karten, Diff-Vorschau, Todo-Sidebar, Settings, Export/Import | `baah-web/src/{components,App.tsx}` | ⏸ wartet auf B |
+
+**Warum B wartet, obwohl A und B disjunkt wären:** B braucht neue Dependencies
+(`baah-core`, `baah-storage`, die Tool-Pakete, `ai`, `@ai-sdk/react`) in
+`packages/baah-web/package.json` **und** den Lockfile. Der CI-Agent schreibt gerade in
+beide. Zwei Agenten auf einem Lockfile zerschießen ihn, und ein zerstörtes Lockfile
+kostet mehr als eine Welle Verzögerung. → **B startet, wenn der CI-Agent gelandet ist.**
+
+**Ein Loch, das allen Blocken im Weg lag:** `baah-core/src/index.ts` exportierte
+`agent`, `provider` und `stream` **nicht** — Welle 2 konnte die Engine gar nicht
+konsumieren. Block A fixt es.
+
 - [ ] **Tool-Registry befüllen**: alle 8 Tools in eine Registry, eine Instanz pro Session
 - [ ] **Engine ↔ Storage verdrahten**: `onStepEnd` → `flushDelta`, Turn-Ende → `idle`-Nachricht
 - [ ] **Reload-Recovery**: Turns mit `status = 'streaming'` und altem Heartbeat beim Start auf `interrupted` setzen, Teilttext behalten
@@ -480,7 +500,14 @@ niemand liest. Alle aus `ca7c02e`.
       3. `listUnfinishedTurns({ sessionId })` — neu, fuer die Reload-Recovery.
 - [ ] **`store.flushDelta` wird vom Loop bis heute nicht aufgerufen.** Wie `onProgress` liegt
       es an der Naht fuer die **App**, nicht fuer die Engine. Von mir benannt, damit es nicht
-      als tote Methode wiederentdeckt wird.
+      als tote Methode wiederentdeckt wird. **Gehoert in Block B.**
+- [!] **`Workspace.walk` meldet seine eigene Kappung nicht.** Block A fixt es auf
+      `{ entries, truncated, visited }` plus exportiertes `DEFAULT_MAX_ENTRIES`; danach
+      fallen die **gespiegelten 50 000-Konstanten** in `grep` und `glob` weg. Der jetzige
+      Stopgap **überberichtet absichtlich** (exakt 50 000 Einträge werden als „möglicherweise
+      unvollständig" gemeldet) — diese konservative Verzerrung muss den Wechsel überleben.
+      Nebenbei offen: **schließt der Walk seinen Cursor, wenn der Verbraucher die
+      `for await`-Schleife bricht?** Ein Handle-Leak im Browser ist still und dauerhaft.
 - [ ] **`ToolDefinition.toModelOutput?` existiert jetzt** — optional, synchron,
       `undefined` = Default. Die im `question`-README dokumentierte Rahmen-Pflicht ist damit
       **implementierbar**; die Pflicht selbst bleibt Welle 2 (untrusted answer, API-Key im
