@@ -69,8 +69,10 @@ describe("createIgnoreFilter", () => {
   it("does not apply a `dir/` rule to a file of the same name", async () => {
     const isIgnored = await filter({ "build": "a file called build\n" });
 
-    expect(isIgnored("build")).toBe(false);
+    expect(isIgnored("build", "file")).toBe(false);
     expect(isIgnored("build", "directory")).toBe(true);
+    // Unknown kind: both spellings are probed, so a walk prunes the subtree.
+    expect(isIgnored("build")).toBe(true);
   });
 
   it("honours the workspace .gitignore", async () => {
@@ -150,16 +152,33 @@ describe("createIgnoreFilter", () => {
     expect(isIgnored.gitignoreError).toBeUndefined();
   });
 
-  it("survives a malformed .gitignore and reports why", async () => {
-    const isIgnored = await filter({ ".gitignore": "*.log\n", "debug.log": "x" });
+  it("survives an unreadable .gitignore and reports why", async () => {
+    // A real failure mode: `.gitignore` is a directory, or the handle is gone.
+    const base = createMemoryWorkspace({ ".gitignore": "*.log\n", "debug.log": "x" });
+    const workspace = {
+      ...base,
+      async readText(path: string) {
+        if (path === ".gitignore") throw new Error("permission denied");
+        return base.readText(path);
+      },
+    };
+    const isIgnored = await createIgnoreFilter(workspace);
 
-    // `debug.log` is not ignored because the file could not be used, and the
-    // reason is observable instead of silently dropped.
     expect(isIgnored("debug.log")).toBe(false);
     expect(isIgnored.gitignoreApplied).toBe(false);
-    expect(isIgnored.gitignoreError).toBeDefined();
+    expect(isIgnored.gitignoreError).toContain("permission denied");
     // The hard-coded rules keep working.
     expect(isIgnored("node_modules/x.js")).toBe(true);
+  });
+
+  it("applies a weird but parseable .gitignore without throwing", async () => {
+    // `ignore@7.0.10` accepts these; the point is that no input throws.
+    const isIgnored = await filter({
+      ".gitignore": "![\n\\a\na\\0000b\n",
+      "weird.md": "x",
+    });
+
+    expect(isIgnored("weird.md")).toBe(false);
   });
 
   it("never throws on odd input paths", async () => {

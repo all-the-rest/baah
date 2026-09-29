@@ -86,9 +86,12 @@ export interface IgnoreFilterOptions {
 }
 
 /**
- * A predicate over workspace-relative POSIX paths. `kind` is optional; pass
- * `"directory"` when the caller knows it, so that a `dir/` rule is not applied
- * to a *file* that happens to carry the same name.
+ * A predicate over workspace-relative POSIX paths.
+ *
+ * `kind` is optional. When it is `"file"` only the plain spelling is tested,
+ * so a `dir/` rule is not applied to a file that happens to carry the same
+ * name. When it is `"directory"` — or unknown — both spellings are tested,
+ * because a directory must be filtered out for a walk to prune its subtree.
  */
 export interface IgnoreFilter {
   (path: string, kind?: EntryKind): boolean;
@@ -131,8 +134,9 @@ interface LoadedGitignore {
 
 /**
  * Reads the workspace `.gitignore`. Never throws: a missing file is normal, a
- * workspace implementation may refuse the read, and a malformed rule set must
- * not take a search down.
+ * workspace implementation may refuse the read, and a rule set the parser
+ * rejects must not take a search down. (`ignore@7.0.10` is very lenient — the
+ * `add()` guard is defence against a future regression, not a hot path.)
  */
 async function loadGitignore(workspace: Workspace): Promise<LoadedGitignore> {
   let raw: string;
