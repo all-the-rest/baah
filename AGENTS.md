@@ -74,20 +74,36 @@ die Commit-Message.
 ## 4. Repo-Layout
 
 ```
-apps/web/          React-SPA (UI, Routing, Worker-Registrierung)
-  src/             UI-Code
-packages/core/     Harness-Engine: Agent-Loop, Tool-Registry, FS-Abstraktion,
-                   Storage-Adapter. Node-frei, worker-tauglich, unit-getestet.
-Plan.md            Spezifikation (Ziel, Architektur, Phasen)
-AGENTS.md          diese Regeln
+apps/web/                React-SPA (UI, Routing, Worker-Registrierung)
+  src/                   UI-Code
+packages/core/           Harness-Engine: Agent-Loop, Tool-Registry,
+                         Workspace-Abstraktion, Storage-Adapter.
+                         Node-frei, worker-tauglich, unit-getestet.
+packages/tools/<id>/     EIN Package pro Tool ("read", "grep", "edit", …).
+Plan.md                  Spezifikation (Ziel, Architektur, Phasen)
+AGENTS.md                diese Regeln
 ```
 
-- **Schichtregel:** `apps/web` darf von `@ohw/core` importieren, **nie
-  umgekehrt**. `core` kennt keine React-/DOM-UI-Typen.
-- Neue Engine-Fähigkeit ⇒ Implementierung in `packages/core` + Unit-Test dort,
-  UI-Anbindung in `apps/web`.
-- Kein Wildwuchs an Packages: ein neues Workspace-Package braucht einen
-  Eintrag in `Plan.md` §4 und eine Begründung.
+- **Schichtregel:** `apps/web` → `packages/tools/*` → `packages/core`.
+  Abhängigkeiten zeigen **nie** zurück. `core` kennt weder React noch DOM-UI,
+  noch die konkreten Tools.
+- **Ein Tool = ein Package.** Konvention:
+  - Verzeichnis `packages/tools/<id>/`, Paketname `@ohw/tool-<id>`.
+  - `src/index.ts` exportiert die Definition als benannten Export
+    (`export const readTool`) **und** als `default`.
+  - Das Tool ist ein `ToolDefinition` aus `@ohw/core` (`defineTool({...})`):
+    `id`, `description`, `access`, `inputSchema` (zod), `execute`.
+  - `inputSchema` ist die **einzige** Quelle der Parameter-Wahrheit — sie geht
+    an das Modell (AI SDK) *und* an die Validierung. Kein zweites Schema.
+  - Eigene Tests unter `test/<id>.test.ts`, immer gegen
+    `createMemoryWorkspace()` aus `@ohw/core` — **kein** Browser und kein DOM
+    nötig, damit die Verifikation in CI läuft.
+  - Ein Tool greift **nie** direkt auf IndexedDB oder UI zu, nur über den
+    `ToolContext`.
+- **Neues Tool:** Package anlegen, in `Plan.md` §4 aufnehmen (mit `access`-Klasse),
+  in der Tool-Liste der Engine registrieren. Reihenfolge/Abhängigkeiten der Tools
+  untereinander sind verboten — Tools kennen nur den `ToolContext`.
+- Kein Wildwuchs: ein neues Package braucht einen Eintrag in `Plan.md`.
 
 ## 5. Code-Regeln
 

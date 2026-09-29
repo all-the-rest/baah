@@ -6,4 +6,9 @@
  * Web Worker). See AGENTS.md §2.
  */
 
+export * from "./path.ts";
+export * from "./registry.ts";
+export * from "./tool.ts";
+export * from "./workspace.ts";
+
 export const CORE_PACKAGE = "@ohw/core";
