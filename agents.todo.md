@@ -37,10 +37,8 @@
       liegt in `packages/baah-core`, wo der Engine-Agent gerade schreibt. Ein
       `pnpm test` im Core-Paket würde dessen halbfertige Tests mitlaufen lassen;
       der Verify-Bericht zeigte dann Fremdfehler. Nach dem Engine-Block.
-- [~] **Verify: `todo`/`question`** — Verify-Agent läuft. Kernfrage vorab:
-      sind das überhaupt *Tools*? Im Vorbild ist ihr Inhalt **injizierter Text**,
-      kein Callable-Tool — falls `Plan.md` das so sagt, sind die 28 Tests gegen
-      eine Form gebaut, die nicht verdrahtet wird.
+- [x] **Verify: `todo`/`question`** — abgeschlossen. **Meine Ausgangsfrage war falsch**
+      (siehe Korrekturen weiter unten); trotzdem 5 Defekte + 9 Mutationslücken gefunden.
 - [~] **Agent-Engine** (`ToolLoopAgent`, Classification, Backoff, Approval) — Build-Agent läuft.
       `stream/classify.ts` + `stream/backoff.ts` stehen, `agent/*` + `provider/*` fehlen.
 - [ ] **Verify: Agent-Engine** — eigener Verify-Agent, danach Mutationstest. **offen**
@@ -86,6 +84,84 @@
 - [ ] **Service-Worker**: Offline-Shell, Single-Writer, PWA-Manifest
 - [ ] **MCP-Spike** (nur `type: "remote"`)
 
+## Offen aus der Verifikation `todo`/`question` — 22 Mutationen, 9 überlebten
+
+Befunde mit `file:line` stehen im Verifier-Report. Hier nur, was **noch zu tun** ist.
+
+- [ ] **`MIN_OPTIONS = 2` lehnt eine Form ab, die das Vorbild selbst benutzt.**
+      OpenCode v2.0.19 hat **kein** Minimum auf `options`, und dessen eigener Test
+      fährt eine **Ein-Option**-Frage. Unsere Fixture umging das, indem sie immer
+      zwei Optionen schrieb. → Fix-Agent läuft (F1).
+- [ ] **`dismissed` und `skipped` sind für das Modell nicht unterscheidbar.**
+      Das Vorbild hat dafür ein typisiertes `CancelledError`. **Meine Spec-Zeile
+      `Plan.md:1400-1401` ist hier falsch** — sie kollabiert beide zu
+      leere Zeile = übersprungen. Korrigiere ich selbst, aber **erst nach dem
+      Landen des Fix-Agenten** (siehe unten). → Fix-Agent läuft (F2).
+- [ ] **`option.label`-Beschreibung ohne Längen-Konvention** — (1-5 words, concise)
+      ist Teil des Vertrags, nicht Dekoration. → Fix-Agent läuft (F3).
+- [ ] **README begründet `access: "read"` falsch** — die Begründung stimmt nicht mehr,
+      die Entscheidung ist trotzdem richtig. → Fix-Agent läuft (F4).
+- [ ] **9 Mutationslücken in den ursprünglichen 28 Tests** — u. a. `MAX_CONTENT_LENGTH`
+      ungetestet, `get()` lieferte live das interne Array, `await` auf `store.set()`
+      war nicht beweisbar (der Test nutzte einen Store, der sofort auflöst), ein
+      **nie abgehängter** Abort-Listener unter einem Test, der behauptet, das zu prüfen.
+      15 neue `characterisation.test.ts` schließen sie. **Nicht wieder löschen.**
+
+## Schnittstellen-Lücken, die der Core-Agent jetzt bekommt
+
+- [!] **`ToolContext` hat keine Call-Identität** (`core/src/tool.ts:27-34`) — damit ist
+      `AGENTS.md:126-127` / `Plan.md:1054-1055` (toolCallId persistieren und
+      kurzschließen) **nicht umsetzbar**, nicht nur unbequem. Der schlimme Fall ist
+      nicht `question` (doppelte Karte), sondern **`todo`**: `set` ist ein vollständiges
+      Ersetzen, ein Replay trägt die veraltete Liste und **überschreibt eine inzwischen
+      vom User gemachte Sidebar-Änderung** — und meldet dabei `changed: true`. Das ist
+      ein **verlorener Update, der sich als echter Update ausgibt**. → Core-Agent.
+- [!] **`todo` hat keine Permission-Action** — `Action` kennt `"question"`, aber nicht
+      `"todo"`, also fällt es auf `{action:"edit", resource: undefined}` zurück. Folge:
+      **ein User kann keine einzige Regel schreiben, die Todo-Schreibvorgänge
+      kontrolliert** — kein `ask`, kein `deny`, nie. Braucht `Action` + `Plan.md` §7.2
+      Zeile. → Core-Agent, exklusiv dafür freigegeben.
+
+## Korrekturen an meiner eigenen Planung
+
+- **Falsch gefragt:** Ich gab dem Verify-Agent die Hypothese mit, `todo`/`question` seien
+  vielleicht keine Callable-Tools, sondern injizierter Text. **Falsch.** `question`
+  existiert in v2.0.19 als echtes Tool (`packages/core/src/tool/plugin/question.ts`), ein
+  `todo`-Tool gibt es dort **gar nicht** — `Plan.md:123` und `Plan.md:975` sagen genau
+  das und nennen unseres eine eigene Zutat. Die zod-`ToolDefinition`-Form ist richtig.
+  Die Prüfung hat trotzdem etwas gebracht — sie fand den `MIN_OPTIONS`-Fehler.
+- **Folge für künftige Verifikationen:** meine Hypothese war plausibel genug, dass ich
+  sie als Auftrag formuliert habe, statt sie als Frage zu stellen. Eine Hypothese, die
+  ich nicht belegen kann, gehört in den Bericht als **Frage**, nicht in den Auftrag.
+- **Dieselbe Lektion wie bei Plan.md:** ein Verify-Agent, der die Spec gegen den Code
+  prüft, muss auch prüfen, ob die Spec die Behauptung überhaupt trägt. Zwei der
+  wichtigsten Funde dieser Runde entstanden genau dort.
+
+## Harte Anforderungen an Welle 2 (aus der Verifikation, nicht im Code lösbar)
+
+Diese Punkte stehen hier, weil sie sonst verschwinden. Kein grüner Test im Tool-Paket
+kann sie schließen — sie sind Rendering- und Vertrauensfragen.
+
+- [ ] **`question`: Antworten sind nicht vertrauenswürdig.** Sie landen ungeframed im
+      Modellkontext, während derselbe Page den API-Key hält. Das strukturierte
+      `{answers[][]}` ist **besser** als das Vorbild (das in einen quoted Satz splisset,
+      den ein Anführungszeichen in der Antwort sprengt) — aber Wave 2 **muss** die
+      Antwort eindeutig abgrenzen. Nicht implementiert, nur dokumentiert.
+- [ ] **`todo`: Zeilen haben keine Provenienz.** Ein Angreifer-Text aus einer
+      `README.md` wird zur Sidebar-Zeile mit Status `completed` — das vertrauenswürdigste
+      Element der UI, es liest sich wie bereits erledigte Arbeit. Die Liste fließt beim
+      nächsten `todo`-Aufruf **zurück** in den Modellkontext: klassisches
+      Stored-Persistence-Muster, ein zweiter Biss. Wave 2 muss untrusted content
+      unterscheidbar rendern.
+- [ ] **`todo` gibt die ganze Liste als Tool-Output zurück** (~20 k Zeichen an den
+      Maxima, kumuliert pro Schritt). Offene Entscheidung: Diff statt Vollliste.
+- [ ] **Scratch-Dateien im Baum**: `baah-core/probe-scratch.ts`, `probe2.ts`,
+      `tsconfig.probe.json` — gehören einem aktiven Agenten, **nicht committen**,
+      beim Landen aufräumen. `.gitignore` um `probe*.ts` ergänzen.
+
+---
+
+## Nur manuell beweisbar
 ## Nur manuell beweisbar — `Plan.md` §15
 
 Diese Punkte bleiben offen, bis jemand in einem echten Browser zusieht. Kein
