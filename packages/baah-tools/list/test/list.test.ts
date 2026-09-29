@@ -10,6 +10,10 @@ function context(files: Record<string, string>, cwd = "."): ToolContext {
     signal: new AbortController().signal,
     approve: async () => "allow-once",
     emit: () => {},
+    // Required since baah-core grew the call identity: a tool cannot be
+    // replay-safe without knowing which call it is (AGENTS.md 3.1).
+    toolCallId: `test-${Object.keys(files).join("-")}`,
+    attempt: 1,
   };
 }
 
