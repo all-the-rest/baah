@@ -96,11 +96,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # `pnpm check` typechecks each package's own tsconfig, and
-      # `packages/baah-web/tsconfig.json` does not include `e2e/`. This step is
-      # what keeps the suite under the same strict settings as the rest of the
-      # repo (no `any`, `import type` for type-only imports, no `node:` imports)
-      # instead of letting it be transpiled and never checked.
+      # `packages/baah-web/tsconfig.json` now includes `e2e/`, so `pnpm check`
+      # covers the suite too. This step is NOT redundant and should stay: it
+      # typechecks the e2e tree with `"types": []`, i.e. without Vite's client
+      # globals. That is the stricter of the two, and it is the only gate that
+      # would still catch a `window`/`import.meta.env` reach-in if the web
+      # config's `types` ever widened. Do not delete it on the strength of the
+      # comment above it being out of date once.
       - name: Typecheck the e2e suite
         run: pnpm --filter @all-the.rest/baah-web exec tsc -p e2e/tsconfig.json
 
