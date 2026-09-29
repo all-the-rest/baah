@@ -218,6 +218,22 @@ Für **jeden Aufgabenblock** einer Welle:
 
 **Regel:** Ein Subagent darf seine eigene Arbeit nie verifizieren.
 
+### 7.2a Commit-Disziplin bei laufenden Agenten
+
+Während Build-Subagenten schreiben, gilt im Repo:
+
+- **Kein `git add -A` und kein `git commit` des Orchestrators**, solange
+  mindestens ein Build-Subagent aktiv ist. Sonst landen seine
+  Zwischenstände in einem Doku-Commit — passiert in Welle 1 und hat zwei
+  Commits unlesbar gemacht.
+- Der Orchestrator committet **erst nach der Verify-Session** eines Blocks und
+  committet dann **genau die Dateien dieses Blocks**, nicht den Arbeitsbaum.
+- Falsch aufgenommene Dateien werden **nicht** per History-Rewrite repariert,
+  wenn schon gepusht wurde. Der Orchestrator benennt die Vermischung im
+  Commit-Hinweis und zieht die Dateien beim nächsten Block-Commit nach.
+- Faustregel vor jedem Orchestrator-Commit: `git status --short` muss genau
+  die Dateien zeigen, die der aktuelle Commit enthalten soll.
+
 Subagenten bekommen **nicht** die ganze `Plan.md`, sondern den relevanten
 Ausschnitt + Regeln — sonst arbeiten sie am Ziel vorbei.
 
