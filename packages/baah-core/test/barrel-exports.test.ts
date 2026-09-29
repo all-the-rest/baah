@@ -176,11 +176,13 @@ describe("the barrel re-exports the engine", () => {
     for (const name of [
       "AgentTurn",
       "recoverStaleTurns",
+      "isRecoverableTurn",
       "isTurnStale",
       "heartbeatAgeMs",
       "staticAgentSettings",
       "STALE_HEARTBEAT_MS",
       "DEFAULT_STALL_TIMEOUT_MS",
+      "DELTA_FLUSH_INTERVAL_MS",
     ] as const) {
       expect((barrel as unknown as Record<string, unknown>)[name], name).toBeDefined();
     }

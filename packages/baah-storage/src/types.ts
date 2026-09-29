@@ -156,6 +156,23 @@ export interface ToolCallKey {
  */
 export type ToolCallRecord = { status: "begun" } | { status: "done"; output: unknown };
 
+/**
+ * A turn outcome this session's log already carries.
+ *
+ * Structurally identical to the engine's own `TurnOutcomeEntry` for the same
+ * reason as {@link UnfinishedTurn}: `AGENTS.md` §4 forbids a pointer from core
+ * to storage, so the two cannot share a declaration and the *structural* match
+ * is what lets this database be handed to the engine as its `TurnStore`.
+ *
+ * `Plan.md` §6.2 makes an outcome an `idle` message, so this is not a table
+ * read: it is the outcome column of the log, projected to the two halves the
+ * recovery compares.
+ */
+export interface TurnOutcomeEntry {
+  turnId: string;
+  outcome: TurnOutcome;
+}
+
 /** A turn a reload may have left open (`Plan.md` §6.1). */
 export interface UnfinishedTurn {
   turnId: string;
@@ -478,11 +495,60 @@ export interface FinishTurnInput {
  * injects its own clock and measures age against the same one, so this layer
  * never substitutes a timestamp of its own. A turn id that does not exist
  * changes no row and raises nothing — the engine fires this without awaiting it.
+ *
+ * `sessionId` is part of the *key* of the write, not a lookup that happens
+ * afterwards. Its absence used to be a forced compromise — `sql.ts` said so, and
+ * was right then. The engine has the session in hand at the call site
+ * (`AgentLoopOptions.sessionId`), so renewing an anchor row is now scoped like
+ * every other write on the seam.
  */
 export interface RenewHeartbeatInput {
   turnId: string;
+  sessionId: string;
   /** ISO-8601 (`AGENTS.md` §5). */
   at: string;
+}
+
+/**
+ * Close one part: it will receive no further delta.
+ *
+ * The engine knows `messageId` because it is the message it is currently
+ * producing; the statement does **not** filter on it, and that is deliberate.
+ * `parts.id` is the primary key, so the id already names exactly one row, and
+ * the session guard is what keeps the write inside its own log. A `message_id`
+ * predicate would be a *stricter* key that is wrong in one real case: a provider
+ * that mints the same part id again on a retry lands on the existing row (the
+ * upsert in `flushDelta` keeps the original `message_id`), and refusing to close
+ * that row would leave the part the user is looking at open forever.
+ *
+ * `updatedAt` is filled in by the adapter's clock, exactly like
+ * {@link FinishTurnInput.finishedAt}: the engine's own signature carries no
+ * timestamp, and the storage side is the one place a clock enters.
+ */
+export interface ClosePartInput {
+  sessionId: string;
+  /** Context, not a guard — see this type's comment. */
+  messageId: string;
+  partId: string;
+  /** `completed` = the provider's end event arrived, `aborted` = it never will. */
+  status: Extract<StreamStatus, "completed" | "aborted">;
+  /** ISO-8601, into `parts.updated_at`. */
+  updatedAt: string;
+}
+
+/**
+ * Close **every still-open part of a turn** as `aborted`.
+ *
+ * The crash case, and why it is not `closePart` with a list: after a reload the
+ * engine no longer knows which parts it was writing, so naming the *turn* is the
+ * most it can do — and "the parts of this turn" is this layer's query, not the
+ * caller's.
+ */
+export interface CloseTurnPartsInput {
+  sessionId: string;
+  turnId: string;
+  /** ISO-8601, into `parts.updated_at`. */
+  updatedAt: string;
 }
 
 export interface FlushDeltaResult {
@@ -558,6 +624,38 @@ export interface StorageDatabase {
   flushDelta(input: FlushDeltaInput): Promise<FlushDeltaResult>;
 
   /* ---------------------------------------------------------------- */
+  /* Closing a part                                                    */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Close one part, as `completed` or `aborted`.
+   *
+   * **One statement, and never a read followed by a write.** A part's text is
+   * flushed at most every 100 ms *and* once at part end, and a flush that
+   * arrives after a close writes back the `streaming` status a delta implies
+   * (see {@link FlushDeltaInput}). So the close and a delayed flush are in a
+   * race by construction, and a read-modify-write would lose it: the upsert
+   * writes the `content_text` it read a moment earlier over the newer one, and
+   * the sentence the user was reading disappears. `UPDATE_PART_STATUS` names one
+   * row and writes one status; there is no window for a flush to slip into.
+   *
+   * A part that is not in `sessionId` is not closed — a zero-row update and no
+   * error, the same way an unknown turn id is a non-event for `renewHeartbeat`.
+   */
+  closePart(input: ClosePartInput): Promise<void>;
+  /**
+   * Close every **still `streaming`** part of a turn as `aborted`.
+   *
+   * `WHERE status = 'streaming'` is the load-bearing half: a part the provider
+   * finished before the crash is `completed`, and walking it back to `aborted`
+   * would make a sentence that was actually written look like it was cut off.
+   * The turn is found through its messages (`message_id IN (SELECT id FROM
+   * messages WHERE turn_id = ? AND session_id = ?)`) because after a reload the
+   * part ids are gone and the turn id is all the engine still has.
+   */
+  closeTurnParts(input: CloseTurnPartsInput): Promise<void>;
+
+  /* ---------------------------------------------------------------- */
   /* The turn anchor and the replay key                              */
   /* ---------------------------------------------------------------- */
 
@@ -579,6 +677,17 @@ export interface StorageDatabase {
    * fresh heartbeat means somebody *else* is still working on it.
    */
   listUnfinishedTurns(input: { sessionId: string }): Promise<UnfinishedTurn[]>;
+  /**
+   * The turn outcomes this session's log already carries.
+   *
+   * A read of the **`idle` messages**, not of the anchor: `Plan.md` §6.2 makes
+   * the outcome a message, and the reload check the plan describes is a query on
+   * it. It is a separate read from {@link StorageDatabase.listUnfinishedTurns}
+   * because that one deliberately keeps reporting an `interrupted` turn as
+   * unfinished — that is what makes it re-sendable — and only the log says
+   * whether the turn has *already* been closed.
+   */
+  listTurnOutcomes(input: { sessionId: string }): Promise<TurnOutcomeEntry[]>;
   /**
    * Close a turn, in **one transaction**: the outcome as an `idle` message
    * (`Plan.md` §6.2) and the anchor row that stops reporting the turn as

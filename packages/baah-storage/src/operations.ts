@@ -20,6 +20,7 @@ import type { z } from "zod";
 
 import { StorageError } from "./errors.ts";
 import {
+  ABORT_TURN_PARTS,
   DELETE_SESSION,
   FLUSH_DELTA_LOG_SQL,
   FLUSH_DELTA_PART_SQL,
@@ -39,6 +40,7 @@ import {
   SELECT_SESSIONS,
   SELECT_TOOL_CALL,
   SELECT_UNFINISHED_TURNS,
+  UPDATE_PART_STATUS,
   UPDATE_TURN_HEARTBEAT,
   UPDATE_TURN_OUTCOME,
   UPSERT_PART,
@@ -63,6 +65,8 @@ import {
 } from "./protocol.ts";
 import type {
   BeginToolCallInput,
+  ClosePartInput,
+  CloseTurnPartsInput,
   FinishTurnInput,
   FlushDeltaInput,
   FlushDeltaResult,
@@ -82,6 +86,7 @@ import type {
   ToolCallRecord,
   Turn,
   TurnInput,
+  TurnOutcomeEntry,
   UnfinishedTurn,
 } from "./types.ts";
 
@@ -278,9 +283,12 @@ export interface StorageOperations {
   upsertPart(input: PartInput): Promise<Part>;
   listParts(messageId: string): Promise<Part[]>;
   flushDelta(input: FlushDeltaInput): Promise<FlushDeltaResult>;
+  closePart(input: ClosePartInput): Promise<void>;
+  closeTurnParts(input: CloseTurnPartsInput): Promise<void>;
   search(input: SearchInput): Promise<SearchHit[]>;
   appendTurn(input: TurnInput): Promise<Turn>;
   listUnfinishedTurns(input: { sessionId: string }): Promise<UnfinishedTurn[]>;
+  listTurnOutcomes(input: { sessionId: string }): Promise<TurnOutcomeEntry[]>;
   finishTurn(input: FinishTurnInput): Promise<void>;
   renewHeartbeat(input: RenewHeartbeatInput): Promise<void>;
   beginToolCall(input: BeginToolCallInput): Promise<void>;
@@ -396,6 +404,44 @@ export function createStorageOperations(engine: StorageEngine): StorageOperation
       };
     },
 
+    /**
+     * Close one part — **one statement**.
+     *
+     * `engine.run(UPDATE_PART_STATUS, …)`, and deliberately not
+     * `listParts` + `upsertPart`: a flush can land between the read and the
+     * write, and the upsert would then write back the older `content_text` and
+     * the older `status` it read, which is the resurrection race `sql.ts`
+     * documents on the statement. Naming the row in the `WHERE` clause is what
+     * closes it; a read adds a window without adding anything.
+     *
+     * A part that is not in `sessionId` changes no row. Not an error, not a
+     * zero-row report either: `TurnStore.closePart` is a `Promise<void>` the
+     * engine awaits, and the honest outcome of "this part is not in this
+     * session" is "nothing happened" — the same as for an unknown turn id on
+     * {@link StorageOperations.renewHeartbeat}.
+     */
+    async closePart(input) {
+      await engine.run(UPDATE_PART_STATUS, [
+        input.status,
+        input.updatedAt,
+        input.partId,
+        input.sessionId,
+      ]);
+    },
+
+    /**
+     * Close every still-`streaming` part of a turn as `aborted`.
+     *
+     * One statement, for the same reason as {@link StorageOperations.closePart}
+     * and with more at stake: a turn can hold several parts, and a read-then-
+     * write per part would be several statements racing several flushes. The
+     * `status = 'streaming'` predicate is inside the statement, so a part the
+     * provider already finished is not walked backwards.
+     */
+    async closeTurnParts(input) {
+      await engine.run(ABORT_TURN_PARTS, [input.updatedAt, input.turnId, input.sessionId]);
+    },
+
     async search(input) {
       // Clamped in the shared layer, not in the backend: the two engines
       // disagree about a negative limit (SQL reads `LIMIT -1` as "no limit",
@@ -422,6 +468,44 @@ export function createStorageOperations(engine: StorageEngine): StorageOperation
         unfinishedTurnRowSchema,
         "listUnfinishedTurns",
       );
+    },
+
+    /**
+     * The outcomes the log already carries: the `idle` messages of a session.
+     *
+     * **A read over `listMessages`, not a second projection.** `Plan.md` §6.2
+     * says the outcome *is* the `idle` message, so "which outcomes does this
+     * session carry" has exactly one definition, and it is the definition the
+     * transcript and the export already use. A narrower statement of its own
+     * would be a second place where that answer is computed — the kind of second
+     * copy `AGENTS.md` §4's one-direction rule exists to prevent, and the kind
+     * that eventually reports an outcome the transcript does not show.
+     *
+     * The cost is honest and bounded: it reads the session's messages rather
+     * than two columns, once, at start-up, on the same connection that already
+     * reads the anchor. The filtering is three predicates, and the two that
+     * could disagree with the schema — `role` and `outcome` — are the columns
+     * themselves rather than a projection of them.
+     *
+     * A message with no turn (`turn_id IS NULL`) or no outcome is skipped rather
+     * than reported with a `null`: `TurnOutcomeEntry` says a turn ended, and an
+     * entry whose turn is `null` would be a key nothing can look up.
+     */
+    async listTurnOutcomes(input) {
+      const messages = await many(
+        engine,
+        SELECT_MESSAGES,
+        [input.sessionId],
+        messageRowSchema,
+        "listTurnOutcomes",
+      );
+      const entries: TurnOutcomeEntry[] = [];
+      for (const message of messages) {
+        if (message.role !== "idle") continue;
+        if (message.turnId === null || message.outcome === null) continue;
+        entries.push({ turnId: message.turnId, outcome: message.outcome });
+      }
+      return entries;
     },
 
     /**
@@ -460,16 +544,18 @@ export function createStorageOperations(engine: StorageEngine): StorageOperation
     },
 
     /**
-     * Renew `heartbeat_at` and nothing else.
+     * Renew `heartbeat_at` and nothing else, in the session that asked.
      *
      * The engine measures the age of this value against its own clock
      * (`Plan.md` §6.1), so the timestamp that lands here is the caller's, not
-     * this layer's. A turn id that does not exist changes no row: the engine
-     * fires this call without awaiting it, and a rejection would be an
-     * unhandled promise rejection rather than a reported failure.
+     * this layer's. `sessionId` is bound into the `WHERE` clause rather than
+     * checked afterwards: a turn that is not in that session changes no row, the
+     * same as a turn that does not exist at all. Either way the engine's
+     * un-awaited `void store.heartbeat(…)` resolves instead of rejecting, which
+     * is the only outcome it could act on.
      */
     async renewHeartbeat(input) {
-      await engine.run(UPDATE_TURN_HEARTBEAT, [input.at, input.turnId]);
+      await engine.run(UPDATE_TURN_HEARTBEAT, [input.at, input.turnId, input.sessionId]);
     },
 
     async beginToolCall(input) {

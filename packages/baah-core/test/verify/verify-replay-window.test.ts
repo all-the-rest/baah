@@ -83,9 +83,14 @@ function crashableStore(): CrashableStore {
     recorded,
     crasher: undefined,
     async flushDelta() {},
+    async closePart() {},
+    async closeTurnParts() {},
     async finishTurn() {},
     async heartbeat() {},
     async listUnfinishedTurns() {
+      return [];
+    },
+    async listTurnOutcomes() {
       return [];
     },
     async recordToolCall(input: { key: ToolCallKey; output: unknown }) {

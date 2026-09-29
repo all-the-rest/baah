@@ -62,13 +62,28 @@ spricht also gegen ein Interface — und `createTurnStore(db)` liefert genau das
 Der Adapter liegt hier und nicht im Web-Client, weil die Web-App ihn nur
 *injiziert*: eine zweite Kopie in `baah-web` wäre ein zweiter Weg in dieselbe
 Datenbank, und zwei Wege driften auseinander (so wie `classifyThrownError` und
-`classifyResponse` in der Engine). Vier der sieben Methoden sind bereits
-strukturell identisch und werden durchgereicht; übersetzt werden `flushDelta`
-(ein `PartInput` aus vier Skalaren plus Uhr), `finishTurn` (Outcome als
-`idle`-Nachricht **und** geschlossene Ankerzeile, in einer Transaktion) und
-`heartbeat` (genau eine Spalte). Was der Vertrag *nicht* tragen kann —
-`parts.type`, ein `finished`-Status, eine `sessionId` beim Heartbeat — steht in
-`src/turn-store.ts`.
+`classifyResponse` in der Engine). Fünf der zehn Methoden sind bereits
+strukturell identisch und werden durchgereicht (`listUnfinishedTurns`,
+`listTurnOutcomes`, `recordToolCall`, `getToolCall`, `beginToolCall`);
+übersetzt werden `flushDelta` (ein `PartInput` aus fünf Skalaren plus Uhr, wobei
+die `partType` der Engine **durchgereicht und nicht geraten** wird), `closePart`
+und `closeTurnParts` (je **genau ein** Statement, plus der Uhr), `finishTurn`
+(Outcome als `idle`-Nachricht **und** geschlossene Ankerzeile, in einer
+Transaktion) und `heartbeat` (genau eine Spalte, **mit** `session_id` im
+`WHERE`).
+
+Warum die beiden Close-Methoden je *ein* Statement sind und nicht `listParts` +
+`upsertPart`: die Engine schreibt den Text eines Parts *vor* dem Close und flusht
+danach weiter im Timer. Ein Flush, der nach dem Close eintrifft, schreibt den
+`streaming`-Status zurück, den ein Delta impliziert — Close und Flush laufen also
+konstruktionsbedingt gegeneinander. Ein Read-Modify-Write verliert dieses Rennen
+deterministisch: es liest den `content_text` von *jetzt*, der Flush schreibt einen
+neueren, und der Upsert schreibt den älteren wieder darüber. Der Satz, den der
+Nutzer liest, verschwindet. Beide Methoden sind darum ein
+`UPDATE parts … WHERE id = ?` bzw. ein `UPDATE parts … WHERE status = 'streaming'
+AND message_id IN (SELECT id FROM messages WHERE turn_id = ? AND session_id = ?)`;
+ein bereits `completed`er Part wird nicht zurückgesetzt. Die Begründung steht bei
+den Statements in `src/sql.ts` und in `src/turn-store.ts`.
 
 ## Test-Harness (AGENTS.md §2, einzige Ausnahme)
 

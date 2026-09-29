@@ -305,17 +305,77 @@ export const SELECT_UNFINISHED_TURNS = `
  * close (or reopen) a turn, and the engine's 30 s threshold is the only thing
  * that is allowed to decide that (`Plan.md` §6.1).
  *
- * No `AND session_id = ?`, and that is forced rather than chosen: `TurnStore`
- * declares `heartbeat({ turnId, at })` with no session at all, so there is
- * nothing to scope by. See `turn-store.ts` for what that costs.
+ * `AND session_id = ?` is **chosen**, not forced, and that is a correction:
+ * this statement used to carry no session guard, with a comment saying the
+ * omission was unavoidable because `TurnStore` declared
+ * `heartbeat({ turnId, at })` with no session. `TurnStore` now carries one, and
+ * the engine has it in hand at the call site (`AgentLoopOptions.sessionId`, the
+ * same closure that passes it to `flushDelta` and `finishTurn`). So the guard is
+ * here, every write on the seam is session-scoped, and the old justification
+ * that would have talked the next reader into removing it is gone with it.
  *
- * A turn id that does not exist changes 0 rows and raises nothing — the
- * recoverable direction, and the reason the engine may fire this without
- * awaiting it (`loop.ts` calls it as `void store.heartbeat(…)`, so a rejection
- * here would be an unhandled promise rejection).
+ * A turn id that does not exist — or is not in that session — changes 0 rows
+ * and raises nothing: the recoverable direction, and the reason the engine may
+ * fire this without awaiting it (`loop.ts` calls it as `void store.heartbeat(…)`,
+ * so a rejection here would be an unhandled promise rejection).
  */
 export const UPDATE_TURN_HEARTBEAT = `
-  UPDATE turns SET heartbeat_at = ? WHERE id = ?`;
+  UPDATE turns SET heartbeat_at = ? WHERE id = ? AND session_id = ?`;
+
+/**
+ * Close one part: `parts.status`, and nothing else.
+ *
+ * **`id = ? AND session_id = ?`, and no read first.** A part's text is flushed
+ * at most every 100 ms and once more at part end, and a flush that arrives
+ * after a close writes back the `streaming` status a delta implies — so the
+ * close is in a race with the delayed flush by construction. A
+ * `listParts` + `upsertPart` would resolve that race by *losing the newer text*:
+ * the upsert writes the `content_text` it read before the flush landed. Naming
+ * the row in the `WHERE` clause leaves no window at all.
+ *
+ * `message_id` is deliberately **not** in the guard even though the caller knows
+ * it: `id` is the primary key, so it already names one row, and adding the
+ * message would be a stricter key that is wrong for a provider that mints the
+ * same part id again on a retry — the upsert in `flushDelta` keeps the original
+ * `message_id`, so the row the user is looking at is the *old* message's row.
+ * See `ClosePartInput`.
+ *
+ * Zero rows matched is not an error: a part id that does not exist, or one that
+ * belongs to another session, is a no-op — the same direction `renewHeartbeat`
+ * takes, and the reason the engine may fire a close without treating silence as
+ * failure.
+ */
+export const UPDATE_PART_STATUS = `
+  UPDATE parts SET status = ?, updated_at = ?
+  WHERE id = ? AND session_id = ?`;
+
+/**
+ * Close every **still-open** part of a turn, as `aborted`.
+ *
+ * `WHERE status = 'streaming'` is the half that makes this safe to run on a
+ * turn somebody may still be writing: a part the provider finished before the
+ * crash is `completed`, and walking it back to `aborted` would make a sentence
+ * that was actually written look like it was cut off. Stated as a positive
+ * predicate on the open state, not as "everything that is not `aborted`", so a
+ * status added to the CHECK later is not swept up by a negative test.
+ *
+ * The parts are found through their messages
+ * (`message_id IN (SELECT id FROM messages WHERE turn_id = ? AND session_id = ?)`)
+ * because after a reload the engine no longer knows which part ids it was
+ * writing — the turn is the only name it still has, and the subquery is what
+ * turns that name into a set of rows. Scoping by the *message's* session rather
+ * than by `parts.session_id` mirrors the statement exactly; both are the same
+ * session in every row the schema allows, and the memory backend runs the same
+ * two lookups.
+ *
+ * `updated_at` is bound, not `CURRENT_TIMESTAMP`: the callers are the same
+ * adapter clock as everywhere else on this seam, and a wall clock the test
+ * cannot pin is a value no assertion can mean anything about.
+ */
+export const ABORT_TURN_PARTS = `
+  UPDATE parts SET status = 'aborted', updated_at = ?
+  WHERE status = 'streaming'
+    AND message_id IN (SELECT id FROM messages WHERE turn_id = ? AND session_id = ?)`;
 
 /**
  * Close the anchor row: the turn stops being unfinished.

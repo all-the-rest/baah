@@ -318,6 +318,43 @@ Verhältnis der drei Dateien:
 
 Eine erledigte Einheit wird **hier** abgehakt und nicht in `AGENTS.md`.
 
+### 6a TS 7 (`typescript@7.0.2`, der native Port) — zwei Fallen
+
+Gemessen in dieser Sitzung, nicht aus der Doku. Beide kosten einen Zyklus, wenn man sie
+nicht kennt.
+
+**1. `--noExplicitAny` existiert nicht.**
+
+```
+$ ./node_modules/.bin/tsc --noEmit --noExplicitAny
+error TS5023: Unknown compiler option '--noExplicitAny'.
+$ ./node_modules/.bin/tsc --all | grep -i explicit     # nichts
+```
+
+Die Flag ist **absent**, nicht nur ungesetzt. „Flag in `tsconfig.base.json` eintragen" ist
+hier ein Fehler, keine Lösung. Die nächste Compiler-Antwort wäre eine Lint-Regel = neue
+Dependency + neue Config-Fläche (§3). Wer `AGENTS.md` §5 („`any` ist verboten") durchsetzen
+will, muss den **Quelltext-Gate** nehmen:
+`packages/baah-core/test/no-explicit-any.test.ts` liest `src/**` und `test/**` über Vites
+`import.meta.glob(..., { query: "?raw" })` (kein `node:fs`, §2), streicht Kommentare und
+String-Literale und sucht danach. Er hat **drei** Tests: der Glob liest wirklich Quellen,
+null Treffer, und ein **Selbsttest mit gepflanztem Material** — ohne den letzten würde ein
+kaputter Scanner alle anderen bestehen.
+
+Bekannte Grenzen, im Doc-Kopf der Datei und nicht versteckt: er ist **regex-basiert, kein
+Parser**. `${…}`-Interpolation gilt ihm als String, und ein Regex-Literal mit einem
+Quote-Zeichen würde den String-Scan früh beenden. Er kennt außerdem **nur `baah-core`**.
+
+Gemessen: bei 3 von 4 `any`-Mutationen war `tsc` **sauber** und die gesamte Verhaltens-Suite
+grün. Der Gate ist damit nicht Kosmetik, sondern der einzige Vollzug dieser Regel.
+
+**2. Ein Backtick-Paar über zwei `//`-Zeilen gescannt falsch.**
+
+Ein `//`-Kommentar mit einem **unbalancierten** Backtick auf einer Zeile schluckt die
+nächste als Template-Literal und erzeugt eine Kaskade von ~30 falschen `TS1005`-Fehlern.
+Kein Hinweis auf die wahre Ursache. **Regel: einen in Backticks gesetzten Span auf **eine**
+Zeile legen.**
+
 ## 8. Git
 
 - Kleine, thematische Commits; ein Commit = eine logische Änderung.

@@ -214,7 +214,56 @@ const IMPLEMENTED: {
     needsSeed: true,
     run: async (db) => {
       await db.appendTurn({ id: "t3", sessionId: "s1", startedAt: T0, status: "streaming" });
-      return db.renewHeartbeat({ turnId: "t3", at: T0 });
+      return db.renewHeartbeat({ turnId: "t3", sessionId: "s1", at: T0 });
+    },
+  },
+  {
+    name: "UPDATE_PART_STATUS",
+    statement: sql.UPDATE_PART_STATUS,
+    // The seeded part is a zero-row update otherwise: the guard is
+    // `id = ? AND session_id = ?`, and `seeded()` writes the part in `s1`.
+    needsSeed: true,
+    run: (db) =>
+      db.closePart({
+        sessionId: "s1",
+        messageId: "m1",
+        partId: "p1",
+        status: "completed",
+        updatedAt: T0,
+      }),
+  },
+  {
+    name: "ABORT_TURN_PARTS",
+    statement: sql.ABORT_TURN_PARTS,
+    // The statement finds its parts through the *messages* of the turn, so a
+    // turn has to exist and a message has to belong to it — the statement's own
+    // two lookups, run in the order it runs them. The seeded part is left
+    // `NULL`, not `streaming`, so the message gets a part of its own.
+    needsSeed: true,
+    run: async (db) => {
+      await db.appendTurn({ id: "t4", sessionId: "s1", startedAt: T0, status: "streaming" });
+      await db.appendMessage({
+        id: "m2",
+        sessionId: "s1",
+        turnId: "t4",
+        role: "assistant",
+        createdAt: T0,
+        updatedAt: T0,
+      });
+      await db.flushDelta({
+        deltaId: "d2",
+        part: {
+          id: "p2",
+          messageId: "m2",
+          sessionId: "s1",
+          type: "text",
+          contentText: "half a sentence",
+          status: "streaming",
+          updatedAt: T0,
+        },
+        flushedAt: T0,
+      });
+      return db.closeTurnParts({ sessionId: "s1", turnId: "t4", updatedAt: T0 });
     },
   },
 ];

@@ -31,6 +31,8 @@ import {
 } from "./protocol.ts";
 import type {
   BeginToolCallInput,
+  ClosePartInput,
+  CloseTurnPartsInput,
   FinishTurnInput,
   FlushDeltaInput,
   FlushDeltaResult,
@@ -55,6 +57,7 @@ import type {
   ToolCallRecord,
   Turn,
   TurnInput,
+  TurnOutcomeEntry,
   UnfinishedTurn,
   TxResult,
 } from "./types.ts";
@@ -271,12 +274,30 @@ export class WorkerStorageDatabase implements StorageDatabase {
     return this.#operations.listParts(messageId);
   }
 
+  /**
+   * The three closing reads and writes go over the shared operations module, so
+   * they are plain `run`/`all` RPCs rather than dedicated wire messages: a
+   * close is one statement, and a wire message per statement is a second
+   * dispatch table to keep in step with `sql.ts` for no gain.
+   */
+  closePart(input: ClosePartInput): Promise<void> {
+    return this.#operations.closePart(input);
+  }
+
+  closeTurnParts(input: CloseTurnPartsInput): Promise<void> {
+    return this.#operations.closeTurnParts(input);
+  }
+
   appendTurn(input: TurnInput): Promise<Turn> {
     return this.#operations.appendTurn(input);
   }
 
   listUnfinishedTurns(input: { sessionId: string }): Promise<UnfinishedTurn[]> {
     return this.#operations.listUnfinishedTurns(input);
+  }
+
+  listTurnOutcomes(input: { sessionId: string }): Promise<TurnOutcomeEntry[]> {
+    return this.#operations.listTurnOutcomes(input);
   }
 
   finishTurn(input: FinishTurnInput): Promise<void> {

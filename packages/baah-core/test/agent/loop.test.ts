@@ -58,6 +58,13 @@ function createStore(seed?: Record<string, unknown>): RecordedStore {
     heartbeats: 0,
     unfinished: [],
     async flushDelta() {},
+    // The delta/close protocol has its own measurements in
+    // `test/agent/turn-store-seam.test.ts`; these cases are about the loop.
+    async closePart() {},
+    async closeTurnParts() {},
+    async listTurnOutcomes() {
+      return [];
+    },
     async finishTurn(input) {
       store.finished.push({ outcome: input.outcome, error: input.error });
     },

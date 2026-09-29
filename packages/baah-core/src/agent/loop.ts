@@ -56,8 +56,20 @@
  *
  * `@all-the.rest/baah-storage` is a sibling, not a dependency of this package,
  * and AGENTS.md §4 forbids a pointer back. The engine talks to a narrow
- * {@link TurnStore} — six methods, all of which `StorageDatabase` already
+ * {@link TurnStore} — ten methods, all of which `StorageDatabase` already
  * implements (Plan.md §16.1).
+ *
+ * ## The seam is this wide for a reason
+ *
+ * Four of the methods exist because a storage adapter measured a gap in the
+ * contract rather than in the schema, and each is named at its declaration: a
+ * delta that cannot say what kind of part it is (a reasoning delta persisted as
+ * text), a part that cannot be closed (every part `streaming` forever, so a
+ * reload cannot tell "still writing" from "died mid-sentence"), a heartbeat
+ * that was the one write on the interface not scoped to a session, and a
+ * recovery that appended a second `interrupted` outcome to a turn it had already
+ * closed. Widening an interface is cheap; a hole in it is measured by somebody
+ * else, later, in a browser.
  */
 
 import {
@@ -197,6 +209,26 @@ export interface UnknownToolOutcome {
 /* ------------------------------------------------------------------ */
 
 /**
+ * The kind of part a streamed delta belongs to.
+ *
+ * `Plan.md` §6.1 allows `text | reasoning | tool` on `parts.type`, and the loop
+ * streams **two** of the three — a reasoning delta is a first-class part type,
+ * not a flavour of text. `tool` is missing on purpose: a tool part is written
+ * whole (input at `tool-call`, output at `tool-result`) and has no mid-stream
+ * text, so there is nothing to flush and nothing to close. Were a tool ever to
+ * need incremental persistence, what would be missing is not the kind but the
+ * payload — §6.1's `data` / `metadata.files` — and that is a different write,
+ * not a third value here.
+ */
+export type PartKind = "text" | "reasoning";
+
+/** An outcome a turn's log already carries (Plan.md §6.2: an `idle` message). */
+export interface TurnOutcomeEntry {
+  turnId: string;
+  outcome: TurnOutcome;
+}
+
+/**
  * The persistence operations a turn needs.
  *
  * Every one of these already exists on `StorageDatabase` (Plan.md §16.1) except
@@ -204,16 +236,64 @@ export interface UnknownToolOutcome {
  * read. Those are the storage wiring that lands with Wave 2; the engine owns
  * the contract and the tests own the semantics, and nothing in `src/` depends
  * on the concrete backend.
+ *
+ * **Every write on this seam is session-scoped, and one of them used not to
+ * be.** `heartbeat` carried only a `turnId`, so it was the single write on the
+ * interface that could renew an arbitrary turn's anchor from any session. It
+ * now carries the session like the other nine.
  */
 export interface TurnStore {
-  /** Idempotent over `deltaId`; this is what makes a retry safe. */
+  /**
+   * One buffered streaming flush (Plan.md §6.2), idempotent over `deltaId`.
+   *
+   * `partType` is required, not defaulted. A delta used to name a part, a
+   * message, a session and a string, and every implementation had to guess the
+   * kind — so a reasoning delta was persisted as a text part, and the
+   * transcript showed the model's thinking as something it said. An optional
+   * field with a `"text"` default would be the same guess with a louder type.
+   */
   flushDelta(input: {
     deltaId: string;
     partId: string;
     messageId: string;
     sessionId: string;
+    partType: PartKind;
     contentText: string;
   }): Promise<void>;
+  /**
+   * Close a part: it will receive no further delta.
+   *
+   * A delta is mid-stream by definition, so every part this seam ever wrote was
+   * `streaming`, and nothing could ever say otherwise. That is not a cosmetic
+   * gap: a reload could not tell "still being written" from "the tab died
+   * mid-sentence", and §6.1's `interrupted` recovery depends on exactly that
+   * difference. Called where the engine *knows* the part ended — the `text-end`
+   * and `reasoning-end` events, and the end of an attempt — not only at turn
+   * end, because a crash before turn end is precisely the case that would
+   * leave a dangling part.
+   *
+   * `status` names which ending it was, and the two are not interchangeable:
+   * `completed` means the provider's end event arrived, `aborted` means it never
+   * will. There is no `failed` — a part does not fail, the *turn* does, and the
+   * turn's outcome already says so.
+   */
+  closePart(input: {
+    sessionId: string;
+    messageId: string;
+    partId: string;
+    status: "completed" | "aborted";
+  }): Promise<void>;
+  /**
+   * Close **every still-open part of a turn**, as `aborted`.
+   *
+   * The crash case, and why it is not `closePart` with a list: after a reload
+   * the engine no longer knows which parts it was writing, so the recovery
+   * cannot name them. Naming the *turn* is what it can still do, and finding
+   * that turn's open parts is the store's query. A turn that is merely alive
+   * must never be passed here — that would truncate a live turn in another tab,
+   * which is why the caller is the recovery and not the heartbeat.
+   */
+  closeTurnParts(input: { sessionId: string; turnId: string }): Promise<void>;
   /** The turn outcome is an `idle` message (Plan.md §6.2) — not a table. */
   finishTurn(input: {
     turnId: string;
@@ -221,8 +301,16 @@ export interface TurnStore {
     outcome: "succeeded" | "failed" | "interrupted";
     error: string | undefined;
   }): Promise<void>;
-  /** Renews `heartbeat_at`; a stale heartbeat is the reload anchor (§6.1). */
-  heartbeat(input: { turnId: string; at: string }): Promise<void>;
+  /**
+   * Renews `heartbeat_at`; a stale heartbeat is the reload anchor (§6.1).
+   *
+   * Scoped by `sessionId` so that every write on this seam is scoped. The call
+   * site has it in hand — it is a field of `AgentLoopOptions` and is already
+   * passed to `flushDelta` and `finishTurn` from the same closure — so this cost
+   * nothing at the call site and removed the one write that could renew any
+   * turn's anchor from anywhere.
+   */
+  heartbeat(input: { turnId: string; sessionId: string; at: string }): Promise<void>;
   /**
    * **[W2]** Unfinished turns of a session, for reload recovery.
    *
@@ -230,7 +318,28 @@ export interface TurnStore {
    * window where a reload leaves a half-written transcript behind.
    */
   listUnfinishedTurns(input: { sessionId: string }): Promise<readonly UnfinishedTurn[]>;
-  /** Records that a `toolCallId` ran, so a replay short-circuits it. */
+  /**
+   * The turn outcomes this session's log already carries.
+   *
+   * Read once at start-up rather than per turn: it is what lets the recovery
+   * tell a turn it has *just* closed from one that still has to be closed.
+   * `Plan.md` §6.2 makes the outcome an `idle` message, so this is the reload
+   * check the plan describes — a read of the log, not a column on the turn. It
+   * is a separate read because `listUnfinishedTurns` is a read of the *anchor*,
+   * and the anchor deliberately keeps reporting an `interrupted` turn as
+   * unfinished: that is what makes it re-sendable, and it is why the second
+   * read exists.
+   */
+  listTurnOutcomes(input: { sessionId: string }): Promise<readonly TurnOutcomeEntry[]>;
+  /**
+   * Records that a `toolCallId` ran, so a replay short-circuits it.
+   *
+   * A **tool part needs no `closePart`**: it is terminal by construction. It is
+   * written whole at `tool-call` and completed whole at `tool-result` /
+   * `tool-error`, there is no mid-stream text to buffer, and whether it *ran* is
+   * recorded here rather than in `parts.status`. That is why {@link PartKind} has
+   * two values and not three.
+   */
   recordToolCall(input: {
     key: ToolCallKey;
     toolName: string;
@@ -310,7 +419,12 @@ export interface AgentLoopOptions {
   /** Injected for deterministic tests. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   random?: () => number;
-  /** Clock for the `heartbeat_at` anchor (Plan.md §6.1). Injected for tests. */
+  /**
+   * The engine's clock: the `heartbeat_at` anchor (§6.1) and the delta-flush
+   * interval (§6.2) are both measured against it. Injected for tests, and
+   * deliberately the *only* clock here — a second one would be a second thing
+   * that has to be faked.
+   */
   now?: () => number;
   /** A caller-supplied signal; combined with {@link AgentTurn.stop}. */
   abortSignal?: AbortSignal;
@@ -322,6 +436,23 @@ export interface AgentLoopOptions {
 const DEFAULT_MAX_STEPS = 20;
 /** Plan.md §5.4: 20 s of silence is a waiting state, not a retry. */
 export const DEFAULT_STALL_TIMEOUT_MS = 20_000;
+
+/**
+ * How often a streaming part's text reaches the store (Plan.md §6.2).
+ *
+ * §6.2 asks for "every ~50–100 ms in **one short** transaction" and, in the same
+ * sentence, "**never** a write per token" — the two are the same requirement,
+ * since a per-token write is what makes the flush expensive enough that nobody
+ * wants it. 100 ms is the top of the plan's window: a crash costs the buffered
+ * tail rather than the answer, and a long answer is checkpointed continuously
+ * instead of only at its end.
+ *
+ * There is no timer behind it. The check runs when a delta arrives, which is the
+ * only place the engine learns that there is something new to write, and it
+ * means the engine needs no clock of its own — {@link AgentLoopOptions.now},
+ * which the heartbeat already uses, is the whole of it.
+ */
+export const DELTA_FLUSH_INTERVAL_MS = 100;
 
 /**
  * How old a `heartbeat_at` may be before the turn it belongs to counts as dead
@@ -370,6 +501,49 @@ export function isTurnStale(
 }
 
 /**
+ * May the recovery close this turn?
+ *
+ * Both conditions are load-bearing and both were measured rather than assumed;
+ * the predicate is named and exported so neither can be dropped into a comment
+ * and lost.
+ *
+ * 1. **The heartbeat is on the stale side of {@link STALE_HEARTBEAT_MS}.** A
+ *    fresh heartbeat means somebody else is still working on this turn, and
+ *    closing it would kill a live turn in another tab — the damage is a turn
+ *    marked `interrupted` and offered as `regenerate`, which is visible but
+ *    still a turn the user did not lose.
+ * 2. **The turn carries no terminal outcome yet.** This is the one that was
+ *    missing. `listUnfinishedTurns` counts `interrupted` as unfinished *on
+ *    purpose* (AGENTS.md §3.1: an unfinished turn is marked `interrupted` and
+ *    repeated with `regenerate`), so the turn the recovery closed at start-up 1
+ *    is still reported at start-up 2 — with a stale heartbeat, because closing a
+ *    turn does not renew its anchor. Every reload therefore appended a *second*
+ *    `interrupted` outcome message to the same turn, and the transcript grew a
+ *    duplicate every time the tab was reopened. A turn that was interrupted at
+ *    start-up 1 stays interrupted at start-up 2; what changes between the two is
+ *    only the part that says the user may regenerate it, and that is the turn
+ *    row, not the log.
+ *
+ * The condition is the *outcome* rather than "is it `interrupted`": `succeeded`
+ * and `failed` are terminal too, and a store that reported one of those on a
+ * turn it still lists unfinished (a read that raced a finish) must not have a
+ * second outcome written over it.
+ */
+export function isRecoverableTurn(
+  turn: UnfinishedTurn,
+  facts: {
+    nowMs: number;
+    staleAfterMs: number;
+    /** The outcome the log already carries, if any. */
+    recordedOutcome: TurnOutcome | undefined;
+  },
+): boolean {
+  if (!isTurnStale(turn.heartbeatAt, facts.nowMs, facts.staleAfterMs)) return false;
+  if (facts.recordedOutcome !== undefined) return false;
+  return true;
+}
+
+/**
  * Close turns that a reload left open (AGENTS.md §3.1, Plan.md §6.1).
  *
  * Called once at start-up, before a new turn starts. It marks every unfinished
@@ -380,6 +554,10 @@ export function isTurnStale(
  * Resume is impossible (§14.4: `reconnectToStream()` always returns `null`), so
  * the recovery is not "continue": it is "close it honestly and let `regenerate`
  * re-send", with the partial text kept.
+ *
+ * The second condition of {@link isRecoverableTurn} — no terminal outcome yet —
+ * is what makes this idempotent: two start-ups in a row produce one outcome, not
+ * two.
  */
 export async function recoverStaleTurns(options: {
   store: TurnStore;
@@ -391,10 +569,40 @@ export async function recoverStaleTurns(options: {
   const staleAfterMs = options.staleAfterMs ?? STALE_HEARTBEAT_MS;
   const nowMs = options.nowMs ?? Date.now();
   const unfinished = await store.listUnfinishedTurns({ sessionId });
+  /**
+   * One read for every candidate, not one per candidate.
+   *
+   * It is read up front rather than lazily so that a turn closed by *this* pass
+   * cannot be seen as already-closed by a later iteration — the outcomes map is
+   * a snapshot, and the loop below adds to it explicitly where it matters (it
+   * does not: a turn is listed once).
+   */
+  const recordedOutcomes = new Map<string, TurnOutcome>();
+  for (const entry of await store.listTurnOutcomes({ sessionId })) {
+    recordedOutcomes.set(entry.turnId, entry.outcome);
+  }
 
   const recovered: UnfinishedTurn[] = [];
   for (const turn of unfinished) {
-    if (!isTurnStale(turn.heartbeatAt, nowMs, staleAfterMs)) continue;
+    if (
+      !isRecoverableTurn(turn, {
+        nowMs,
+        staleAfterMs,
+        recordedOutcome: recordedOutcomes.get(turn.turnId),
+      })
+    ) {
+      continue;
+    }
+    /**
+     * The parts first, then the outcome.
+     *
+     * A part that was still streaming when the tab died is the half-written
+     * sentence the user sees, and closing it as `aborted` is what makes it
+     * readable as "this was cut off" instead of "this is still being written".
+     * Order matters for the log: the outcome message says the turn ended, so it
+     * must not claim that before the last text of the turn is closed.
+     */
+    await store.closeTurnParts({ sessionId, turnId: turn.turnId });
     await store.finishTurn({
       turnId: turn.turnId,
       sessionId,
@@ -958,9 +1166,104 @@ export class AgentTurn {
       string,
       { name: string; part: Record<string, unknown> }
     >();
+    /**
+     * The assistant message this attempt produces.
+     *
+     * Minted before the stream rather than after it, because every flushed
+     * delta and every closed part has to name the message it belongs to.
+     */
+    const messageId = newMessageId();
+
+    /**
+     * The parts of this attempt that are still being written, and when each was
+     * last flushed.
+     *
+     * This is the whole of the streaming persistence protocol, and it is here
+     * because the engine is the only layer that knows when a part has ended.
+     * `Plan.md` §6.2 forbids a write per token, so a delta is not persisted when
+     * it arrives: the part's cumulative text is flushed at most once per
+     * {@link DELTA_FLUSH_INTERVAL_MS} and unconditionally when the part ends.
+     */
+    const openParts = new Map<string, { kind: PartKind; part: { text: string }; openedAt: number }>();
+    /** partId → when its last flush went out. */
+    const lastFlushAt = new Map<string, number>();
+    /** partId → how many flushes it has had; the delta id's sequence number. */
+    const flushCount = new Map<string, number>();
+
+    /**
+     * The idempotency key of one flush (Plan.md §6.2: `deltaId`).
+     *
+     * All four components are needed, and each closes a measured failure:
+     * `turnId` keeps two turns apart; `attempt` is what separates two attempts
+     * of the *same* turn, because a retry re-sends the request and the provider
+     * mints the **same part ids again** — a per-part counter alone would make
+     * attempt 2's first flush a replay of attempt 1's and drop it silently;
+     * `partId` separates the parts of one step; and the trailing counter keeps
+     * repeated flushes of one part apart, because a second flush with an id the
+     * store has already seen is a no-op — which would leave the part stuck at
+     * the text of the first flush.
+     */
+    const nextDeltaId = (partId: string): string => {
+      const sequence = flushCount.get(partId) ?? 0;
+      flushCount.set(partId, sequence + 1);
+      return `${turnId}#${attempt}#${partId}#${sequence}`;
+    };
+
+    /** Write a part's cumulative text. */
+    const flushPart = async (partId: string): Promise<void> => {
+      const entry = openParts.get(partId);
+      if (entry === undefined) return;
+      await store.flushDelta({
+        deltaId: nextDeltaId(partId),
+        partId,
+        messageId,
+        sessionId,
+        // Not inferred from anything: the two call sites below know which kind
+        // of part they are opening, and §6.1's `reasoning` is a different part
+        // type, not a flavour of text.
+        partType: entry.kind,
+        contentText: entry.part.text,
+      });
+      lastFlushAt.set(partId, now());
+    };
+
+    /**
+     * Flush, then close — in that order, and awaited.
+     *
+     * A flush carries the part's text and a store is free to write it with the
+     * status a delta implies (`streaming`), so a close that landed first would
+     * be overwritten by this part's own next flush and the part would read as
+     * streaming again. Awaiting (rather than firing and forgetting, as the
+     * heartbeat does) is what makes the order real; a rejected flush surfaces
+     * as the turn's error rather than as a lost sentence.
+     */
+    const closePart = async (partId: string, status: "completed" | "aborted"): Promise<void> => {
+      if (!openParts.has(partId)) return;
+      await flushPart(partId);
+      await store.closePart({ sessionId, messageId, partId, status });
+      openParts.delete(partId);
+    };
+
+    /** Open a streamed part, closing a previous one that never got its end event. */
+    const openPart = (partId: string, kind: PartKind, part: { text: string }): void => {
+      openParts.set(partId, { kind, part, openedAt: now() });
+    };
+
+    /**
+     * The time-gated flush of §6.2: a delta that arrives less than
+     * {@link DELTA_FLUSH_INTERVAL_MS} after the last one is buffered instead of
+     * written. A crash costs the buffered tail, not the answer.
+     */
+    const flushIfDue = async (partId: string): Promise<void> => {
+      const entry = openParts.get(partId);
+      if (entry === undefined) return;
+      const since = now() - (lastFlushAt.get(partId) ?? entry.openedAt);
+      if (since < DELTA_FLUSH_INTERVAL_MS) return;
+      await flushPart(partId);
+    };
 
     const heartbeat = (): void => {
-      void store.heartbeat({ turnId, at: new Date(now()).toISOString() });
+      void store.heartbeat({ turnId, sessionId, at: new Date(now()).toISOString() });
     };
     // Written at the start of every attempt, not only per step, so a turn that
     // dies *before* its first `onStepEnd` still has an anchor to be measured
@@ -1008,8 +1311,6 @@ export class AgentTurn {
           ];
     const modelMessages = await convertToModelMessages(uiMessages, { tools: toolSet });
 
-    const messageId = newMessageId();
-
     try {
       const result = await agent.stream({
         messages: modelMessages,
@@ -1023,58 +1324,83 @@ export class AgentTurn {
             parts.push({ type: "step-start" } as UIMessage["parts"][number]);
             break;
 
-          case "text-start":
+          case "text-start": {
+            // A part that is still open when the next one starts will never get
+            // an end event — the provider replaced it — so it is closed as
+            // `aborted` here rather than left `streaming` for the rest of the
+            // transcript's life.
+            if (currentText !== undefined) await closePart(currentText.id, "aborted");
             currentText = {
               id: part.id,
               part: { type: "text", text: "", state: "streaming" },
             };
+            openPart(part.id, "text", currentText.part);
             parts.push(currentText.part);
             break;
+          }
 
           case "text-delta": {
             if (currentText?.id !== part.id) {
               // A delta without a start is a provider protocol break; ignoring
               // it silently would lose text, so it starts a fresh part.
+              if (currentText !== undefined) await closePart(currentText.id, "aborted");
               currentText = {
                 id: part.id,
                 part: { type: "text", text: "", state: "streaming" },
               };
+              openPart(part.id, "text", currentText.part);
               parts.push(currentText.part);
             }
             currentText.part.text += part.text;
             text = currentText.part.text;
             emit({ type: "text-delta", text: part.text, messageId });
+            await flushIfDue(currentText.id);
             break;
           }
 
           case "text-end":
-            if (currentText?.id === part.id) currentText.part.state = "done";
+            if (currentText?.id === part.id) {
+              currentText.part.state = "done";
+              // The engine knows this part ended, and this is that point — not
+              // the end of the turn, which a crash never reaches.
+              await closePart(part.id, "completed");
+            }
             currentText = undefined;
             break;
 
-          case "reasoning-start":
+          case "reasoning-start": {
+            if (currentReasoning !== undefined) await closePart(currentReasoning.id, "aborted");
             currentReasoning = {
               id: part.id,
               part: { type: "reasoning", id: part.id, text: "", state: "streaming" },
             };
+            openPart(part.id, "reasoning", currentReasoning.part);
             parts.push(currentReasoning.part);
             break;
+          }
 
-          case "reasoning-delta":
+          case "reasoning-delta": {
             if (currentReasoning?.id !== part.id) {
+              if (currentReasoning !== undefined) await closePart(currentReasoning.id, "aborted");
               currentReasoning = {
                 id: part.id,
                 part: { type: "reasoning", id: part.id, text: "", state: "streaming" },
               };
+              openPart(part.id, "reasoning", currentReasoning.part);
               parts.push(currentReasoning.part);
             }
             currentReasoning.part.text += part.text;
             reasoning = currentReasoning.part.text;
             emit({ type: "reasoning-delta", text: part.text, messageId });
+            await flushIfDue(currentReasoning.id);
             break;
+          }
 
           case "reasoning-end":
-            if (currentReasoning?.id === part.id) currentReasoning.part.state = "done";
+            if (currentReasoning?.id === part.id) {
+              currentReasoning.part.state = "done";
+              await closePart(part.id, "completed");
+            }
             currentReasoning = undefined;
             break;
 
@@ -1265,6 +1591,21 @@ export class AgentTurn {
     } catch (error) {
       // A throw before or around the stream: the agent itself failed.
       streamError = error;
+    }
+
+    /**
+     * A part that is still open when the attempt is over will never be closed by
+     * anything else — the stream is done, whether it succeeded, was cut off, or
+     * died on a provider error.
+     *
+     * Closed as `aborted`, not `completed`: the provider never sent the end
+     * event, and a transcript that claims otherwise is exactly the state §6.1
+     * says a reload must be able to tell from "still being written". This is the
+     * in-process half of the crash case; `recoverStaleTurns` is the half where
+     * the process is gone and nobody knows these part ids any more.
+     */
+    for (const partId of [...openParts.keys()]) {
+      await closePart(partId, "aborted");
     }
 
     const assistant: UIMessage = { id: messageId, role: "assistant", parts };

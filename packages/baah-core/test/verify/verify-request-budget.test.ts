@@ -125,9 +125,14 @@ function recordingStore(): TurnStore & { recorded: Map<string, unknown>; seed(id
       recorded.set(idOf({ sessionId: "s1", attempt: 1, toolCallId: id, occurrence: 0 }), output);
     },
     async flushDelta() {},
+    async closePart() {},
+    async closeTurnParts() {},
     async finishTurn() {},
     async heartbeat() {},
     async listUnfinishedTurns() {
+      return [];
+    },
+    async listTurnOutcomes() {
       return [];
     },
     async recordToolCall(input: { key: ToolCallKey; output: unknown }) {
@@ -146,9 +151,14 @@ const allowAll = { evaluate: () => ({ effect: "allow" as const }), recordAlways:
 function store(): TurnStore {
   return {
     async flushDelta() {},
+    async closePart() {},
+    async closeTurnParts() {},
     async finishTurn() {},
     async heartbeat() {},
     async listUnfinishedTurns() {
+      return [];
+    },
+    async listTurnOutcomes() {
       return [];
     },
     async recordToolCall() {},

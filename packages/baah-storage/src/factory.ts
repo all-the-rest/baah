@@ -24,6 +24,7 @@ import {
   type StatementOutcome,
 } from "./operations.ts";
 import {
+  ABORT_TURN_PARTS,
   DELETE_SESSION,
   FLUSH_DELTA_LOG_SQL,
   INSERT_MESSAGE,
@@ -40,6 +41,7 @@ import {
   SELECT_DELTA_SEQ,
   SELECT_TOOL_CALL,
   SELECT_UNFINISHED_TURNS,
+  UPDATE_PART_STATUS,
   UPDATE_TURN_HEARTBEAT,
   UPDATE_TURN_OUTCOME,
   UPSERT_PART,
@@ -48,6 +50,8 @@ import {
 } from "./sql.ts";
 import type {
   BeginToolCallInput,
+  ClosePartInput,
+  CloseTurnPartsInput,
   FinishTurnInput,
   Message,
   MessageRole,
@@ -68,6 +72,7 @@ import type {
   Turn,
   TurnInput,
   TurnOutcome,
+  TurnOutcomeEntry,
   TurnStatus,
   UnfinishedTurn,
 } from "./types.ts";
@@ -243,6 +248,23 @@ export interface MemoryDatabase extends StorageDatabase {
   counts(): Record<Table, number>;
   /** The delta log, in insertion order. */
   deltas(): readonly PartDeltaRow[];
+  /**
+   * Every statement the engine ran, single-spaced, in order.
+   *
+   * The memory backend has no connection to log, so before this a claim like
+   * "this operation is *one* statement" could only be measured on the SQL side
+   * — which left the in-memory half of the parity untested for exactly the
+   * property that matters most when the two implementations differ in shape. A
+   * read-modify-write inside `operations.ts` is invisible to a spy on the
+   * *database*, too: the read happens on the engine, below it. This is that
+   * lower seam, and it exists because `execute()` is the single place a
+   * statement is recognised.
+   *
+   * Test-facing, like {@link MemoryDatabase.counts}: a real application holds one
+   * database for its whole lifetime and must not accumulate a log of every
+   * statement it ever ran.
+   */
+  statements(): readonly string[];
 }
 
 export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase {
@@ -254,6 +276,8 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     partDeltas: new Map(),
     toolInvocations: new Map(),
   };
+  /** Every statement `execute()` was asked to run — see {@link MemoryDatabase.statements}. */
+  const log: string[] = [];
 
   /** `COALESCE(?, MAX(seq) + 1)` over the rows of one parent. */
   const nextSeq = (rows: Iterable<{ seq: number }>, explicit: number | null): number => {
@@ -603,22 +627,88 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
   };
 
   /**
-   * `UPDATE_TURN_HEARTBEAT`: one column, one statement.
+   * `UPDATE_TURN_HEARTBEAT`: one column, one statement, one session.
    *
    * `heartbeat_at` and nothing else — a heartbeat that also wrote a status would
    * be a second way to decide whether a turn is alive, and only the engine's
    * 30 s threshold may do that (`Plan.md` §6.1).
+   *
+   * The `session_id` guard is the statement's, so it is checked here before the
+   * row is written: a heartbeat that named another session's turn changes
+   * nothing, which is what SQLite reports for a zero-row `UPDATE` and what
+   * `operations.renewHeartbeat` passes on.
    */
   const updateTurnHeartbeat = (params: readonly SqlParam[]): ExecutionResult => {
-    const [at, turnId] = params;
+    const [at, turnId, sessionId] = params;
     if (typeof turnId !== "string") return { rows: [], changes: 0 };
     const turn = store.turns.get(turnId);
-    if (turn === undefined) return { rows: [], changes: 0 };
+    if (turn === undefined || turn.sessionId !== sessionId) return { rows: [], changes: 0 };
     if (typeof at !== "string") {
       throw new StorageError("sql_error", "turns.heartbeat_at must be an ISO-8601 string.");
     }
     store.turns.set(turnId, { ...turn, heartbeatAt: at });
     return { rows: [], changes: 1 };
+  };
+
+  /**
+   * `UPDATE_PART_STATUS`: the close, as one write on one row.
+   *
+   * No read first, and that is the whole point — see `sql.ts`. A read here would
+   * have to be turned back into a full `PartInput` for an upsert, and the
+   * `content_text` it read could be a flush behind the one the user is looking
+   * at.
+   *
+   * The `parts.status` CHECK is applied before anything is written, so a status
+   * outside the list fails here exactly as SQLite's `CHECK` would — a rejected
+   * close has to leave the row as it was, and it has to fail the same way on
+   * both backends.
+   */
+  const updatePartStatus = (params: readonly SqlParam[]): ExecutionResult => {
+    const [status, updatedAt, partId, sessionId] = params;
+    if (typeof partId !== "string") return { rows: [], changes: 0 };
+    const part = store.parts.get(partId);
+    if (part === undefined || part.sessionId !== sessionId) return { rows: [], changes: 0 };
+    const checked = requireOneOf("parts.status", status, STREAM_STATUSES);
+    if (typeof updatedAt !== "string") {
+      throw new StorageError("sql_error", "parts.updated_at must be an ISO-8601 string.");
+    }
+    store.parts.set(partId, { ...part, status: checked, updatedAt });
+    return { rows: [], changes: 1 };
+  };
+
+  /**
+   * `ABORT_TURN_PARTS`: the crash case, and the two lookups it takes.
+   *
+   * Message ids first, then the parts that hang off them — the same
+   * `message_id IN (SELECT id FROM messages WHERE turn_id = ? AND session_id = ?)`
+   * the statement runs, in the same order, so a turn of another session finds
+   * nothing here exactly as it finds nothing there.
+   *
+   * The `status === 'streaming'` test is the one that matters: a part the
+   * provider finished before the crash is `completed`, and this leaves it alone.
+   * Nothing else about the part is touched, and `updated_at` is only written on
+   * the rows that really change — a completed part keeps the timestamp of its
+   * own close.
+   */
+  const abortTurnParts = (params: readonly SqlParam[]): ExecutionResult => {
+    const [updatedAt, turnId, sessionId] = params;
+    if (typeof turnId !== "string") return { rows: [], changes: 0 };
+    if (typeof updatedAt !== "string") {
+      throw new StorageError("sql_error", "parts.updated_at must be an ISO-8601 string.");
+    }
+    const messageIds = new Set(
+      [...store.messages.values()]
+        .filter((message) => message.turnId === turnId && message.sessionId === sessionId)
+        .map((message) => message.id),
+    );
+    let changes = 0;
+    for (const part of store.parts.values()) {
+      if (part.status !== "streaming") continue;
+      if (!messageIds.has(part.messageId)) continue;
+      store.parts.set(part.id, { ...part, status: "aborted", updatedAt });
+      changes += 1;
+    }
+    return { rows: [], changes };
   };
 
   /**
@@ -778,6 +868,10 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
   /** The in-memory counterpart of exactly one statement of `sql.ts`. */
   const execute = (sql: string, params: readonly SqlParam[]): ExecutionResult => {
     const statement = canonical(sql);
+    // Logged *before* the dispatch, and once per call, so a statement that
+    // throws is still in the log — a test that says "this call ran exactly one
+    // statement" must not be able to miss one by failing on it.
+    log.push(statement);
 
     if (statement === canonical(INSERT_SESSION)) return insertSession(params);
     if (statement === canonical(INSERT_MESSAGE)) return insertMessage(params);
@@ -788,6 +882,8 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     if (statement === canonical(INSERT_TURN_OUTCOME_MESSAGE)) return insertTurnOutcomeMessage(params);
     if (statement === canonical(UPDATE_TURN_OUTCOME)) return updateTurnOutcome(params);
     if (statement === canonical(UPDATE_TURN_HEARTBEAT)) return updateTurnHeartbeat(params);
+    if (statement === canonical(UPDATE_PART_STATUS)) return updatePartStatus(params);
+    if (statement === canonical(ABORT_TURN_PARTS)) return abortTurnParts(params);
     if (statement === canonical(INSERT_TOOL_INVOCATION_BEGUN)) return beginToolCall(params);
     if (statement === canonical(UPSERT_TOOL_INVOCATION_DONE)) return recordToolCall(params);
 
@@ -967,10 +1063,15 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     listParts: (messageId) => operations.listParts(messageId),
 
     flushDelta: (input) => operations.flushDelta(input),
+    closePart: (input: ClosePartInput): Promise<void> => operations.closePart(input),
+    closeTurnParts: (input: CloseTurnPartsInput): Promise<void> =>
+      operations.closeTurnParts(input),
 
     appendTurn: (input: TurnInput) => operations.appendTurn(input),
     listUnfinishedTurns: (input: { sessionId: string }): Promise<UnfinishedTurn[]> =>
       operations.listUnfinishedTurns(input),
+    listTurnOutcomes: (input: { sessionId: string }): Promise<TurnOutcomeEntry[]> =>
+      operations.listTurnOutcomes(input),
     finishTurn: (input: FinishTurnInput): Promise<void> => operations.finishTurn(input),
     renewHeartbeat: (input: RenewHeartbeatInput): Promise<void> => operations.renewHeartbeat(input),
     beginToolCall: (input: BeginToolCallInput): Promise<void> => operations.beginToolCall(input),
@@ -989,5 +1090,7 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     }),
 
     deltas: () => [...store.partDeltas.values()],
+
+    statements: () => [...log],
   };
 }
