@@ -175,6 +175,48 @@ const IMPLEMENTED: {
     needsSeed: true,
     run: (db) => db.getToolCall({ sessionId: "s1", attempt: 1, toolCallId: "c1", occurrence: 0 }),
   },
+  {
+    name: "INSERT_TURN_OUTCOME_MESSAGE",
+    statement: sql.INSERT_TURN_OUTCOME_MESSAGE,
+    // The outcome message is written *from* the turn row, so a turn has to exist
+    // before its guard can match — the statement's own precondition.
+    needsSeed: true,
+    run: async (db) => {
+      await db.appendTurn({ id: "t1", sessionId: "s1", startedAt: T0, status: "streaming" });
+      return db.finishTurn({
+        turnId: "t1",
+        sessionId: "s1",
+        outcome: "succeeded",
+        error: undefined,
+        finishedAt: T0,
+      });
+    },
+  },
+  {
+    name: "UPDATE_TURN_OUTCOME",
+    statement: sql.UPDATE_TURN_OUTCOME,
+    // Same precondition; the update is the second half of that one transaction.
+    needsSeed: true,
+    run: async (db) => {
+      await db.appendTurn({ id: "t2", sessionId: "s1", startedAt: T0, status: "streaming" });
+      return db.finishTurn({
+        turnId: "t2",
+        sessionId: "s1",
+        outcome: "interrupted",
+        error: "reload",
+        finishedAt: T0,
+      });
+    },
+  },
+  {
+    name: "UPDATE_TURN_HEARTBEAT",
+    statement: sql.UPDATE_TURN_HEARTBEAT,
+    needsSeed: true,
+    run: async (db) => {
+      await db.appendTurn({ id: "t3", sessionId: "s1", startedAt: T0, status: "streaming" });
+      return db.renewHeartbeat({ turnId: "t3", at: T0 });
+    },
+  },
 ];
 
 /** A database with one session, one message and one part. */
@@ -202,6 +244,8 @@ const NOT_A_STATEMENT = new Set([
   "searchSql",
   "turnParams",
   "toolCallKeyParams",
+  "turnOutcomeMessageParams",
+  "turnOutcomeParams",
 ]);
 
 /**

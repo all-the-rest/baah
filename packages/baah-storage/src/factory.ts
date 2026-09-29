@@ -31,6 +31,7 @@ import {
   INSERT_SESSION,
   INSERT_TOOL_INVOCATION_BEGUN,
   INSERT_TURN,
+  INSERT_TURN_OUTCOME_MESSAGE,
   SELECT_MESSAGE,
   SELECT_MESSAGES,
   SELECT_PARTS,
@@ -39,17 +40,21 @@ import {
   SELECT_DELTA_SEQ,
   SELECT_TOOL_CALL,
   SELECT_UNFINISHED_TURNS,
+  UPDATE_TURN_HEARTBEAT,
+  UPDATE_TURN_OUTCOME,
   UPSERT_PART,
   UPSERT_TOOL_INVOCATION_DONE,
   searchSql,
 } from "./sql.ts";
 import type {
   BeginToolCallInput,
+  FinishTurnInput,
   Message,
   MessageRole,
   Part,
   PartType,
   RecordToolCallInput,
+  RenewHeartbeatInput,
   SearchHit,
   Session,
   SessionStatus,
@@ -270,6 +275,21 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     }
   };
 
+  /**
+   * Mirrors `messages.turn_id`'s foreign key.
+   *
+   * Added because the memory backend accepted a message pointing at a turn that
+   * does not exist, while SQLite — with `PRAGMA foreign_keys=ON` — refuses it.
+   * A row the two backends disagree about is exactly what `Plan.md` §16.1 lists
+   * as the thing that must not happen, and `finishTurn`'s outcome message leans
+   * on this constraint being real.
+   */
+  const requireTurn = (id: string): void => {
+    if (!store.turns.has(id)) {
+      throw new StorageError("sql_error", `FOREIGN KEY constraint failed: turns.id = ${id}`);
+    }
+  };
+
   /** Mirrors `ON DELETE CASCADE` from the schema, for the tables it holds. */
   const cascadeDelete = (sessionId: string): void => {
     store.sessions.delete(sessionId);
@@ -333,17 +353,34 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     return { rows: [session], changes: 1 };
   };
 
-  const insertMessage = (params: readonly SqlParam[]): ExecutionResult => {
-    // The parameter order mirrors `messageParams()`: `seq` and the `session_id`
-    // of the seq subquery are two separate placeholders.
-    const [
-      id, sessionId, turnId, parentId, seq, , role, status, model, outcome, error, usage,
-      createdAt, updatedAt,
-    ] = params;
+  /**
+   * The one place a message row is written, shared by `INSERT_MESSAGE` and the
+   * guarded `INSERT_TURN_OUTCOME_MESSAGE`.
+   *
+   * Two callers, one implementation: a second copy of the `seq` allocation and
+   * the `CHECK` lists is a second set of rules to keep in step.
+   */
+  const storeMessage = (params: {
+    id: SqlParam | undefined;
+    sessionId: SqlParam | undefined;
+    turnId: SqlParam | undefined;
+    parentId: SqlParam | undefined;
+    seq: SqlParam | undefined;
+    role: SqlParam | undefined;
+    status: SqlParam | undefined;
+    model: SqlParam | undefined;
+    outcome: SqlParam | undefined;
+    error: SqlParam | undefined;
+    usage: SqlParam | undefined;
+    createdAt: SqlParam | undefined;
+    updatedAt: SqlParam | undefined;
+  }): ExecutionResult => {
+    const { id, sessionId, turnId, parentId, seq, role, status, model, outcome, error, usage } = params;
     if (typeof id !== "string" || typeof sessionId !== "string") {
       throw new StorageError("sql_error", "messages.id and messages.session_id must be strings.");
     }
     requireSession(sessionId);
+    if (typeof turnId === "string") requireTurn(turnId);
     if (store.messages.has(id)) {
       throw new StorageError("sql_error", `UNIQUE constraint failed: messages.id = ${id}`);
     }
@@ -370,11 +407,64 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
       outcome: nullableOneOf("messages.outcome", outcome, TURN_OUTCOMES),
       error: typeof error === "string" ? error : null,
       usage: typeof usage === "string" ? usage : null,
-      createdAt: typeof createdAt === "string" ? createdAt : nowIso(),
-      updatedAt: typeof updatedAt === "string" ? updatedAt : nowIso(),
+      createdAt: typeof params.createdAt === "string" ? params.createdAt : nowIso(),
+      updatedAt: typeof params.updatedAt === "string" ? params.updatedAt : nowIso(),
     };
     store.messages.set(id, message);
     return { rows: [message], changes: 1 };
+  };
+
+  const insertMessage = (params: readonly SqlParam[]): ExecutionResult => {
+    // The parameter order mirrors `messageParams()`: `seq` and the `session_id`
+    // of the seq subquery are two separate placeholders.
+    return storeMessage({
+      id: params[0],
+      sessionId: params[1],
+      turnId: params[2],
+      parentId: params[3],
+      seq: params[4],
+      // params[5] is the `session_id` of the seq subquery, not a column.
+      role: params[6],
+      status: params[7],
+      model: params[8],
+      outcome: params[9],
+      error: params[10],
+      usage: params[11],
+      createdAt: params[12],
+      updatedAt: params[13],
+    });
+  };
+
+  /**
+   * `INSERT_TURN_OUTCOME_MESSAGE`.
+   *
+   * The guard comes first and it is the whole point: a turn that does not exist,
+   * or that belongs to another session, writes **no row at all** and reports the
+   * zero changes SQLite reports for an `INSERT … SELECT` that matched nothing.
+   * Only after it passes is a message written — the very same
+   * {@link storeMessage} that `INSERT_MESSAGE` uses, so the `seq` allocation and
+   * the `CHECK` lists cannot drift between the two statements.
+   */
+  const insertTurnOutcomeMessage = (params: readonly SqlParam[]): ExecutionResult => {
+    const [id, outcome, error, createdAt, updatedAt, turnId, sessionId] = params;
+    const turn = typeof turnId === "string" ? store.turns.get(turnId) : undefined;
+    if (turn === undefined || turn.sessionId !== sessionId) return { rows: [], changes: 0 };
+    return storeMessage({
+      id,
+      // Read from the turn row, exactly as the SQL does.
+      sessionId: turn.sessionId,
+      turnId: turn.id,
+      parentId: null,
+      seq: null,
+      role: "idle",
+      status: null,
+      model: null,
+      outcome,
+      error,
+      usage: null,
+      createdAt,
+      updatedAt,
+    });
   };
 
   const insertPart = (isInsert: boolean, params: readonly SqlParam[]): ExecutionResult => {
@@ -483,6 +573,52 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     };
     store.turns.set(id, turn);
     return { rows: [turn], changes: 1 };
+  };
+
+  /**
+   * `UPDATE_TURN_OUTCOME`: close the anchor row.
+   *
+   * Scoped by id **and** session, and a turn that is not in that session is a
+   * zero-row update rather than an error — which is what SQLite reports, and
+   * what `operations.finishTurn` turns into a typed rejection.
+   */
+  const updateTurnOutcome = (params: readonly SqlParam[]): ExecutionResult => {
+    const [status, finishedAt, error, turnId, sessionId] = params;
+    if (typeof turnId !== "string") return { rows: [], changes: 0 };
+    const turn = store.turns.get(turnId);
+    if (turn === undefined || turn.sessionId !== sessionId) return { rows: [], changes: 0 };
+    if (finishedAt !== null && typeof finishedAt !== "string") {
+      throw new StorageError("sql_error", "turns.finished_at must be a string or NULL.");
+    }
+    store.turns.set(turnId, {
+      ...turn,
+      // The schema's CHECK, applied where the schema would apply it — a rejected
+      // outcome has to fail *inside* the transaction, or "nothing was written"
+      // would be a claim instead of a measurement.
+      status: requireOneOf("turns.status", status, TURN_STATUSES),
+      finishedAt: typeof finishedAt === "string" ? finishedAt : null,
+      error: typeof error === "string" ? error : null,
+    });
+    return { rows: [], changes: 1 };
+  };
+
+  /**
+   * `UPDATE_TURN_HEARTBEAT`: one column, one statement.
+   *
+   * `heartbeat_at` and nothing else — a heartbeat that also wrote a status would
+   * be a second way to decide whether a turn is alive, and only the engine's
+   * 30 s threshold may do that (`Plan.md` §6.1).
+   */
+  const updateTurnHeartbeat = (params: readonly SqlParam[]): ExecutionResult => {
+    const [at, turnId] = params;
+    if (typeof turnId !== "string") return { rows: [], changes: 0 };
+    const turn = store.turns.get(turnId);
+    if (turn === undefined) return { rows: [], changes: 0 };
+    if (typeof at !== "string") {
+      throw new StorageError("sql_error", "turns.heartbeat_at must be an ISO-8601 string.");
+    }
+    store.turns.set(turnId, { ...turn, heartbeatAt: at });
+    return { rows: [], changes: 1 };
   };
 
   /**
@@ -649,6 +785,9 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     if (statement === canonical(UPSERT_PART)) return insertPart(false, params);
     if (statement === canonical(FLUSH_DELTA_LOG_SQL)) return appendDelta(params);
     if (statement === canonical(INSERT_TURN)) return insertTurn(params);
+    if (statement === canonical(INSERT_TURN_OUTCOME_MESSAGE)) return insertTurnOutcomeMessage(params);
+    if (statement === canonical(UPDATE_TURN_OUTCOME)) return updateTurnOutcome(params);
+    if (statement === canonical(UPDATE_TURN_HEARTBEAT)) return updateTurnHeartbeat(params);
     if (statement === canonical(INSERT_TOOL_INVOCATION_BEGUN)) return beginToolCall(params);
     if (statement === canonical(UPSERT_TOOL_INVOCATION_DONE)) return recordToolCall(params);
 
@@ -832,6 +971,8 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     appendTurn: (input: TurnInput) => operations.appendTurn(input),
     listUnfinishedTurns: (input: { sessionId: string }): Promise<UnfinishedTurn[]> =>
       operations.listUnfinishedTurns(input),
+    finishTurn: (input: FinishTurnInput): Promise<void> => operations.finishTurn(input),
+    renewHeartbeat: (input: RenewHeartbeatInput): Promise<void> => operations.renewHeartbeat(input),
     beginToolCall: (input: BeginToolCallInput): Promise<void> => operations.beginToolCall(input),
     recordToolCall: (input: RecordToolCallInput): Promise<void> => operations.recordToolCall(input),
     getToolCall: (key: ToolCallKey): Promise<ToolCallRecord | undefined> => operations.getToolCall(key),

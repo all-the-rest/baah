@@ -109,12 +109,19 @@ export {
 export {
   INSERT_TOOL_INVOCATION_BEGUN,
   INSERT_TURN,
+  INSERT_TURN_OUTCOME_MESSAGE,
   SELECT_TOOL_CALL,
   SELECT_UNFINISHED_TURNS,
   TOOL_CALL_KEY_PREDICATE,
   toolCallKeyParams,
+  turnOutcomeMessageParams,
+  turnOutcomeParams,
   turnParams,
+  UPDATE_TURN_HEARTBEAT,
+  UPDATE_TURN_OUTCOME,
   UPSERT_TOOL_INVOCATION_DONE,
 } from "./sql.ts";
+
+export { createTurnStore, type TurnStoreOptions } from "./turn-store.ts";
 
 export type * from "./types.ts";

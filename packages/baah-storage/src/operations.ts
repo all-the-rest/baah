@@ -28,6 +28,7 @@ import {
   INSERT_SESSION,
   INSERT_TOOL_INVOCATION_BEGUN,
   INSERT_TURN,
+  INSERT_TURN_OUTCOME_MESSAGE,
   SEARCH_SQL_ALL_SESSIONS,
   SEARCH_SQL_BY_SESSION,
   SELECT_DELTA_SEQ,
@@ -38,12 +39,16 @@ import {
   SELECT_SESSIONS,
   SELECT_TOOL_CALL,
   SELECT_UNFINISHED_TURNS,
+  UPDATE_TURN_HEARTBEAT,
+  UPDATE_TURN_OUTCOME,
   UPSERT_PART,
   UPSERT_TOOL_INVOCATION_DONE,
   messageParams,
   partParams,
   sessionParams,
   toolCallKeyParams,
+  turnOutcomeMessageParams,
+  turnOutcomeParams,
   turnParams,
 } from "./sql.ts";
 import {
@@ -58,6 +63,7 @@ import {
 } from "./protocol.ts";
 import type {
   BeginToolCallInput,
+  FinishTurnInput,
   FlushDeltaInput,
   FlushDeltaResult,
   Message,
@@ -65,6 +71,7 @@ import type {
   Part,
   PartInput,
   RecordToolCallInput,
+  RenewHeartbeatInput,
   SearchHit,
   SearchInput,
   Session,
@@ -274,6 +281,8 @@ export interface StorageOperations {
   search(input: SearchInput): Promise<SearchHit[]>;
   appendTurn(input: TurnInput): Promise<Turn>;
   listUnfinishedTurns(input: { sessionId: string }): Promise<UnfinishedTurn[]>;
+  finishTurn(input: FinishTurnInput): Promise<void>;
+  renewHeartbeat(input: RenewHeartbeatInput): Promise<void>;
   beginToolCall(input: BeginToolCallInput): Promise<void>;
   recordToolCall(input: RecordToolCallInput): Promise<void>;
   getToolCall(key: ToolCallKey): Promise<ToolCallRecord | undefined>;
@@ -413,6 +422,54 @@ export function createStorageOperations(engine: StorageEngine): StorageOperation
         unfinishedTurnRowSchema,
         "listUnfinishedTurns",
       );
+    },
+
+    /**
+     * Close a turn: the outcome as an `idle` message **and** the anchor row,
+     * in one transaction and in that order.
+     *
+     * Both statements or neither, and the transaction is what buys that — not
+     * the order. The order is fixed anyway because `outcomes[1]` below *is* the
+     * anchor write; and a refused `outcome` is refused by the first statement
+     * (both statements CHECK it), so nothing is half-written either way.
+     *
+     * The message insert carries its own guard (`INSERT_TURN_OUTCOME_MESSAGE`
+     * reads `session_id`/`turn_id` from the turn row and matches only the pair
+     * the caller named), so a caller that pairs a turn with a foreign session
+     * writes nothing at all — not even a message that would then have to be
+     * rolled back. The zero-row update below is what turns that into a typed
+     * error instead of a silent success.
+     */
+    async finishTurn(input) {
+      const outcomes = await engine.transaction([
+        { sql: INSERT_TURN_OUTCOME_MESSAGE, params: turnOutcomeMessageParams(input, newId()) },
+        { sql: UPDATE_TURN_OUTCOME, params: turnOutcomeParams(input) },
+      ]);
+
+      const closed = outcomes[1];
+      if (closed === undefined) {
+        throw new StorageError("internal", "finishTurn: the transaction returned no turn outcome.");
+      }
+      if (closed.changes !== 1) {
+        throw new StorageError(
+          "sql_error",
+          `finishTurn: there is no unfinished turn ${input.turnId} in session ${input.sessionId}.`,
+          { turnId: input.turnId, sessionId: input.sessionId },
+        );
+      }
+    },
+
+    /**
+     * Renew `heartbeat_at` and nothing else.
+     *
+     * The engine measures the age of this value against its own clock
+     * (`Plan.md` §6.1), so the timestamp that lands here is the caller's, not
+     * this layer's. A turn id that does not exist changes no row: the engine
+     * fires this call without awaiting it, and a rejection would be an
+     * unhandled promise rejection rather than a reported failure.
+     */
+    async renewHeartbeat(input) {
+      await engine.run(UPDATE_TURN_HEARTBEAT, [input.at, input.turnId]);
     },
 
     async beginToolCall(input) {

@@ -44,6 +44,7 @@ Zusätzlich zu beachten (AGENTS.md §2, `Plan.md` §14.5):
 | `src/client.ts` | der Main-Thread-Proxy, spricht `protocol.ts` |
 | `src/factory.ts` | die In-Memory-Implementierung — derselbe `StorageDatabase`-Vertrag, ohne OPFS/Worker/WASM |
 | `src/sql.ts` | die SQL-Strings, an beiden Implementierungen geteilt |
+| `src/turn-store.ts` | `TurnStore` der Engine über `StorageDatabase` — der einzige Weg vom Loop in die Datenbank |
 
 `createStorageOperations()` ist der Grund, warum die In-Memory-Variante keine
 zweite Datenbank-Logik enthält: sie erkennt dieselben SQL-Strings wie
@@ -53,6 +54,21 @@ und die Kaskadenregeln werden einmal implementiert und einmal getestet.
 Nicht unterstützt in `factory.ts`: die rohen SQL-Ausgänge. `query`/`run`/
 `transaction` lehnen mit einem typisierten `unsupported`-Fehler ab, statt so zu
 tun, als funktionierten sie.
+
+### Warum der `TurnStore`-Adapter hier liegt
+
+`AGENTS.md` §4 verbietet einen Zeiger von `core` nach `storage`, die Engine
+spricht also gegen ein Interface — und `createTurnStore(db)` liefert genau das.
+Der Adapter liegt hier und nicht im Web-Client, weil die Web-App ihn nur
+*injiziert*: eine zweite Kopie in `baah-web` wäre ein zweiter Weg in dieselbe
+Datenbank, und zwei Wege driften auseinander (so wie `classifyThrownError` und
+`classifyResponse` in der Engine). Vier der sieben Methoden sind bereits
+strukturell identisch und werden durchgereicht; übersetzt werden `flushDelta`
+(ein `PartInput` aus vier Skalaren plus Uhr), `finishTurn` (Outcome als
+`idle`-Nachricht **und** geschlossene Ankerzeile, in einer Transaktion) und
+`heartbeat` (genau eine Spalte). Was der Vertrag *nicht* tragen kann —
+`parts.type`, ein `finished`-Status, eine `sessionId` beim Heartbeat — steht in
+`src/turn-store.ts`.
 
 ## Test-Harness (AGENTS.md §2, einzige Ausnahme)
 

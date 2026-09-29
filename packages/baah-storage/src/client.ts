@@ -31,6 +31,7 @@ import {
 } from "./protocol.ts";
 import type {
   BeginToolCallInput,
+  FinishTurnInput,
   FlushDeltaInput,
   FlushDeltaResult,
   Message,
@@ -40,6 +41,7 @@ import type {
   PartInput,
   QueryResult,
   RecordToolCallInput,
+  RenewHeartbeatInput,
   RunResult,
   SearchHit,
   SearchInput,
@@ -275,6 +277,14 @@ export class WorkerStorageDatabase implements StorageDatabase {
 
   listUnfinishedTurns(input: { sessionId: string }): Promise<UnfinishedTurn[]> {
     return this.#operations.listUnfinishedTurns(input);
+  }
+
+  finishTurn(input: FinishTurnInput): Promise<void> {
+    return this.#operations.finishTurn(input);
+  }
+
+  renewHeartbeat(input: RenewHeartbeatInput): Promise<void> {
+    return this.#operations.renewHeartbeat(input);
   }
 
   beginToolCall(input: BeginToolCallInput): Promise<void> {

@@ -10,6 +10,7 @@
  */
 
 import type {
+  FinishTurnInput,
   MessageInput,
   PartInput,
   SessionInput,
@@ -294,6 +295,92 @@ export const SELECT_UNFINISHED_TURNS = `
   FROM turns
   WHERE session_id = ? AND status NOT IN ('succeeded', 'failed')
   ORDER BY seq ASC`;
+
+/**
+ * Renew the reload anchor: `heartbeat_at` and nothing else.
+ *
+ * One column, one statement. It renews *no* status and touches no other row,
+ * because every column it did not have to write would be a second way for a
+ * heartbeat to change the truth: a `status` write here would let a heartbeat
+ * close (or reopen) a turn, and the engine's 30 s threshold is the only thing
+ * that is allowed to decide that (`Plan.md` §6.1).
+ *
+ * No `AND session_id = ?`, and that is forced rather than chosen: `TurnStore`
+ * declares `heartbeat({ turnId, at })` with no session at all, so there is
+ * nothing to scope by. See `turn-store.ts` for what that costs.
+ *
+ * A turn id that does not exist changes 0 rows and raises nothing — the
+ * recoverable direction, and the reason the engine may fire this without
+ * awaiting it (`loop.ts` calls it as `void store.heartbeat(…)`, so a rejection
+ * here would be an unhandled promise rejection).
+ */
+export const UPDATE_TURN_HEARTBEAT = `
+  UPDATE turns SET heartbeat_at = ? WHERE id = ?`;
+
+/**
+ * Close the anchor row: the turn stops being unfinished.
+ *
+ * Scoped by `session_id` **and** by id, because the caller names both and a
+ * finish that ignored the session would close another session's turn. Zero rows
+ * matched is reported, not raised — the caller turns it into a typed error.
+ */
+export const UPDATE_TURN_OUTCOME = `
+  UPDATE turns
+  SET status = ?, finished_at = ?, error = ?
+  WHERE id = ? AND session_id = ?`;
+
+/**
+ * The turn outcome, as an `idle` message — `Plan.md` §6.2, and the reason the
+ * reload check is "a query on `message.role = 'idle'`" rather than a table of
+ * its own.
+ *
+ * Written as `INSERT … SELECT … FROM turns` instead of `INSERT … VALUES` for one
+ * reason: the row's `session_id` and `turn_id` are read **from the turn that is
+ * being closed**, and a guard (`t.id = ? AND t.session_id = ?`) decides whether
+ * anything is written at all. A caller that names a turn and a session that do
+ * not belong together therefore writes *nothing* — no message, no update — and
+ * the caller can reject loudly on a zero-row update. The alternative (bind the
+ * caller's session id and validate afterwards) would commit an outcome message
+ * into a session that never ran the turn, which is exactly the cross-session
+ * bleed `messages.session_id` exists to make impossible.
+ *
+ * `seq` follows §6.2: `MAX(seq) + 1` per session, evaluated in this statement.
+ */
+export const INSERT_TURN_OUTCOME_MESSAGE = `
+  INSERT INTO messages
+    (id, session_id, turn_id, parent_id, seq, role, status, model, outcome, error, usage,
+     created_at, updated_at)
+  SELECT
+    ?, t.session_id, t.id, NULL,
+    (SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = t.session_id),
+    'idle', NULL, NULL, ?, ?, NULL, ?, ?
+  FROM turns t
+  WHERE t.id = ? AND t.session_id = ?
+  RETURNING ${MESSAGE_COLUMNS}`;
+
+/**
+ * Positional parameters for {@link INSERT_TURN_OUTCOME_MESSAGE}.
+ *
+ * Not `messageParams()`: the two session/turn columns are not bound — they are
+ * read from the turn row — and the guard pair comes last, after the message's
+ * own columns, in that order.
+ */
+export function turnOutcomeMessageParams(input: FinishTurnInput, messageId: string): SqlParam[] {
+  return [
+    messageId,
+    input.outcome,
+    input.error ?? null,
+    input.finishedAt,
+    input.finishedAt,
+    input.turnId,
+    input.sessionId,
+  ];
+}
+
+/** Positional parameters for {@link UPDATE_TURN_OUTCOME}. */
+export function turnOutcomeParams(input: FinishTurnInput): SqlParam[] {
+  return [input.outcome, input.finishedAt, input.error ?? null, input.turnId, input.sessionId];
+}
 
 /**
  * `beginToolCall`: write "may have run", and change nothing if the key is

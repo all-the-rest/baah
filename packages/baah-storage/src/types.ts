@@ -447,6 +447,44 @@ export interface FlushDeltaInput {
   flushedAt: string;
 }
 
+/**
+ * Close a turn.
+ *
+ * **Not** the engine's `TurnStore.finishTurn` input, deliberately: that one has
+ * no timestamp and no way to name the outcome message. The engine's `TurnStore`
+ * takes `{ turnId, sessionId, outcome, error }` and the adapter fills the rest
+ * in — see `turn-store.ts`. Keeping the two shapes apart is what makes the
+ * adapter's existence necessary rather than decorative.
+ *
+ * `outcome` is deliberately **not** validated here. SQLite's `CHECK` on
+ * `turns.status` and the in-memory mirror's equivalent are the two validators,
+ * and both run *inside* the transaction — which is what lets "a refused outcome
+ * wrote nothing at all" be asserted rather than assumed.
+ */
+export interface FinishTurnInput {
+  turnId: string;
+  sessionId: string;
+  outcome: TurnOutcome;
+  /** `undefined` is written as `NULL`, and read back as `null`. */
+  error: string | undefined;
+  /** ISO-8601, for both `finished_at` and the outcome message's timestamps. */
+  finishedAt: string;
+}
+
+/**
+ * Renew `heartbeat_at`, the reload/interrupt anchor (`Plan.md` §6.1).
+ *
+ * `at` is the **caller's** clock reading, ISO-8601 (`AGENTS.md` §5): the engine
+ * injects its own clock and measures age against the same one, so this layer
+ * never substitutes a timestamp of its own. A turn id that does not exist
+ * changes no row and raises nothing — the engine fires this without awaiting it.
+ */
+export interface RenewHeartbeatInput {
+  turnId: string;
+  /** ISO-8601 (`AGENTS.md` §5). */
+  at: string;
+}
+
 export interface FlushDeltaResult {
   partId: string;
   deltaId: string;
@@ -541,6 +579,26 @@ export interface StorageDatabase {
    * fresh heartbeat means somebody *else* is still working on it.
    */
   listUnfinishedTurns(input: { sessionId: string }): Promise<UnfinishedTurn[]>;
+  /**
+   * Close a turn, in **one transaction**: the outcome as an `idle` message
+   * (`Plan.md` §6.2) and the anchor row that stops reporting the turn as
+   * unfinished.
+   *
+   * Both or neither. A crash between the two would leave a transcript claiming
+   * `succeeded` while the reload anchor still reports the turn open — and the
+   * next start-up would then `interrupt` a turn that had already said how it
+   * ended.
+   *
+   * Rejects (`sql_error`) when `turnId` is not a turn of `sessionId`, so a
+   * caller cannot close another session's turn or leave an outcome message in
+   * the wrong log.
+   */
+  finishTurn(input: FinishTurnInput): Promise<void>;
+  /**
+   * Renew `heartbeat_at` (`Plan.md` §6.1). One column, one statement, and no
+   * error for an unknown turn — see {@link RenewHeartbeatInput}.
+   */
+  renewHeartbeat(input: RenewHeartbeatInput): Promise<void>;
 
   /**
    * Record "may have run", keyed on the full {@link ToolCallKey}.
