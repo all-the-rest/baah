@@ -54,6 +54,25 @@ Konkrete Konsequenzen — jede verletzt diese Regel:
   Neue Core-Module dürfen keine DOM-Annahmen machen, wo es vermeidbar ist
   (damit sie in Worker + Vitest laufen).
 
+**Einzige Ausnahme — Test-Harness, nicht Laufzeit:** Ein Test darf den
+**Node-Build** einer WASM-Bibliothek importieren, wenn dieselbe Bibliothek im
+Browser läuft. Konkret: `packages/baah-storage/test/harness/sqlite.ts` importiert
+`@sqlite.org/sqlite-wasm` über dessen `exports.node`-Eintrag, damit die
+Worker-Tests gegen **echtes** SQLite laufen statt gegen ein Modell davon.
+
+Bedingungen, alle drei:
+
+1. **Nur im Test-Baum.** Nichts unter `src/` eines Package darf das tun.
+2. **Nichts davon wird ausgeliefert** — kein Import aus `src/`, kein Bundling.
+3. **Die Ausnahme wird im Bericht des Build-Agenten genannt**, damit sie
+   sichtbar bleibt und nicht zur Gewohnheit verkommt.
+
+Warum das erlaubt ist: Es ist derselbe SQLite-Compiler, nur anders geladen. Der
+Test prüft damit die **SQL-Semantik**, die auch im Browser gilt — ein Fake hätte
+genau die Properties geprüft, die der Fake selbst definiert. Die
+*Browser*-Eigenheiten (OPFS, `FileSystemSyncAccessHandle`, VFS-Eigentum) bleiben
+unberührt und weiterhin nur manuell beweisbar (`Plan.md` §15).
+
 ## 3. Stack (gesetzt)
 
 | Bereich | Wahl |
@@ -226,6 +245,10 @@ Während Build-Subagenten schreiben, gilt im Repo:
   mindestens ein Build-Subagent aktiv ist. Sonst landen seine
   Zwischenstände in einem Doku-Commit — passiert in Welle 1 und hat zwei
   Commits unlesbar gemacht.
+- **Commit immer über explizite Pfade**, nie über den Arbeitsbaum:
+  `git add packages/baah-storage/…` statt `git add -A`. Pfade, die ein
+  **aktiver** Agent besitzt, werden ausgelassen — sie gehören nicht in diesen
+  Commit, auch nicht teilweise.
 - Der Orchestrator committet **erst nach der Verify-Session** eines Blocks und
   committet dann **genau die Dateien dieses Blocks**, nicht den Arbeitsbaum.
 - Falsch aufgenommene Dateien werden **nicht** per History-Rewrite repariert,

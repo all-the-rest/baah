@@ -1322,6 +1322,31 @@ Wiederholen) · `search` (tokenisiertes AND-Matching) · `close`.
   `MATCH`-Ausdrücke verhalten sich anders. Nur Feldmenge und Sortierrichtung
   sind aussagekräftig.
 
+**Was identische Semantik ausdrücklich NICHT bedeutet** (vom Verify-Agenten
+gemessen, nicht vermutet):
+
+| Eigenschaft | gleich? | Warum |
+|---|---|---|
+| `seq`-Vergabe, Kaskaden, Fremdschlüssel, `UNIQUE` | ja | gegen echtes SQLite gemessen |
+| Idempotenz von `flushDelta` und `applyMigrations` | ja | gemessen, `changes()` 1 dann 0 |
+| **Anzahl** der Treffer bei jedem `limit` | ja | getestet fuer -1, 0, normal, riesig |
+| **Reihenfolge** der Treffer | **nein** | FTS5 sortiert nach `bm25()`, die Memory-Engine nach Einfuegung. **Nicht vergleichen** -- ein Test, der gleiche Reihenfolge behauptet, prueft etwas, das kein Backend zusagt. |
+| `score`-Werte | nein | Term-Haeufigkeit statt `bm25()` |
+| `NaN`/`Infinity` als `limit` | nein | ueber den Draht `invalid_message`, in Memory geklemmt. Beides **laut**, keines eine stille Teilmenge -- und `postMessage` kann kein non-finite uebertragen. |
+| `TxResult.changes` bei gemischten Batches | **keine Zeilenzahl** | `sqlite3_changes()` wird von einem SELECT **nicht** zurueckgesetzt; ein Batch Schreiben-dann-Lesen zaehlt die Zeile doppelt. Der ehrliche Kanal ist `results`. |
+
+Test-Harness: `worker.ts` und `client.ts` laufen gegen **echtes** SQLite
+(Node-Build derselben WASM-Bibliothek, siehe `AGENTS.md` §2 Ausnahme), nicht
+gegen ein Modell. Nur `installOpfsSAHPoolVfs` ist ersetzt. Deshalb sind
+CHECK-Verletzungen, Rollback, FTS5 und `changes()`-Buchhaltung **gemessen**.
+
+**Mutationsnachweis** (7 eingebaute Eingriffe, alle 7 toeten jetzt mindestens einen
+Test): `isOwnershipFailure`-Zweig loeschen, zod-Validierung im Worker
+ueberspringen, Antwort-Huelle im Client nicht parsen, Ergebnis-Validierung je
+`kind` ueberspringen, Double-open-Guard entfernen, `nested_transaction`-Guard
+entfernen, unbekannten Status zu `active` coerced. Vor der Erweiterung
+ueberlebten alle sieben **176 gruene Tests** -- das war die eigentliche Luecke.
+
 **Worker-Protokoll** — jede Anfrage korreliert, **nie** über die Grenze geworfen:
 
 ```ts
