@@ -31,6 +31,30 @@ export interface ToolContext {
   signal: AbortSignal;
   approve(request: ApprovalRequest): Promise<ApprovalDecision>;
   emit(event: ToolProgress): void;
+
+  /**
+   * Identity of this one tool call (AGENTS.md §3.1, Plan.md §14.4:
+   * "ausgeführte `toolCallId`s persistieren und kurzschließen").
+   *
+   * Present because the rule is **not implementable without it**. The engine
+   * short-circuits a replay *before* calling `execute`, so a tool that already
+   * ran is never re-entered — but a tool cannot be re-entered blindly either:
+   * `question` would open a second card, and `todo` would `set` a list built
+   * from what the model last saw, overwriting whatever the user did since. A
+   * tool that wants to be safe on its own (a retry loop, a resumable step) has
+   * to be able to ask "is this the same call?", and that needs the id here.
+   */
+  toolCallId: string;
+  /**
+   * Which attempt of the turn this is, 1-based. Plan.md §5.4 caps a turn at
+   * three attempts; a tool that writes needs to know whether it is being asked
+   * to do the work for the first time or again after a retry.
+   *
+   * A retry is a *new* attempt with new `toolCallId`s — the failed attempt is
+   * never continued — so this is for a tool's own bookkeeping, not for
+   * deduplication. Deduplication keys on `toolCallId` alone.
+   */
+  attempt: number;
 }
 
 export interface ToolDefinition<Input = unknown, Output = unknown> {

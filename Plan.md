@@ -627,6 +627,7 @@ Eine Regel ist `{ action, resource, effect }`:
 | `subagent` | Ziel-Agent-ID |
 | `skill` | Skill-ID |
 | `question` | `*` |
+| `todo` | `*` (unsere eigene Zutat, §14.3 — das Vorbild hat kein Todo-Tool) |
 | `webfetch` / `websearch` | URL bzw. Query |
 | `network` | Domain (unsere Ergänzung für `webfetch`-Ziele) |
 | `external_directory` | kanonisches Verzeichnis außerhalb des Workspace |

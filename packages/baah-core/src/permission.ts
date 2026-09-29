@@ -37,6 +37,13 @@ export type Reply = "once" | "always" | "reject";
  *
  * `edit` deliberately covers `write` and `patch` as well — one action for
  * "the model wants to change this file".
+ *
+ * `todo` is our own addition and is listed here for that reason. The reference
+ * harness has no todo tool at all (Plan.md §14.3, item 11), so the action
+ * cannot be copied from a predecessor — but it still needs its own name, because
+ * folding it into `edit` leaves a user with no way to write a rule about it.
+ * Its resource is the session's todo list, which no user can meaningfully name,
+ * so it is matched as `*` like `question`.
  */
 export type Action =
   | "read"
@@ -47,6 +54,7 @@ export type Action =
   | "subagent"
   | "skill"
   | "question"
+  | "todo"
   | "webfetch"
   | "websearch"
   | "network"
