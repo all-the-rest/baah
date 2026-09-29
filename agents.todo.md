@@ -38,6 +38,11 @@
       der Verify-Bericht zeigte dann Fremdfehler. Nach dem Engine-Block.
 - [x] **Verify: `todo`/`question`** — abgeschlossen. **Meine Ausgangsfrage war falsch**
       (siehe Korrekturen weiter unten); trotzdem 5 Defekte + 9 Mutationslücken gefunden.
+- [x] **Fix: `todo`/`question`** — F1–F4 behoben, 43 → 65 Tests (21 todo / 44 question),
+      **30 Mutationen, 0 überlebt** (Rekonstruktion, siehe Lehre 4).
+      ⚠️ **Commit wartet auf den Engine-Block:** Core hat `toolCallId`/`attempt` auf
+      `ToolContext` gesetzt (uncommittet, 24 Zeilen in `tool.ts`). Die Tests hier brauchen
+      die Felder, ein Commit jetzt wäre also ein **roter `main`** (§8). Erst nach Core.
 - [~] **Agent-Engine** (`ToolLoopAgent`, Classification, Backoff, Approval) — Build-Agent läuft.
       `stream/classify.ts` + `stream/backoff.ts` stehen, `agent/*` + `provider/*` fehlen.
 - [ ] **Verify: Agent-Engine** — eigener Verify-Agent, danach Mutationstest. **offen**
@@ -87,24 +92,72 @@
 
 Befunde mit `file:line` stehen im Verifier-Report. Hier nur, was **noch zu tun** ist.
 
-- [ ] **`MIN_OPTIONS = 2` lehnt eine Form ab, die das Vorbild selbst benutzt.**
-      OpenCode v2.0.19 hat **kein** Minimum auf `options`, und dessen eigener Test
-      fährt eine **Ein-Option**-Frage. Unsere Fixture umging das, indem sie immer
-      zwei Optionen schrieb. → Fix-Agent läuft (F1).
-- [ ] **`dismissed` und `skipped` sind für das Modell nicht unterscheidbar.**
-      Das Vorbild hat dafür ein typisiertes `CancelledError`. **Meine Spec-Zeile
-      `Plan.md:1400-1401` ist hier falsch** — sie kollabiert beide zu
-      leere Zeile = übersprungen. Korrigiere ich selbst, aber **erst nach dem
-      Landen des Fix-Agenten** (siehe unten). → Fix-Agent läuft (F2).
-- [ ] **`option.label`-Beschreibung ohne Längen-Konvention** — (1-5 words, concise)
-      ist Teil des Vertrags, nicht Dekoration. → Fix-Agent läuft (F3).
-- [ ] **README begründet `access: "read"` falsch** — die Begründung stimmt nicht mehr,
-      die Entscheidung ist trotzdem richtig. → Fix-Agent läuft (F4).
-- [ ] **9 Mutationslücken in den ursprünglichen 28 Tests** — u. a. `MAX_CONTENT_LENGTH`
-      ungetestet, `get()` lieferte live das interne Array, `await` auf `store.set()`
-      war nicht beweisbar (der Test nutzte einen Store, der sofort auflöst), ein
-      **nie abgehängter** Abort-Listener unter einem Test, der behauptet, das zu prüfen.
-      15 neue `characterisation.test.ts` schließen sie. **Nicht wieder löschen.**
+- [x] **`MIN_OPTIONS = 2` lehnt eine Form ab, die das Vorbild selbst benutzt.**
+      → `MIN_OPTIONS = 1`, Begründung als Kommentar. `0` bleibt verboten (dann gibt es
+      nichts zu fragen). Der Konstante folgten **zwei modellseitige Strings**, deshalb
+      blieb ihr Name. **Mutant Q06 (zurück auf 2) tötet 3 Tests.**
+- [x] **`dismissed` und `skipped` sind für das Modell nicht unterscheidbar.**
+      → Dismissal ist jetzt ein **typisierter Fehler** (`QuestionCancelledError extends
+      ToolError`), Überspringen bleibt eine leere Zeile. Die **Werte** unterscheiden
+      sich, nicht das Timing. **9 Tests.**
+- [ ] **`Plan.md:1400-1401` korrigieren** — meine Spec-Zeile kollabiert dismissed und
+      skipped zu leere Zeile = übersprungen. **Das ist falsch**, wie oben belegt.
+      Bleibt bei mir, aber **erst nach dem Commit des Fix-Blocks** (siehe Welle-1-Liste).
+- [x] **`option.label`-Beschreibung ohne Längen-Konvention** — wortgleich mit dem
+      Vorbild wiederhergestellt, mit Kommentar: Vertragstext, geht in das
+      modellseitige JSON-Schema, wird **behauptet**. Getestet über `z.toJSONSchema()`,
+      nicht gegen die Konstante — eine Konstante würde der Umformulierung folgen.
+- [x] **README begründet `access: "read"` falsch** — Begründung durch den tatsächlichen
+      Codepfad aus `approval.ts` ersetzt, `approval.ts` als *in flight* markiert. Die
+      Entscheidung (`read`) bleibt, und zwar mit tragfähiger Begründung.
+- [x] **9 Mutationslücken geschlossen** — 15 `characterisation.test.ts` vom Verifier,
+      dazu `contract.test.ts` vom Fix-Agent. **Nicht wieder löschen.**
+
+## Lehren aus dem `todo`/`question`-Fix — beide gehen in künftige Aufträge ein
+
+**1. Ein Test, der seine Erwartung aus der Konstante unter Prüfung ableitet, beweist nichts.**
+Der alte Grenzwert-Test las seine Grenzen aus `MIN_OPTIONS`. Als der Wert von 2 auf 1
+geändert wurde, **folgte der Test der Änderung und blieb grün** — er hatte die Änderung
+nie geprüft. Die neuen Tests behaupten deshalb **Literale** (1 parst, 0 nicht, 8 parst,
+9 nicht) statt die Konstante zu spiegeln.
+→ **Regel für jeden Auftrag:** Test-Erwartungen müssen **Literale** sein, keine Spiegel der
+Implementierung. Sonst misst der Test die Konsistenz des Codes mit sich selbst.
+
+**2. Zwei Überlebende im ersten Durchlauf waren beide echte Löcher.**
+- **T09:** das README verspricht, dass ein werfendes `onChange` als Tool-Fehler auftaucht
+  (`AGENTS.md` §5, keine stillen Catches) — **nichts prüfte das.** Ein `try/catch` um die
+  Benachrichtigung hätte eine kaputte Sidebar als stillen Erfolg verkauft.
+- **N01:** `isQuestionDismissed` lieferte `false` für den typisierten Fehler und **überlebte**,
+  weil die Default-Nachricht zufällig das englische Wort *dismiss* enthält und der
+  Regex-Fallback sie abfing. Ein Kanal, der `new QuestionCancelledError("user pressed
+  ESC")` wirft, wäre falsch gemappt worden.
+→ **Regel:** Ein Mutant, der nur durch *einen* Zufall stirbt, ist nicht getötet. Der zweite
+Weg muss den Test ebenfalls töten.
+
+**3. Der Fix-Agent fand einen Defekt in seiner eigenen Lösung.** Die erste Fassung von F2 gab
+`QuestionCancelledError` unverändert über den `instanceof ToolError`-Zweig zurück, also
+bekam das Modell bei `new QuestionCancelledError("user pressed ESC")` genau den String
+`user pressed ESC` — **ohne Anweisung, ohne dont-ask-again**. Ein unbestätigter Zweig genau
+der Art, vor der ich gewarnt hatte, und gefunden von einem **neuen** Test, nicht vom Review.
+
+**4. Ehrliche Einschränkung, die der Agent selbst genannt hat:** die 22-Mutationsliste des
+Verificators war **nicht in seinem Auftrag**. Er hat eine Menge rekonstruiert, die alle 10 in
+meinem Bericht genannten Mutationen enthält, plus weitere. „30 angewandt, 0 überlebt" ist
+also **seine** Rekonstruktion, kein 1:1-Nachlauf. Zwei Mutationen waren im ersten Lauf
+`NOT-APPLIED`, weil sein Refactoring die Anker verschoben hatte; er hat es genannt, die
+Anker korrigiert und neu gelaufen.
+
+**5. Meine Entscheidung zur Text-Erkennung — angenommen, mit Auflagen.** Der Fix-Agent hat
+bewusst **auch** per Text auf dismissed geprüft, nicht nur per `instanceof`. Ich hatte
+Text-Sniffing auf Fehler skeptisch gesehen. Die Begründung hat mich überzeugt: `instanceof`
+greift nicht über einen Kanal, der gegen das Vorbild geschrieben wurde und unsere Klasse nie
+importiert hat — und der Ausfall ist still und schlecht, weil ein Dismissal dann zu *„The
+question could not be answered … Assume nobody can reply right now"* verkommt, was dem
+Modell sagt, **die UI sei kaputt**. Genau die Verwechslung, die F2 beseitigen soll.
+Auflage: der Text-Pfad ist ein **dokumentierter Migrationspfad** und darf ausschließlich
+einen Fehler *spezifischer* machen, niemals die Antwort berühren.
+
+---
 
 ## Schnittstellen-Lücken, die der Core-Agent jetzt bekommt
 
@@ -115,11 +168,14 @@ Befunde mit `file:line` stehen im Verifier-Report. Hier nur, was **noch zu tun**
       Ersetzen, ein Replay trägt die veraltete Liste und **überschreibt eine inzwischen
       vom User gemachte Sidebar-Änderung** — und meldet dabei `changed: true`. Das ist
       ein **verlorener Update, der sich als echter Update ausgibt**. → Core-Agent.
-- [!] **`todo` hat keine Permission-Action** — `Action` kennt `"question"`, aber nicht
-      `"todo"`, also fällt es auf `{action:"edit", resource: undefined}` zurück. Folge:
-      **ein User kann keine einzige Regel schreiben, die Todo-Schreibvorgänge
-      kontrolliert** — kein `ask`, kein `deny`, nie. Braucht `Action` + `Plan.md` §7.2
-      Zeile. → Core-Agent, exklusiv dafür freigegeben.
+- [x] **`todo` hat keine Permission-Action** — Core hat `"todo"` in die `Action`-Union
+      aufgenommen (`permission.ts:57`) und `todo: {action:"todo", resource: () => "*"}`
+      gesetzt (`approval.ts:132`). **Jetzt kann ein User Regeln schreiben.**
+      ⚠️ **Die Resource muss die Konstante `"*"` sein** und darf **nicht** aus dem Input
+      gelesen werden: eine aus `content` abgeleitete Resource ließe jede Regel gegen einen
+      vom Angreifer kontrollierten String matchen. Und `"*"` statt `undefined`, weil
+      `createRuleEnginePermissionEngine` eine leere Liste zu `["*"]` macht, eine engere
+      Default-Policy aber nicht.
 
 ## Korrekturen an meiner eigenen Planung
 
@@ -152,8 +208,19 @@ kann sie schließen — sie sind Rendering- und Vertrauensfragen.
       nächsten `todo`-Aufruf **zurück** in den Modellkontext: klassisches
       Stored-Persistence-Muster, ein zweiter Biss. Wave 2 muss untrusted content
       unterscheidbar rendern.
-- [ ] **`todo` gibt die ganze Liste als Tool-Output zurück** (~20 k Zeichen an den
-      Maxima, kumuliert pro Schritt). Offene Entscheidung: Diff statt Vollliste.
+- [ ] **`todo`-Kosten entscheiden.** **Meine Entscheidung: Vollliste als *Input* bleibt.**
+      Der Fix-Agent hat gemessen, wo die Kosten wirklich sitzen: das `todos`-**Input** des
+      Modells ist so groß wie das Resultat, und bei einem 20-Schritte-Turn wird die Liste
+      **20-mal** übertragen. Ein Diff-**Resultat** spart ~35 %, ein Diff-**Input** ~75 % —
+      zerstört aber *vollständiges Ersetzen, kein stilles Verschwinden*, die eigentliche
+      Sicherheitseigenschaft des Tools. Ein fehlerhaftes Delta ließe Aufgaben
+      stillschweigend fallen, also genau der Fehlermodus, den das aktuelle Design vermeiden soll.
+      **Billige Variante, die ich nehme:** Vollliste bei `changed: true`, bei einem
+      No-op-Aufruf nur `{changed, completedCount}`. Heute schickt ein No-op die ganze Liste
+      für nichts. → Welle-2-Batch, kein eigener Agent.
+      Betroffen: `todo.test.ts` „stores the list and reports the resulting state" und
+      „reports a stable result shape" (beide `toEqual` bzw. `Object.keys`), außerdem
+      „replaces the whole list", „keeps sessions apart" und der Default-Instanz-Test.
 - [ ] **Scratch-Dateien im Baum**: `baah-core/probe-scratch.ts`, `probe2.ts`,
       `tsconfig.probe.json` — gehören einem aktiven Agenten, **nicht committen**,
       beim Landen aufräumen. `.gitignore` um `probe*.ts` ergänzen.
