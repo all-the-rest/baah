@@ -57,6 +57,13 @@ export interface ToolContext {
   attempt: number;
 }
 
+/** What a tool's own `toModelOutput` is given. */
+export interface ToolModelOutput<Input, Output> {
+  toolCallId: string;
+  input: Input;
+  output: Output;
+}
+
 export interface ToolDefinition<Input = unknown, Output = unknown> {
   readonly id: string;
   /** Model-facing description. This text is what the LLM reads to decide. */
@@ -65,6 +72,31 @@ export interface ToolDefinition<Input = unknown, Output = unknown> {
   /** zod schema; the same object is handed to the AI SDK as `inputSchema`. */
   readonly inputSchema: z.ZodType<Input>;
   execute(context: ToolContext, input: Input): Promise<Output>;
+  /**
+   * Frame the result for the model. Optional — omit it and the default
+   * rendering applies, unchanged.
+   *
+   * **Why a tool needs this at all.** The transcript and the database hold the
+   * output; the *model* gets a separate, capped rendering of it. Without a seam
+   * the rendering is `JSON.stringify(output)`, and for a tool whose output is a
+   * bare structure that is unreadable: `question` returns
+   * `{ answers: [["SQLite WASM (Recommended)"]] }`, which reaches the model as
+   * `{"answers":[["SQLite WASM (Recommended)"]]}` — no indication of *which*
+   * question was answered, and no marker that the value is the user's own answer
+   * rather than something the tool derived.
+   *
+   * **What this seam is and is not.** It is framing, not trust. Marking a value
+   * as "the user said this" is a label the model is told to treat as data, not
+   * an instruction it must follow — the untrusted-answer obligation is a separate
+   * concern and stays out of here. Declared as a method, not a property, so the
+   * erased `ToolDefinition<unknown, unknown>` form stays assignable from a
+   * concrete tool (same reason as `execute`).
+   *
+   * Returning `undefined` means "no opinion, use the default", so a tool can
+   * frame only some of its results. Synchronous by design: see the note at
+   * `createSdkTool`'s `toModelOutput`.
+   */
+  toModelOutput?(result: ToolModelOutput<Input, Output>): string | undefined;
 }
 
 /** Preserves the concrete input type when declaring a tool. */

@@ -66,9 +66,21 @@ export interface ProviderSettings {
    * Omitted means the vendor SDK's own default.
    */
   baseUrl?: string | undefined;
-  /** Name of a custom `openai-compatible` entry; required for that vendor. */
+  /**
+   * Name of a custom `openai-compatible` entry; a fallback when the vendor id
+   * carries no suffix.
+   *
+   * A **label, and only a label.** It is never used as a base URL: a name is
+   * something the user typed, and putting it in front of a request produced
+   * `https://groq/…` — a URL that cannot resolve, for a reason no error message
+   * would explain. `baseUrl` is the one field that decides where requests go,
+   * and it is the user's to set.
+   */
   name?: string | undefined;
-  /** Extra headers, merged *after* the required ones so they cannot drop them. */
+  /**
+   * Extra headers, merged **underneath** the required ones so a required header
+   * can never be dropped by an accident in the settings.
+   */
   headers?: Readonly<Record<string, string>> | undefined;
 }
 
@@ -103,6 +115,15 @@ export interface ProviderFactory {
  * Anthropic's `401` carries no `access-control-allow-origin` unless this
  * header is set — the SDK does not add it, so it has to be added here or the
  * browser reports a wrong key as a network failure.
+ *
+ * These are merged **last** in {@link createProviderModel}, and the reason is a
+ * security one rather than a tidiness one: Anthropic without this header turns a
+ * wrong key into an opaque `TypeError: Failed to fetch`, and a settings object
+ * that happens to carry the same header with `"false"` in it would turn a
+ * working key into the same opaque failure. Object spread merges right-to-left,
+ * so "last" is what wins — the earlier arrangement merged required headers
+ * *first* and the caller's value silently overwrote them, which is the exact
+ * opposite of what the comment beside it claimed.
  */
 export function requiredHeaders(vendor: string): Record<string, string> {
   if (vendor === "anthropic") {
@@ -131,7 +152,17 @@ export class ProviderError extends Error {
   }
 }
 
-/** A vendor name, or a custom `openai-compatible` label. */
+/**
+ * A vendor name, or a custom `openai-compatible` label.
+ *
+ * Splits on the **first** colon, so `openai-compatible:groq:llama-3` is the
+ * vendor `openai-compatible` with the label `groq:llama-3`. That is deliberate:
+ * the label is a label (see {@link ProviderSettings.name}) and a colon inside it
+ * is harmless now, because a label never becomes a URL. The error message at
+ * {@link createProviderModel} used to recommend exactly that three-part form
+ * while the parser could only produce a two-part one — and the three-part form's
+ * label was then handed to the vendor SDK as a base URL.
+ */
 export function parseVendorId(value: string): { vendor: string; name: string | undefined } {
   const separator = value.indexOf(":");
   if (separator < 0) return { vendor: value, name: undefined };
@@ -140,18 +171,62 @@ export function parseVendorId(value: string): { vendor: string; name: string | u
   return name === "" ? { vendor, name: undefined } : { vendor, name };
 }
 
-/** A stable key for memoization. The key itself is part of the value. */
-export function fingerprint(settings: ProviderSettings): string {
-  const parts = [
+/**
+ * A short, non-reversible digest of an API key.
+ *
+ * **Why a hash and not the key itself.** The fingerprint is a memo key, and a
+ * memo key is the kind of value that ends up in a log line, a `?raw` source
+ * dump, an error message or an IndexedDB row without anybody deciding to put it
+ * there. The key is a credential; a memo key must not be able to become one.
+ *
+ * **Why `crypto.subtle` and not a hand-rolled mix.** AGENTS.md §2 names
+ * `crypto.subtle` as the only hashing primitive in this package, and a
+ * synchronous "good enough" hash would be exactly the sort of crypto that looks
+ * fine and is not. The cost is that `crypto.subtle.digest` is **async**, which is
+ * why {@link fingerprint} and {@link ProviderRegistry.resolve} are async too.
+ * That is a real API cost and it is the honest one: a synchronous WebCrypto does
+ * not exist, and a synchronous alternative would mean shipping a hash function.
+ *
+ * 8 of the 32 digest bytes. A cache key needs collision resistance against
+ * *accidental* collisions, not preimage resistance, and 64 bits is far past what
+ * a handful of provider configurations can collide on. Truncating also keeps the
+ * key out of any eyeball-scannable string, which is half the point.
+ */
+async function digestKey(apiKey: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(apiKey));
+  const bytes = new Uint8Array(digest).subarray(0, 8);
+  let hex = "";
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+
+/**
+ * A stable, **injective** key for memoization.
+ *
+ * The key itself is part of the value, the headers are part of the value, and
+ * so is the API key — "two settings that differ only by key must not share a
+ * model instance" is what the comment claimed and what the code did not do:
+ * `fingerprint()` never read `apiKey`, so a user who pasted a new key got the
+ * *old* key's model back until something else happened to change. The key enters
+ * as a {@link digestKey}, never as itself.
+ *
+ * Injective, not merely collision-resistant: `JSON.stringify` of the parts
+ * array, not a `join("|")`. A join is not injective — `baseUrl: "x|y", name: "z"`
+ * and `baseUrl: "x", name: "y|z"` produce the same string, and the memo would
+ * hand the first configuration's model to the second. Reaching that needs a pipe
+ * character inside a base URL or a name, which is why it was rated latent; a
+ * memo key should still be injective, and the fix is free.
+ */
+export async function fingerprint(settings: ProviderSettings): Promise<string> {
+  return JSON.stringify([
     settings.vendor,
     settings.model,
     settings.baseUrl ?? "",
     settings.name ?? "",
-    // Headers and the key are part of the identity: two settings that differ
-    // only by key must not share a model instance.
+    // Sorted so a settings round-trip that reorders headers is not a rebuild.
     JSON.stringify(Object.entries(settings.headers ?? {}).sort()),
-  ];
-  return parts.join("|");
+    await digestKey(settings.apiKey),
+  ]);
 }
 
 export interface ProviderRegistryOptions {
@@ -168,7 +243,24 @@ export interface ProviderRegistryOptions {
  */
 export function createProviderModel(options: ProviderRegistryOptions): LanguageModel {
   const { settings, factories } = options;
-  const { vendor, name } = parseVendorId(settings.vendor);
+  const { vendor, name: nameFromId } = parseVendorId(settings.vendor);
+  /**
+   * One label, resolved once, from the id suffix or the field.
+   *
+   * The id suffix wins. It used to be read twice and differently: the presence
+   * check read `nameFromId ?? settings.name` while everything after read the
+   * suffix alone, so `settings.name` decided whether the call succeeded and
+   * nothing about what happened next.
+   *
+   * **Honest scope of that claim:** the resolved label has exactly one consumer
+   * today — the presence check — because the factory takes no label and the
+   * fingerprint uses the raw `settings.name` field. The *precedence* between the
+   * two sources is therefore not observable, and reversing it is an equivalent
+   * mutation rather than a killed one. It is written the way it is because the
+   * id is the more specific of the two and the direction should not depend on
+   * which line a later edit happens to touch.
+   */
+  const name = nameFromId ?? settings.name;
 
   if (settings.model.trim() === "") {
     throw new ProviderError("A model must be selected", "missing_model");
@@ -181,9 +273,11 @@ export function createProviderModel(options: ProviderRegistryOptions): LanguageM
       "missing_api_key",
     );
   }
-  if (vendor === "openai-compatible" && (name ?? settings.name) === undefined) {
+  if (vendor === "openai-compatible" && name === undefined) {
     throw new ProviderError(
-      "An openai-compatible entry needs a name, e.g. `openai-compatible:groq:llama-3`",
+      'An openai-compatible entry needs a name, e.g. vendor `openai-compatible:groq` with ' +
+        'baseUrl "https://api.groq.com/openai/v1". The name is a label; only `baseUrl` decides ' +
+        "where requests go.",
       "missing_name",
     );
   }
@@ -196,10 +290,16 @@ export function createProviderModel(options: ProviderRegistryOptions): LanguageM
   return factory.create({
     apiKey: settings.apiKey,
     model: settings.model,
-    // Required headers first, so a caller's `headers` can add to them but a
-    // required header can never be dropped by an accident in the settings.
-    headers: { ...requiredHeaders(vendor), ...(settings.headers ?? {}) },
-    baseUrl: settings.baseUrl ?? name ?? undefined,
+    // Required headers LAST: object spread merges right-to-left, so this is the
+    // side that wins. The two comments that used to claim the opposite — one on
+    // `ProviderSettings.headers`, one right here — described an arrangement that
+    // let a caller's `headers` drop `anthropic-dangerous-direct-browser-access`,
+    // i.e. turned a working key into an opaque `Failed to fetch`.
+    headers: { ...(settings.headers ?? {}), ...requiredHeaders(vendor) },
+    // **Only** the explicit `baseUrl`. The id suffix is a label; feeding it in
+    // here is what produced `https://groq/…` for an entry the user had simply
+    // not given a URL for.
+    baseUrl: settings.baseUrl,
   });
 }
 
@@ -209,6 +309,24 @@ export function createProviderModel(options: ProviderRegistryOptions): LanguageM
  * The settings screen hands it a new settings object and gets a fresh model;
  * two calls with the same fingerprint get the *same* instance, so a settings
  * round-trip that did not change anything does not rebuild the provider.
+ *
+ * ## It is one slot, not a map — and that is a deliberate trade
+ *
+ * `#cached` holds exactly one entry. A caller alternating between two settings
+ * objects — two sessions, or a user switching provider between turns — never
+ * hits the memo and rebuilds every time.
+ *
+ * That is a **performance** property, not a correctness one, and the reason it
+ * stays is that the alternative has a real cost this does not. A `Map` would
+ * hold live provider clients — each with its own key in memory — indefinitely,
+ * with no way to know when a settings change has made every one of them
+ * garbage. One slot means the previous instance is collectable the moment the
+ * next one is built, and a rebuild is a `create*` call, not a request. The
+ * settings screen, which is the caller that alternates most, is exactly where a
+ * rebuild is free.
+ *
+ * `invalidate()` exists for the case that does need a hard drop: deleting a key
+ * must not leave a live client holding it.
  */
 export class ProviderRegistry {
   readonly #factories: readonly ProviderFactory[];
@@ -226,9 +344,17 @@ export class ProviderRegistry {
     this.#factories = factories;
   }
 
-  /** Resolve, reusing the instance when the settings are unchanged. */
-  resolve(settings: ProviderSettings): LanguageModel {
-    const key = fingerprint(settings);
+  /**
+   * Resolve, reusing the instance when the settings are unchanged.
+   *
+   * Async because {@link fingerprint} is: the API key enters the memo key as a
+   * `crypto.subtle` digest, and there is no synchronous WebCrypto. The
+   * alternative — a hand-rolled synchronous hash — would be shipping crypto to
+   * avoid one `await`, which is the wrong trade in a file that also says a key
+   * must never end up in a loggable string.
+   */
+  async resolve(settings: ProviderSettings): Promise<LanguageModel> {
+    const key = await fingerprint(settings);
     if (this.#cached?.key === key) return this.#cached.model;
     const model = createProviderModel({ settings, factories: this.#factories });
     this.#cached = { key, model };

@@ -199,6 +199,61 @@ Subagent-Tool, Todo-Tool, Kosten-/Budget-Anzeige, `AGENTS.md`-Injektion.
 `ModelMessage[]`). `ModelMessage[]` wird pro Request neu aus den UIMessages
 berechnet (`convertToModelMessages`, seit v6 **async**).
 
+#### Zwei Zustände, die Welle 2 speichern muss (aus der Verifikation)
+
+**1. `tool_invocations.status` ist `begun | done`, nicht „läuft oder nicht".**
+`beginToolCall` schreibt **vor** der Ausführung, `recordToolCall` **danach**.
+Vor dieser Präzisierung gab es kein Feld, das „begonnen, Ausgang unbekannt"
+ausdrückte — der Zustand war **nicht darstellbar**, und damit war im
+Absturzfenster zwischen beiden Schritten genau eine Antwort möglich: das Tool
+noch einmal laufen zu lassen. Bei einem `write`-Tool ist das keine Wiederholung,
+sondern ein **zweites Anhängen an die Datei des Nutzers** (gemessen:
+`log === ["x","x"]`, während das Transcript einen Write zeigt). Das ist stiller
+Datenverlust, den das Modell nicht zurücknehmen kann.
+
+Die Engine löst den Konflikt nicht durch Wiederholen und nicht durch
+stilles Überspringen, sondern durch **Sichtbarkeit**: `begin` ohne `done` wird
+dem Modell als Ergebnis mit `outcome: "unknown"` zurückgegeben — mit der
+Anweisung, den Zustand zu **prüfen**, statt zu wiederholen — und als Event
+`tool-outcome-unknown` gemeldet. **Bleibendes Restrisiko, ausdrücklich gesagt:**
+ob die Wirkung eingetreten ist, weiß die Engine nicht und kann es nicht wissen.
+Der User sieht eine Warnung, kein stilles Entweder-oder.
+
+Der Kurzschluss feuert **nur** auf `done`. Und er ist nicht auf die bloße
+`toolCallId` geschlüsselt: der Schlüssel ist
+`(sessionId, attempt, toolCallId, occurrence)` — **jede** Komponente ist nötig,
+denn jede schließt einen gemessenen Fehler:
+
+| Komponente | Fehler, den sie schließt |
+|---|---|
+| `sessionId` | zwei Sessions mit gleicher Id teilten sich einen Record (§6.1 hat die Spalte) |
+| `attempt` | ein Retry ist ein neuer Turn; ohne ihn schwieg der alte Record einen neuen legitimen Aufruf |
+| `occurrence` | ein Provider, der eine Id **zweimal** benutzt, verlor sonst den zweiten Aufruf — still, und der Turn meldete `succeeded` |
+
+`occurrence` wird bei der **Lookup** hochgezählt, nicht beim `begin`: ein
+kurzgeschlossener Aufruf beginnt nie, und ein Turn, der zwei Aufrufe mit
+gleicher Id replayt, löste sonst **beide** auf Occurrence 0 auf.
+
+**2. Reload-Recovery braucht eine Schwelle, nicht nur einen Anker.**
+`heartbeat_at` wird bei **jedem** `onStepEnd` und zu **Beginn jedes Versuchs**
+erneuert. Beim Start markiert `recoverStaleTurns` jeden unfertigen Turn, dessen
+Heartbeat **älter als 30 s** ist, als `interrupted` — und lässt alle anderen
+unangetastet.
+
+| Seite der Grenze | Bedeutung |
+|---|---|
+| `age < 30 s` | **lebendig** — jemand arbeitet noch daran. Ein zweiter Tab darf diesen Turn nicht schließen. |
+| `age >= 30 s` | **tot** — der Tab ist weg. `interrupted`, mit Grund, Teiltext bleibt. |
+
+Die Grenze ist **bewusst kurz**, und der Trade ist benannt: zu lang, und ein im
+Schritt 7 von 20 gestorbener Turn sieht weiter aus wie lebendig — das ist
+genau der stille Fall, den §5.4 verhindern will. Zu kurz, und ein wirklich
+arbeitender Turn wird für tot erklärt; der Schaden ist ein `interrupted` mit
+`regenerate`-Angebot, also sichtbar und umkehrbar. 30 s liegt über dem
+20-s-Stallfenster aus §5.4 und weit unter der Dauer eines echten Schritts.
+Resume bleibt unmöglich (§14.4) — „Recovery" heißt hier also *ehrlich
+abschließen und neu senden lassen*, nicht fortsetzen.
+
 
 ### 5.2 Worker
 
@@ -410,6 +465,61 @@ und ein Turn, der hängen bleibt, ist schlechter. Die harte Grenze bleibt
 - **Dauerhafter Hinweis**, wenn Antworten am Stück ankommen — sonst hält man die
   UI für kaputt.
 
+#### Was die Engine tatsächlich prüft — und wo die Grenze liegt (revidiert)
+
+Dieser Abschnitt ist eine **Korrektur**, keine Ergänzung. Die Regel oben
+(„ein 200 ist eine Behauptung, keine Tatsache") bleibt richtig; sie ist aber
+**nicht auf jeder Ebene** durch den Code einlösbar, und das gehört hier hin,
+statt es in einem Kommentar zu verstecken.
+
+**Die Regel gilt auf der Response-Body-Ebene, nicht auf der Chunk-Ebene.**
+Durch `ToolLoopAgent` sieht die Engine **keinen** rohen Chunk-Stream:
+`ToolLoopAgentSettings` hat **kein** `onChunk`, **kein** `includeRawChunks`,
+**kein** `onError` (gegen `ai/dist/index.d.ts` geprüft). Das
+SSE-`data: [DONE]`, das oben als Erfolgskriterium steht, ist von hier aus
+**nicht erreichbar**. Wer es braucht, muss das `LanguageModel` in der
+Registry umhüllen — **eine spätere Entscheidung, hier nicht getroffen.**
+
+Was **stattdessen** gemessen wird, zwei Signale, beide echt:
+
+| Signal | Woher | Was es trägt |
+|---|---|---|
+| `rawFinishReason` am `finish`-Part | der **Provider** selbst, wörtlich; der SDK lässt es `undefined`, wenn er den Part **selbst** erzeugt | abgeschnittener Stream → `undefined`; ein vom Provider gesendeter `finish`, auch mit `other` → gesetzt |
+| `AI_NoOutputGeneratedError` | der SDK, mit `"The model stream ended without a finish chunk."` | ein Stream ganz ohne Ausgabe |
+
+**Warum die alte Heuristik ersetzt werden musste — nicht verbessert.** Sie war
+nicht ungenau, sie war **entartet**: `ai@7.0.122` rechnet
+`unified: finishReason === "unknown" ? "other" : finishReason`. Ein Provider,
+der **absichtlich** mit dem spec-legalen `"unknown"` endet, erzeugt damit eine
+**byte-identische** Part-Sequenz wie ein abgeschnittener Stream — beide melden
+`"other"`. Gemessen: ein sauber beendeter `finish("other")` wurde als
+Abschneidung gelesen und **erneut gesendet** — drei Requests für eine Antwort,
+die da war. Ein Terminal-Event aus einem **normalisierten** Wert zu raten ist
+schlimmer als gar keiner, weil es auf richtigen Antworten feuert.
+
+**Und die Klassifikation hat jetzt *eine* Implementierung.** `classifyResponse`
+ist die einzige Regel; `classifyThrownError` ist ein dünner Adapter darauf, und
+der Loop ruft `classifyResponse` **für jeden fehlgeschlagenen Turn** mit den
+beobachteten Fakten. Vorher gab es zwei Regelsätze, die sich widersprachen, und
+nur einer davon wurde von einem Turn je erreicht: `AbortError` mit
+`statusCode 500` war „nicht wiederholen" gegen „retryable 500", und eine fehlende
+`LoadAPIKeyError` — also ein **nicht konfigurierter Key** — wurde als
+`no-response` gemeldet, also als das 20-Sekunden-Stillstandskonzept „warte auf
+eine Antwort, die nie kommen kann". Der User wurde auf ein Warten hingewiesen,
+das nichts beheben konnte. Beides ist jetzt eine Aussage: ein lokaler Abbruch
+ist `no-response` (nie wiederholen, egal was der Wurf trägt), ein fehlender Key
+ist `config-error` (endgültig, mit benanntem Code für die UI).
+
+**Offene Lücke, benannt statt kaschiert:** `stallTimeoutMs` ist die Länge des
+`waiting`-Zustands und **misst nichts**. Der Loop kann ein `stream()`, auf das
+er wartet, nicht unterbrechen, also kann er keinen Stillstand messen — und
+`no-response` hat damit im Turn keine Erzeugung. Die Messung gehört an den
+Transport (ein Watchdog auf die Chunk-Zeitpunkte), also an dieselbe Stelle, an
+der auch das 20-s-Fenster durchgesetzt werden müsste, damit es etwas bedeutet.
+Ein Stall-Detektor, der keinen Stall beobachten kann, ist von gar keinem nicht
+unterscheidbar.
+
+
 
 
 ### 5.5 Shell — von „nicht v1" zu „v1 möglich" (revidiert)
@@ -503,6 +613,28 @@ schema_migrations(version PK, name, applied_at)
 
 Pragmas pro Verbindung: `foreign_keys=ON`, `journal_mode=DELETE` (WAL bringt im
 Web-VFS nichts), `synchronous=NORMAL`, `busy_timeout=5000`.
+
+#### Präzisierung der zwei Anker (aus der Verifikation)
+
+**`tool_invocations.status` ist `begun | done`.** Die Spalte existierte, stand
+aber für nichts Brauchbares, weil beide Schreiber — `beginToolCall` **vor** der
+Ausführung, `recordToolCall` **danach** — in dasselbe Feld schrieben. „Begonnen,
+Ausgang unbekannt" war damit **nicht darstellbar**, und genau das ist der
+Zustand, in dem ein Absturz zwischen den beiden Schritten landet. Die Engine
+schließt daraus nie stillschweigend: Kurzschluss nur auf `done`, sonst ein für
+Modell **und** User sichtbares „Ausgang unbekannt". Vollständig in §5.1.
+
+Der Kurzschluss-Key ist `(session_id, attempt, toolCallId, occurrence)`. Für
+`session_id` hat die Tabelle bereits die Spalte; `attempt` und `occurrence` sind
+Engine-Buchführung und gehören in die Key-Berechnung des Stores, nicht
+zwingend in die Tabelle.
+
+**`heartbeat_at` braucht eine Schwelle, sonst ist es kein Anker.** §6.1 nennt
+den Anker, aber keine Grenze — ein frischer und ein verwaister Turn waren
+identisch. Die Engine erneuert ihn je `onStepEnd` **und** zu Beginn jedes
+Versuchs; beim Start gilt `age >= 30 s` als tot, alles darunter als lebendig
+(also: **nicht** anfassen — ein zweiter Tab arbeitet daran). Grenze, Trade und
+Restrisiko in §5.1.
 
 ### 6.2 Design-Entscheidungen
 
@@ -1072,6 +1204,38 @@ selbst kann **keine** Modelle auflisten — es gibt nur `model(id)`-Fabriken.
 **Keine offiziellen Chat-Komponenten.** Alles über `message.parts` selbst
 rendern (daisyUI hat passende `chat`/`chat-bubble`-Klassen). `@ai-sdk/rsc` ist
 RSC-only und wird **nicht** verwendet.
+
+**Keine offiziellen Chat-Komponenten.** Alles über `message.parts` selbst
+rendern (daisyUI hat passende `chat`/`chat-bubble`-Klassen). `@ai-sdk/rsc` ist
+RSC-only und wird **nicht** verwendet.
+
+#### Was daraus für den Loop folgt (Nachtrag aus der Verifikation)
+
+**Der rohe Chunk-Stream ist durch `ToolLoopAgent` nicht erreichbar.** Die
+Einstellungen kennen **kein** `onChunk`, **kein** `includeRawChunks`, **kein**
+`onError` — alle drei gegen die installierte `dist/index.d.ts` geprüft. Damit
+gibt es auf dieser Ebene **keinen** Weg, das `data: [DONE]` aus §5.4 zu sehen.
+Das ist keine Lücke in der Implementierung, sondern eine Eigenschaft der
+gewählten Schicht; sie aufzulösen heißt, das `LanguageModel` in der
+Provider-Registry zu umhüllen — **eine spätere Entscheidung, hier nicht
+getroffen.** Was die Engine stattdessen hat, steht in §5.4.
+
+**`rawFinishReason` ist der Ersatz, und er ist kein Ersatz im Notsinn.** Auf dem
+`finish`-Part trägt er den **Grund des Providers, wörtlich**; der SDK lässt ihn
+`undefined`, wenn er den Part nach einem Stream ohne Provider-Ende selbst
+erzeugt. Gemessen gegen `ai@7.0.122`: ein sauberer `finish("other")` des
+Providers meldet `finishReason: "other"` **und** `rawFinishReason: "other"`, ein
+abgeschnittener meldet `finishReason: "other"` und **kein** `rawFinishReason`.
+Genau diese eine unterscheidbare Eigenschaft war vorher nicht benutzt worden —
+stattdessen wurde `finishReason !== "other"` geraten, was nicht ungenau, sondern
+**entartet** war.
+
+**Was `ToolLoopAgent` *nicht* kann, steht hier, weil es jemand brauchen wird:**
+`streamRetries` gibt es auf `streamText`, **nicht** auf `ToolLoopAgentSettings`
+(Durchreichen ist ein Typfehler). Der einzige Retry-Loop der Engine ist der
+eigene, und `maxRetries: 0` schaltet den SDK-Loop ab. Beides steht als Wert in
+`staticAgentSettings()` und wird von einem Test geprüft — nicht in einem
+Kommentar, denn das Löschen der Zeile hat einmal **403 Tests** überlebt.
 
 
 ### 14.5 Browser-Sandbox, Shell-Ersatz und Code-Suche (abgeschlossen)

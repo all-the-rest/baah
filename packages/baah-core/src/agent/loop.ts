@@ -30,14 +30,22 @@
  *
  * ## A `200` is not a success (Plan.md §5.4)
  *
- * Retry is driven by `stream/classify.ts`, not by "did it throw?". Two rules
- * that are easy to get wrong and are therefore load-bearing below:
+ * Retry is driven by `stream/classify.ts` — `classifyResponse` is called for
+ * every failed turn, with the facts that turn observed, so the JSON-error-body
+ * check, the content-type check and the `sawTerminalEvent` observation are
+ * exercised by real turns and not only by their own unit tests. Two rules that
+ * are easy to get wrong and are therefore load-bearing below:
  *
- * - a stream that ends **without a terminal event** is a failure, and
+ * - a stream that ends **without a provider finish chunk** is a failure, and
  * - a **retry never continues the failed attempt**: the partial text stays in
  *   the transcript marked `interrupted`, and the next attempt starts from the
  *   original prompt. Copying partial text forward would show the user text the
  *   model never finished and would make the failure undiagnosable.
+ *
+ * The terminal-event check reads `rawFinishReason`, the provider's own value.
+ * What is *not* reachable at this layer — the raw SSE chunk stream — is stated
+ * where the check is used rather than approximated, because approximating it is
+ * exactly what made the previous check fire on correct answers.
  *
  * ## Nothing here writes to the console
  *
@@ -62,10 +70,16 @@ import {
   type UIMessageChunk,
 } from "ai";
 
-import { classifyThrownError, type Classification } from "../stream/classify.ts";
+import { classifyResponse, isKnownErrorType, type Classification } from "../stream/classify.ts";
 import { MAX_ATTEMPTS, nextDelayMs, remainingAttempts } from "../stream/backoff.ts";
 import type { ApprovalResolver } from "./approval.ts";
-import { createToolSet, type AiToolSet, type AnyToolDefinition } from "./tools.ts";
+import {
+  createToolSet,
+  type AiToolSet,
+  type AnyToolDefinition,
+  type ToolCallKey,
+  type ToolCallRecord,
+} from "./tools.ts";
 import type { ApprovalDecision, ApprovalRequest, ToolProgress } from "../tool.ts";
 import type { Workspace } from "../workspace.ts";
 
@@ -89,6 +103,18 @@ export type AgentEvent =
   | { type: "tool-error"; toolCallId: string; toolName: string; error: string }
   /** The model was refused; it reads the refusal and can route around it. */
   | { type: "tool-output-denied"; toolCallId: string; toolName: string; reason: string | undefined }
+  /**
+   * A call began and never reported an outcome — the tab died in between, or
+   * the process was killed.
+   *
+   * Its own event because neither of the two available responses is honest on
+   * its own. Re-running risks a second side effect on the user's files
+   * (corruption, which the model cannot undo); skipping silently would hand the
+   * model a result for work that may never have happened. The engine does
+   * neither: it surfaces the gap, and the model is told to verify rather than
+   * repeat. See the residual-risk note where the short-circuit lives.
+   */
+  | { type: "tool-outcome-unknown"; toolCallId: string; toolName: string; input: unknown }
   | { type: "approval-requested"; approvalId: string; toolCallId: string; toolName: string; reason: string | undefined }
   | { type: "approval-answered"; approvalId: string; approved: boolean }
   /** A step finished — the checkpoint point (AGENTS.md §3.1, `onStepEnd`). */
@@ -96,6 +122,16 @@ export type AgentEvent =
   | { type: "attempt-failed"; attempt: number; classification: Classification }
   /** 20 s of silence: a waiting state plus a manual action, never a retry. */
   | { type: "waiting"; reason: string; retryAfterMs: number }
+  /**
+   * The user stopped the turn.
+   *
+   * Separate from a stall, and separate from `attempt-failed`, because a stop is
+   * a deliberate action and not a provider verdict. `turn-finished` with
+   * `outcome: "interrupted"` and **no** classification is the invariant: a stall
+   * always carries `no-response`, so an interrupted turn without one is a stop.
+   * The event exists so a UI does not have to infer that.
+   */
+  | { type: "turn-stopped"; stage: "attempt" | "approval-resume" }
   | { type: "turn-finished"; outcome: TurnOutcome; attempts: number }
   | { type: "error"; error: unknown; classification: Classification };
 
@@ -139,6 +175,21 @@ export interface TurnResult {
    * retried.
    */
   hitStepLimit: boolean;
+  /**
+   * Tool calls that began and never reported an outcome (Plan.md §14.4).
+   *
+   * The engine ran none of them a second time and reported none of them as
+   * failed — both would be lies the model would act on. Every one is listed so
+   * the caller can put it on screen; an empty array is the common case.
+   */
+  unknownOutcomes: readonly UnknownToolOutcome[];
+}
+
+/** A tool call whose effect is genuinely unknown. See `AgentEvent`. */
+export interface UnknownToolOutcome {
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
 }
 
 /* ------------------------------------------------------------------ */
@@ -148,8 +199,11 @@ export interface TurnResult {
 /**
  * The persistence operations a turn needs.
  *
- * Every one of these already exists on `StorageDatabase` (Plan.md §16.1). The
- * engine does not know that, and must not.
+ * Every one of these already exists on `StorageDatabase` (Plan.md §16.1) except
+ * the two marked **[W2]** — the tool-call status column and the unfinished-turn
+ * read. Those are the storage wiring that lands with Wave 2; the engine owns
+ * the contract and the tests own the semantics, and nothing in `src/` depends
+ * on the concrete backend.
  */
 export interface TurnStore {
   /** Idempotent over `deltaId`; this is what makes a retry safe. */
@@ -169,15 +223,32 @@ export interface TurnStore {
   }): Promise<void>;
   /** Renews `heartbeat_at`; a stale heartbeat is the reload anchor (§6.1). */
   heartbeat(input: { turnId: string; at: string }): Promise<void>;
-  /** Records that a `toolCallId` ran, so a replay short-circuits it. */
-  recordToolCall(input: { toolCallId: string; toolName: string; output: unknown }): Promise<void>;
   /**
-   * The recorded output of an already-executed `toolCallId`, or `undefined` if
-   * it has never run.
+   * **[W2]** Unfinished turns of a session, for reload recovery.
+   *
+   * A turn is unfinished while it is neither `succeeded` nor `failed` — the
+   * window where a reload leaves a half-written transcript behind.
    */
-  getToolCall(toolCallId: string): Promise<{ output: unknown } | undefined>;
+  listUnfinishedTurns(input: { sessionId: string }): Promise<readonly UnfinishedTurn[]>;
+  /** Records that a `toolCallId` ran, so a replay short-circuits it. */
+  recordToolCall(input: {
+    key: ToolCallKey;
+    toolName: string;
+    output: unknown;
+  }): Promise<void>;
   /**
-   * Mark a `toolCallId` as **about to run** (Plan.md §14.4, AGENTS.md §3.1).
+   * The record of a call, or `undefined` if it has never been begun.
+   *
+   * **The status is the point.** It was absent, and its absence was the bug: a
+   * row written by `beginToolCall` and a row written by `recordToolCall` both
+   * read back as "not present", so "began, outcome unknown" was
+   * *unrepresentable* and a crash in that window was indistinguishable from
+   * "never ran" — which is exactly the case in which re-running corrupts the
+   * user's files. `status: "done"` is the only state that short-circuits.
+   */
+  getToolCall(key: ToolCallKey): Promise<ToolCallRecord | undefined>;
+  /**
+   * Mark a call as **about to run** (Plan.md §14.4, AGENTS.md §3.1).
    *
    * Written before the tool executes, not after. Afterwards would only record
    * "ran successfully", which leaves a crash in between indistinguishable from
@@ -185,7 +256,15 @@ export interface TurnStore {
    * twice, or (for `todo`) overwrites a newer list with a stale one while
    * reporting a change that never happened.
    */
-  beginToolCall(input: { toolCallId: string; toolName: string; input: unknown }): Promise<void>;
+  beginToolCall(input: { key: ToolCallKey; toolName: string; input: unknown }): Promise<void>;
+}
+
+/** A turn that a reload may have left open (Plan.md §6.1). */
+export interface UnfinishedTurn {
+  turnId: string;
+  /** The `heartbeat_at` value the writer last renewed. ISO-8601, per AGENTS.md §5. */
+  heartbeatAt: string;
+  startedAt: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -213,13 +292,25 @@ export interface AgentLoopOptions {
   /** Stop condition. Defaults to 20, the SDK's own default. */
   maxSteps?: number;
   /**
-   * Stall window before a response counts as "no response" (Plan.md §5.4).
+   * Stall window, the length of the `waiting` state (Plan.md §5.4).
+   *
    * 20 s — the provider may still be generating, so this is never retried.
+   *
+   * **What it does and does not do, so nobody builds on a promise:** it is the
+   * duration reported in the `waiting` event and nothing more. There is no timer
+   * in this loop: it cannot interrupt a `stream()` it is awaiting, so it cannot
+   * *measure* a stall, and `no-response` therefore has no producer here. The
+   * measurement belongs at the transport — a watchdog on the chunk arrival
+   * times, which is the same place the 20 s window would have to be enforced
+   * to mean anything. Recorded as a gap in Plan.md §5.4 rather than papered
+   * over with a heuristic, because a stall detector that cannot observe a stall
+   * is indistinguishable from no detector at all.
    */
   stallTimeoutMs?: number;
   /** Injected for deterministic tests. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   random?: () => number;
+  /** Clock for the `heartbeat_at` anchor (Plan.md §6.1). Injected for tests. */
   now?: () => number;
   /** A caller-supplied signal; combined with {@link AgentTurn.stop}. */
   abortSignal?: AbortSignal;
@@ -231,6 +322,91 @@ export interface AgentLoopOptions {
 const DEFAULT_MAX_STEPS = 20;
 /** Plan.md §5.4: 20 s of silence is a waiting state, not a retry. */
 export const DEFAULT_STALL_TIMEOUT_MS = 20_000;
+
+/**
+ * How old a `heartbeat_at` may be before the turn it belongs to counts as dead
+ * (Plan.md §6.1 calls it "der Reload-/Interrupt-Anker").
+ *
+ * **The boundary is `age >= 30 s` → stale.** Chosen deliberately short, and the
+ * trade is worth stating because it cuts both ways:
+ *
+ * - Too *long* and a turn whose tab was closed mid-step keeps looking alive.
+ *   Nothing ever finishes it, the transcript is left mid-sentence, and the user
+ *   is never told — the silent failure Plan.md §5.4 exists to prevent.
+ * - Too *short* and a genuinely working turn is declared dead by whoever runs
+ *   the recovery (a second tab, or the same one after a reload). The heartbeat
+ *   is renewed at **every step end** (AGENTS.md §3.1), so a healthy turn
+ *   refreshes it continuously; the damage of a false positive is a turn marked
+ *   `interrupted` and offered as `regenerate`, which is visible and undoable.
+ *
+ * 30 s sits above §5.4's 20 s stall window, so a turn that produced nothing for
+ * the whole stall window is already recoverable, and far below the duration of
+ * a real step (a long tool, a slow model) that must not be mistaken for death.
+ */
+export const STALE_HEARTBEAT_MS = 30_000;
+
+/**
+ * Milliseconds between a heartbeat and `nowMs`. Unparsable input is `Infinity`
+ * rather than `0`.
+ *
+ * `Infinity` because "I cannot tell how old this is" must resolve to *stale*,
+ * the recoverable side. Guessing `0` would read as "written just now" and keep
+ * a turn whose anchor is corrupt — or from a clock that disagrees with ours —
+ * looking alive forever, which is the silent direction.
+ */
+export function heartbeatAgeMs(heartbeatAt: string, nowMs: number): number {
+  const at = Date.parse(heartbeatAt);
+  if (Number.isNaN(at)) return Number.POSITIVE_INFINITY;
+  return Math.max(0, nowMs - at);
+}
+
+/** Is this heartbeat on the stale side of {@link STALE_HEARTBEAT_MS}? */
+export function isTurnStale(
+  heartbeatAt: string,
+  nowMs: number,
+  staleAfterMs: number = STALE_HEARTBEAT_MS,
+): boolean {
+  return heartbeatAgeMs(heartbeatAt, nowMs) >= staleAfterMs;
+}
+
+/**
+ * Close turns that a reload left open (AGENTS.md §3.1, Plan.md §6.1).
+ *
+ * Called once at start-up, before a new turn starts. It marks every unfinished
+ * turn whose heartbeat is on the stale side of the boundary `interrupted` and
+ * leaves the rest alone — a fresh heartbeat means **someone else is still
+ * working on it**, and closing that would kill a live turn in another tab.
+ *
+ * Resume is impossible (§14.4: `reconnectToStream()` always returns `null`), so
+ * the recovery is not "continue": it is "close it honestly and let `regenerate`
+ * re-send", with the partial text kept.
+ */
+export async function recoverStaleTurns(options: {
+  store: TurnStore;
+  sessionId: string;
+  staleAfterMs?: number;
+  nowMs?: number;
+}): Promise<readonly UnfinishedTurn[]> {
+  const { store, sessionId } = options;
+  const staleAfterMs = options.staleAfterMs ?? STALE_HEARTBEAT_MS;
+  const nowMs = options.nowMs ?? Date.now();
+  const unfinished = await store.listUnfinishedTurns({ sessionId });
+
+  const recovered: UnfinishedTurn[] = [];
+  for (const turn of unfinished) {
+    if (!isTurnStale(turn.heartbeatAt, nowMs, staleAfterMs)) continue;
+    await store.finishTurn({
+      turnId: turn.turnId,
+      sessionId,
+      outcome: "interrupted",
+      // Said out loud, because "interrupted" with no reason reads as a crash and
+      // the user has to be able to tell a reload from a provider failure.
+      error: `interrupted: no heartbeat for ${Math.round(heartbeatAgeMs(turn.heartbeatAt, nowMs) / 1000)}s`,
+    });
+    recovered.push(turn);
+  }
+  return recovered;
+}
 
 function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -255,15 +431,16 @@ function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
 /* ------------------------------------------------------------------ */
 
 type AttemptObservation =
-  | { kind: "success"; text: string; messages: UIMessage[]; hitStepLimit: boolean }
+  | { kind: "success"; text: string; messages: UIMessage[]; hitStepLimit: boolean; unknownOutcomes: UnknownToolOutcome[] }
   | {
       kind: "awaiting-approval";
       text: string;
       messages: UIMessage[];
       openApprovals: OpenApproval[];
       hitStepLimit: boolean;
+      unknownOutcomes: UnknownToolOutcome[];
     }
-  | { kind: "aborted"; text: string; messages: UIMessage[]; hitStepLimit: boolean }
+  | { kind: "aborted"; text: string; messages: UIMessage[]; hitStepLimit: boolean; unknownOutcomes: UnknownToolOutcome[] }
   | {
       kind: "failed";
       text: string;
@@ -271,7 +448,31 @@ type AttemptObservation =
       classification: Classification;
       error: unknown;
       hitStepLimit: boolean;
+      unknownOutcomes: UnknownToolOutcome[];
     };
+
+/**
+ * The settings handed to `ToolLoopAgent` that do not vary per attempt.
+ *
+ * Exported, and in its own function, for one reason: **both values here are
+ * rules, and rules that are only stated in a comment are rules that a later edit
+ * can delete without a test noticing.**
+ *
+ * - `maxRetries: 0` — the SDK's default is 2, retried under *its own* backoff,
+ *   below our classification. Left on, one turn makes up to 9 requests of which
+ *   6 are invisible to the UI, and §5.4's "at most 3 attempts, all visible"
+ *   becomes false. It survives as long as it is a value somebody can assert.
+ * - `telemetry: { isEnabled: false }` — AGENTS.md §3.1 requires it, §14.4 gives
+ *   the reason (the docs treat telemetry as default-on once an integration is
+ *   registered, so a silent upgrade would start sending). It is trivially
+ *   assertable here, and was previously pinned by nothing at all.
+ */
+export function staticAgentSettings(): {
+  maxRetries: 0;
+  telemetry: { isEnabled: false };
+} {
+  return { maxRetries: 0, telemetry: { isEnabled: false } };
+}
 
 /**
  * One turn: send a prompt, stream, run tools, checkpoint per step, and retry a
@@ -325,7 +526,7 @@ export class AgentTurn {
   }
 
   async run(prompt: string): Promise<TurnResult> {
-    const { store, stallTimeoutMs = DEFAULT_STALL_TIMEOUT_MS } = this.#options;
+    const { stallTimeoutMs = DEFAULT_STALL_TIMEOUT_MS } = this.#options;
     const attemptLog: AttemptRecord[] = [];
     const baseMessages = [...(this.#options.messages ?? [])];
     /** Retries already spent on an *unrecognised* error type (§5.4: only one). */
@@ -357,6 +558,7 @@ export class AgentTurn {
           openApprovals: [],
           messages: observation.messages,
           hitStepLimit: observation.hitStepLimit,
+          unknownOutcomes: observation.unknownOutcomes,
         };
       }
 
@@ -380,6 +582,7 @@ export class AgentTurn {
           openApprovals: observation.openApprovals,
           messages: observation.messages,
           hitStepLimit: observation.hitStepLimit,
+          unknownOutcomes: observation.unknownOutcomes,
         };
       }
 
@@ -392,6 +595,7 @@ export class AgentTurn {
           interrupted: true,
           classification: undefined,
         });
+        this.#emit({ type: "turn-stopped", stage: "attempt" });
         this.#emit({ type: "turn-finished", outcome: "interrupted", attempts: attempt });
         await this.#finish("interrupted", "stopped");
         return {
@@ -405,6 +609,7 @@ export class AgentTurn {
           openApprovals: [],
           messages: observation.messages,
           hitStepLimit: observation.hitStepLimit,
+          unknownOutcomes: observation.unknownOutcomes,
         };
       }
 
@@ -430,6 +635,7 @@ export class AgentTurn {
           openApprovals: [],
           messages: observation.messages,
           hitStepLimit: observation.hitStepLimit,
+          unknownOutcomes: observation.unknownOutcomes,
         };
       }
 
@@ -463,15 +669,13 @@ export class AgentTurn {
           openApprovals: [],
           messages: observation.messages,
           hitStepLimit: observation.hitStepLimit,
+          unknownOutcomes: observation.unknownOutcomes,
         };
       }
 
       // The failed attempt stays visible, marked interrupted, with its partial
       // text — that is what makes a 200-but-broken turn diagnosable at all.
-      // The failed attempt stays visible, marked interrupted, with its partial
-      // text — that is what makes a 200-but-broken turn diagnosable at all.
       await this.#finish("interrupted", describe(classification));
-      void store;
     }
 
     this.#emit({ type: "turn-finished", outcome: "interrupted", attempts: MAX_ATTEMPTS });
@@ -485,6 +689,7 @@ export class AgentTurn {
       openApprovals: [],
       messages: baseMessages,
       hitStepLimit: false,
+      unknownOutcomes: [],
     };
   }
 
@@ -552,6 +757,7 @@ export class AgentTurn {
         openApprovals: [],
         messages: observation.messages,
         hitStepLimit: observation.hitStepLimit,
+        unknownOutcomes: observation.unknownOutcomes,
       };
     }
     if (observation.kind === "awaiting-approval") {
@@ -564,20 +770,49 @@ export class AgentTurn {
         openApprovals: observation.openApprovals,
         messages: observation.messages,
         hitStepLimit: observation.hitStepLimit,
+        unknownOutcomes: observation.unknownOutcomes,
       };
     }
+
+    /**
+     * A stop during a resume is a stop, not a stall.
+     *
+     * This used to synthesise `{ kind: "no-response" }` and emit
+     * `attempt-failed`, which told the UI that a person pressing stop during an
+     * approval resume had hit §5.4's 20-second stall — "waiting for a response
+     * that will never come" — for a response that was never even asked for. The
+     * two are now separated exactly as they are in `run()`: `turn-stopped`
+     * first, no `attempt-failed` at all, and a `classification` of `undefined`.
+     *
+     * The invariant is the one the event documents: an interrupted turn with a
+     * classification is a failure, and an interrupted turn without one is a
+     * stop. Both branches below obey it, so a UI never has to guess.
+     */
+    if (observation.kind === "aborted") {
+      this.#emit({ type: "turn-stopped", stage: "approval-resume" });
+      this.#emit({ type: "turn-finished", outcome: "interrupted", attempts: 1 });
+      await this.#finish("interrupted", "stopped");
+      return {
+        outcome: "interrupted",
+        attempts: 1,
+        text: observation.text,
+        classification: undefined,
+        attemptLog: [{ attempt: 1, text: observation.text, interrupted: true, classification: undefined }],
+        openApprovals: [],
+        messages: observation.messages,
+        hitStepLimit: observation.hitStepLimit,
+        unknownOutcomes: observation.unknownOutcomes,
+      };
+    }
+
     // A resume has no retry budget of its own: it is the tail of an attempt that
     // already succeeded up to the pause. A failure here ends the turn.
-    const aborted = observation.kind === "aborted";
-    const classification: Classification = aborted
-      ? { kind: "no-response" }
-      : observation.classification;
+    const classification = observation.classification;
     this.#emit({ type: "attempt-failed", attempt: 1, classification });
-    const outcome: TurnOutcome = aborted ? "interrupted" : "failed";
-    this.#emit({ type: "turn-finished", outcome, attempts: 1 });
-    await this.#finish(outcome === "interrupted" ? "interrupted" : "failed", describe(classification));
+    this.#emit({ type: "turn-finished", outcome: "failed", attempts: 1 });
+    await this.#finish("failed", describe(classification));
     return {
-      outcome,
+      outcome: "failed",
       attempts: 1,
       text: observation.text,
       classification,
@@ -585,6 +820,7 @@ export class AgentTurn {
       openApprovals: [],
       messages: observation.messages,
       hitStepLimit: observation.hitStepLimit,
+      unknownOutcomes: observation.unknownOutcomes,
     };
   }
 
@@ -604,6 +840,7 @@ export class AgentTurn {
     const {
       store,
       turnId,
+      sessionId,
       instructions,
       tools,
       workspace,
@@ -611,8 +848,62 @@ export class AgentTurn {
       approve,
       onProgress,
       maxSteps = DEFAULT_MAX_STEPS,
+      now = Date.now,
     } = this.#options;
     const emit = this.#emit;
+
+    /**
+     * How many calls with a given id have already been begun in this attempt.
+     *
+     * The scope of the dedup key, and the reason a reused `toolCallId` is not a
+     * correctness hole any more. A provider that reuses `c1` for two *different*
+     * calls in one turn used to have the second one silently dropped: the tool
+     * ran once, the model was handed `ran: 1` for a call it had never made, and
+     * the turn still reported `succeeded`. Keying on the id alone cannot tell
+     * that case from a genuine replay — they are the same string.
+     *
+     * `occurrence` is the discriminator, and it is 0-based: the first call with
+     * an id is occurrence 0 and is a candidate for the replay short-circuit;
+     * every later call with the same id is a distinct call and must run. The
+     * counter is per **attempt**, which is what makes a `regenerate` (a new
+     * attempt that re-sends the same ids) replay, while a provider's reuse
+     * inside one attempt does not.
+     *
+     * **The counter is advanced by the *lookup*, not by the begin** — a point
+     * that cost a test to find. Advancing it in `begin` looked equivalent and
+     * was not: a short-circuited call never begins, so a turn that replayed two
+     * calls sharing an id resolved *both* to occurrence 0 and handed the model
+     * the first call's recorded answer for the second. Every call consumes an
+     * occurrence, whether or not it went on to execute.
+     */
+    const occurrences = new Map<string, number>();
+    /**
+     * toolCallId → the key its most recent `lookupToolCall` produced, so the
+     * `beginToolCall` and the `tool-result` that follow both record **that**
+     * call and not a freshly minted key. Without it the record write and the
+     * short-circuit read could land on different occurrences of a reused id, and
+     * the outcome would be filed against a call the short-circuit never reads.
+     */
+    const toolCallKeys = new Map<string, ToolCallKey>();
+    /** Idempotency bookkeeping for this attempt, as the tool adapter sees it. */
+    const toolCallIds: {
+      lookup: (toolCallId: string) => Promise<ToolCallRecord | undefined>;
+      begin: (info: { toolCallId: string; toolName: string; input: unknown }) => Promise<void>;
+      unknownOutcomes: UnknownToolOutcome[];
+    } = {
+      lookup: async (toolCallId) => {
+        const key = nextToolCallKey(sessionId, attempt, toolCallId, occurrences);
+        toolCallKeys.set(toolCallId, key);
+        occurrences.set(toolCallId, (occurrences.get(toolCallId) ?? 0) + 1);
+        return store.getToolCall(key);
+      },
+      begin: async (info) => {
+        const key = toolCallKeys.get(info.toolCallId) ?? nextToolCallKey(sessionId, attempt, info.toolCallId, occurrences);
+        await store.beginToolCall({ key, toolName: info.toolName, input: info.input });
+        toolCallKeys.set(info.toolCallId, key);
+      },
+      unknownOutcomes: [],
+    };
 
     const toolSet = createToolSet({
       tools,
@@ -626,24 +917,36 @@ export class AgentTurn {
       // and the tool context itself. A retry gets fresh ids, because a retry is
       // a new turn rather than a continuation.
       attempt,
-      lookupExecutedToolCall: (toolCallId) => store.getToolCall(toolCallId),
-      beginToolCall: (info) => store.beginToolCall(info),
+      lookupToolCall: toolCallIds.lookup,
+      beginToolCall: toolCallIds.begin,
+      onUnknownOutcomeToolCall: (info) => {
+        toolCallIds.unknownOutcomes.push({
+          toolCallId: info.toolCallId,
+          toolName: info.toolName,
+          input: info.input,
+        });
+        emit({ type: "tool-outcome-unknown", ...info });
+      },
     });
 
     /**
      * Observations for one attempt.
      *
-     * `sawTerminalEvent` is the success signal, not "the stream ended": a
-     * stream that stops without a `finish` part is a failure whatever the HTTP
-     * status said (Plan.md §5.4, step 5).
+     * `sawTerminalEvent` is the success signal, not "the stream ended": a stream
+     * that stops without a provider `finish` chunk is a failure whatever the
+     * HTTP status said (Plan.md §5.4, step 5). How it is established — and what
+     * is *not* observable here — is documented at the `finish` case below.
      */
     let text = "";
     let reasoning = "";
     let sawTerminalEvent = false;
+    /** Parts observed, the evidence §5.4's step 5 is reported with. */
+    let partCount = 0;
     let lastFinishReason: string | undefined;
     /** Steps completed so far, from `onStepEnd`. */
     let steps = 0;
     let streamError: unknown;
+    let sawErrorPart = false;
     const openApprovals: OpenApproval[] = [];
     const parts: UIMessage["parts"] = [];
     let currentText: { id: string; part: Extract<UIMessage["parts"][number], { type: "text" }> } | undefined;
@@ -656,32 +959,23 @@ export class AgentTurn {
       { name: string; part: Record<string, unknown> }
     >();
 
+    const heartbeat = (): void => {
+      void store.heartbeat({ turnId, at: new Date(now()).toISOString() });
+    };
+    // Written at the start of every attempt, not only per step, so a turn that
+    // dies *before* its first `onStepEnd` still has an anchor to be measured
+    // against (Plan.md §6.1).
+    heartbeat();
+
     const agent = new ToolLoopAgent({
       model: this.#options.model,
       instructions,
       tools: toolSet,
       stopWhen: isStepCount(maxSteps),
-      // Off, explicitly: the docs treat telemetry as default-on once an
-      // integration is registered, and a silent upgrade must not start sending.
-      telemetry: { isEnabled: false },
-      /**
-       * The SDK's own retry loops, off.
-       *
-       * `maxRetries` **defaults to 2** (verified in `ai/dist/index.d.ts`:
-       * "Maximum number of retries. Set to 0 to disable retries. Default:
-       * 2"). Left on, every 5xx and 429 would be retried twice more by the SDK
-       * *under its own backoff* before our classification ever saw the failure
-       * — so a turn would silently make up to nine requests, six of them
-       * invisible to the UI, and §5.4's "at most 3 attempts, all visible" would
-       * be false.
-       *
-       * `streamRetries` exists on `streamText` but is **not** part of
-       * `ToolLoopAgentSettings` (verified: passing it is a type error), so there
-       * is no second loop to disable.
-       *
-       * Our schedule (0 s / 2 s / 8 s, capped at 3) is the only retry here.
-       */
-      maxRetries: 0,
+      // `maxRetries: 0` and `telemetry: { isEnabled: false }` — both are rules
+      // from AGENTS.md §3.1, and both live in `staticAgentSettings()` so a test
+      // can assert them instead of trusting a comment. The reasoning is there.
+      ...staticAgentSettings(),
       toolApproval: this.#options.approval,
       // Checkpoint per step, not once at the end (AGENTS.md §3.1). A turn that
       // dies in step 7 of 20 must not lose steps 1..6.
@@ -694,7 +988,7 @@ export class AgentTurn {
           toolCallCount: step.toolCalls.length,
           finishReason: step.finishReason,
         });
-        void store.heartbeat({ turnId, at: new Date().toISOString() });
+        heartbeat();
       },
     });
 
@@ -723,6 +1017,7 @@ export class AgentTurn {
       });
 
       for await (const part of result.stream) {
+        partCount += 1;
         switch (part.type) {
           case "start":
             parts.push({ type: "step-start" } as UIMessage["parts"][number]);
@@ -808,9 +1103,11 @@ export class AgentTurn {
               output: part.output,
             });
             // Recorded at once, not at turn end: a crash mid-turn must not lose
-            // the fact that the tool ran, or a replay would run it again.
+            // the fact that the tool ran, or a replay would run it again. The
+            // key is the *same* one the short-circuit will look the call up
+            // under, so a replay finds it and a same-id reuse does not.
             void store.recordToolCall({
-              toolCallId: part.toolCallId,
+              key: toolCallKeys.get(part.toolCallId) ?? nextToolCallKey(sessionId, attempt, part.toolCallId, occurrences),
               toolName: part.toolName,
               output: part.output,
             });
@@ -828,6 +1125,22 @@ export class AgentTurn {
               toolName: part.toolName,
               error: String(part.error),
             });
+            /**
+             * No `recordToolCall` here, and that is a fact about reachability
+             * rather than an oversight.
+             *
+             * A `tool-error` part means the SDK caught a rejection from
+             * `execute` — and `createSdkTool` never lets one escape: every
+             * failure inside `definition.execute` is converted into a tool
+             * *result* (`toToolErrorResult`), which the `tool-result` case above
+             * does record. The two throws that do escape, `parseInput` and
+             * `MissingToolCallIdError`, both happen *before* `beginToolCall`, so
+             * there is no `begun` record for them to close either.
+             *
+             * If that ever stops being true, the record will legitimately read
+             * as `begun` and a replay will report the outcome as unknown — which
+             * is the recoverable direction, not the corrupting one.
+             */
             break;
           }
 
@@ -892,23 +1205,44 @@ export class AgentTurn {
 
           case "finish":
             /**
-             * The terminal-event check — with an honest caveat.
+             * The terminal-event check — on the provider's own signal, not a
+             * guess about the finish reason.
              *
-             * The provider's raw `finish` part is **not observable** through
-             * the SDK: when a provider stream ends without one, `streamText`
-             * synthesises a `finish` itself, and the only thing that
-             * distinguishes the two is the reason — measured against
-             * `ai@7.0.122`: a clean run reports the provider's real reason
-             * (`stop`, `tool-calls`, …), a truncated one reports `"other"`.
+             * `TextStreamFinishPart.rawFinishReason` is the provider's own finish
+             * reason, verbatim; the SDK leaves it `undefined` on a finish part it
+             * **synthesises** after a stream that ended without one. That is the
+             * discriminator, and it is a public, typed field
+             * (`ai/dist/index.d.ts`, `type TextStreamFinishPart`) rather than an
+             * inference from a normalised value.
              *
-             * So `"other"` is the observable proxy for "no terminal event",
-             * and a turn that only ever produces it is classified as a
-             * protocol error and retried. This is a heuristic, not the raw
-             * signal §5.4 asks for; a provider that legitimately finishes with
-             * reason `"other"` would be misread. Verified by measurement, and
-             * the one place where the SDK's normalisation costs us fidelity.
+             * What it replaces, and why that had to go: `finishReason !== "other"`
+             * cannot work, because `ai@7.0.122` does
+             * `unified: finishReason === "unknown" ? "other" : finishReason`. A
+             * provider that terminates *deliberately* with the spec-legal
+             * `"unknown"` produces a part sequence **byte-identical** to a
+             * truncated one — both report `"other"` — and was therefore read as a
+             * truncation and retried: three requests for an answer that had
+             * already arrived. Guessing a terminal event from a normalised
+             * reason is worse than having no check, because it fires on answers.
+             *
+             * The second, typed half of the check is
+             * `AI_NoOutputGeneratedError` — the SDK's own "the model stream
+             * ended without a finish chunk", which it raises when a stream closes
+             * with neither a terminal chunk nor any output. That one carries no
+             * guess at all, and it is handled below where the error is
+             * classified.
+             *
+             * **What is still not observable, honestly:** the provider's *raw*
+             * chunk stream. `ToolLoopAgentSettings` has no `onChunk`, no
+             * `includeRawChunks` and no `onError` (verified against the installed
+             * `dist/index.d.ts`), so the SSE-level `data: [DONE]` that Plan.md
+             * §5.4 names cannot be seen from here at all. Reaching it means
+             * wrapping the `LanguageModel` in the provider registry — a separate
+             * decision, not taken here. This is recorded as a limitation in
+             * Plan.md §5.4 rather than papered over, because a check that
+             * pretends to be raw when it is not is how this bug happened.
              */
-            sawTerminalEvent = part.finishReason !== "other";
+            sawTerminalEvent = part.rawFinishReason !== undefined;
             lastFinishReason = part.finishReason;
             break;
 
@@ -921,6 +1255,7 @@ export class AgentTurn {
             // `Error: An error occurred.`, which would make §5.4's whole
             // classification impossible.
             streamError = part.error;
+            sawErrorPart = true;
             break;
 
           default:
@@ -944,7 +1279,7 @@ export class AgentTurn {
      * rather than presenting a half-finished turn as finished.
      */
     const hitStepLimit = steps >= maxSteps && lastFinishReason === "tool-calls";
-    const shape = { messages: allMessages, hitStepLimit };
+    const shape = { messages: allMessages, hitStepLimit, unknownOutcomes: toolCallIds.unknownOutcomes };
 
     if (this.#stopped || this.#controller.signal.aborted) {
       return { kind: "aborted", text, ...shape };
@@ -954,27 +1289,55 @@ export class AgentTurn {
       return { kind: "awaiting-approval", text, openApprovals, ...shape };
     }
 
+    /**
+     * Every failure goes through `classifyResponse` — the one implementation of
+     * §5.4's order of checks.
+     *
+     * The facts it is given are exactly what the turn observed: the error itself
+     * (which carries `statusCode`, `responseHeaders` and `responseBody`
+     * structurally, so the JSON-error-body and content-type checks of §5.4's
+     * step 4 really do run here, not only in their own unit tests) and the
+     * stream observation, whose `sawTerminalEvent` is the provider's own answer
+     * from the `finish` case above.
+     *
+     * `responded: true`: the throwable reached us, so the attempt got far enough
+     * to have an outcome. A connection that never opened and one that died after
+     * the headers both surface as a bare `TypeError` from `fetch` and cannot be
+     * told apart here; both are treated as retryable, which is §5.4's
+     * "Antwort kam, unbrauchbar". The residual is stated rather than hidden.
+     */
     if (streamError !== undefined) {
       return {
         kind: "failed",
         text,
-        classification: classifyThrown(streamError),
+        classification: classifyResponse({
+          responded: true,
+          error: streamError,
+          stream: {
+            partCount,
+            sawTerminalEvent,
+            sawErrorEvent: sawErrorPart,
+            errorEvent: streamError,
+          },
+        }),
         error: streamError,
         ...shape,
       };
     }
 
     // Step 5 of the plan's order: a stream that ends without a terminal event
-    // is a failure, whatever the status line said.
+    // is a failure, whatever the status line said. Same single implementation —
+    // no `error` here only because there is nothing to read a status or a body
+    // from.
     if (!sawTerminalEvent) {
-      const reason =
-        text === "" && parts.length === 0
-          ? "no response: the stream produced nothing"
-          : `stream ended without a terminal event (${text.length} chars of text, no provider finish)`;
+      const reason = `stream ended without a terminal event (${partCount} parts, no provider finish chunk)`;
       return {
         kind: "failed",
         text,
-        classification: { kind: "protocol-error", reason },
+        classification: classifyResponse({
+          responded: true,
+          stream: { partCount, sawTerminalEvent: false, sawErrorEvent: sawErrorPart },
+        }),
         error: new Error(reason),
         ...shape,
       };
@@ -982,6 +1345,34 @@ export class AgentTurn {
 
     return { kind: "success", text, ...shape };
   }
+}
+
+/**
+ * The key a tool call is recorded under.
+ *
+ * All three parts earn their place, and the reasoning is the reason the bare
+ * `toolCallId` this replaces was a correctness bug rather than a simplification:
+ *
+ * - `sessionId` — `tool_invocations` has the column (Plan.md §6.1) and the store
+ *   knows the session. Without it, two sessions that happen to mint the same id
+ *   share one short-circuit record, and the second session's model is handed the
+ *   first session's output.
+ * - `attempt` — §5.4 caps a turn at three attempts, and a retry is a fresh
+ *   re-send. Scoping by attempt means a `regenerate` replays what the previous
+ *   attempt recorded, instead of that attempt's record silencing a call the new
+ *   one made in good faith.
+ * - `occurrence` — 0-based, per attempt. A provider that reuses one id for two
+ *   *different* calls is measured, not hypothetical, and the id alone cannot
+ *   tell it from a replay. The first call is occurrence 0 and may be
+ *   short-circuited; every later one must run.
+ */
+function nextToolCallKey(
+  sessionId: string,
+  attempt: number,
+  toolCallId: string,
+  occurrences: ReadonlyMap<string, number>,
+): ToolCallKey {
+  return { sessionId, attempt, toolCallId, occurrence: occurrences.get(toolCallId) ?? 0 };
 }
 /**
  * Build the persisted UI part for a tool call.
@@ -1030,6 +1421,10 @@ function isRetryable(classification: Classification): boolean {
   switch (classification.kind) {
     case "success":
     case "no-response":
+    // A local configuration error. Repeating a request that was never
+    // configured produces the identical error; §5.4's rule for `invalid_api_key`
+    // — "Key ist falsch, nicht kaputt" — applies verbatim.
+    case "config-error":
       return false;
     case "http-error":
     case "body-error":
@@ -1040,25 +1435,24 @@ function isRetryable(classification: Classification): boolean {
   }
 }
 
-const KNOWN_BODY_ERROR_TYPES: ReadonlySet<string> = new Set([
-  "insufficient_quota",
-  "billing",
-  "credit",
-  "invalid_api_key",
-  "authentication",
-  "permission",
-  "not_found",
-  "rate_limit",
-  "overloaded",
-  "server_error",
-  "internal",
-]);
-
-/** An unrecognised error type is retried **once** (Plan.md §5.4). */
+/**
+ * Is this a body error whose type the plan does not name?
+ *
+ * §5.4: an unknown type is retried **once**, a known transient type may spend
+ * the whole budget. The test is {@link isKnownErrorType} — exported from
+ * `stream/classify.ts` for precisely this caller.
+ *
+ * It used to be a private copy of the normaliser here, and the copy was wrong:
+ * it stripped a trailing `_error` **unconditionally**, so `server_error` — which
+ * is a key in its own right, not a decorated `server` — became `server`, missed
+ * every table, and was treated as unknown. The effect was a listed *retryable*
+ * type spending 2 attempts instead of 3. `classify.ts` documents that exact bug
+ * in the comment on {@link normalizeErrorType} and guards it by stripping only
+ * when the stripped form is itself a key; the guard was simply never carried
+ * across. One implementation now, so the two cannot drift again.
+ */
 function isUnknownBodyError(classification: Classification): boolean {
-  if (classification.kind !== "body-error") return false;
-  const normalized = classification.code.toLowerCase().replaceAll("-", "_").replace(/_error$/, "");
-  return !KNOWN_BODY_ERROR_TYPES.has(normalized);
+  return classification.kind === "body-error" && !isKnownErrorType(classification.code);
 }
 
 function describe(classification: Classification): string {
@@ -1073,19 +1467,12 @@ function describe(classification: Classification): string {
       return `${classification.code}: ${classification.message}`;
     case "protocol-error":
       return classification.reason;
+    case "config-error":
+      // Named, not paraphrased: the UI shows this string, and "API key missing"
+      // is the difference between a five-second fix and an afternoon of guessing
+      // at the network.
+      return `API key missing: ${classification.message}`;
   }
-}
-
-/**
- * Classify a thrown or emitted provider error.
- *
- * Delegates to `stream/classify.ts`, which is the single place that knows the
- * rules. This file deliberately has **no** second copy: an earlier version had
- * one, and it disagreed — it classified an `AbortError` as a retryable protocol
- * error, so a user pressing stop was answered with three pointless retries.
- */
-function classifyThrown(error: unknown): Classification {
-  return classifyThrownError(error);
 }
 
 export type { ToolSet, AiToolSet, UIMessageChunk };

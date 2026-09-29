@@ -18,7 +18,7 @@ import {
   type ApprovalResolver,
   type PermissionEngine,
 } from "../../src/agent/approval.ts";
-import { AgentTurn, type AgentEvent, type TurnStore } from "../../src/agent/loop.ts";
+import { AgentTurn, staticAgentSettings, type AgentEvent, type TurnStore, type UnfinishedTurn } from "../../src/agent/loop.ts";
 import { createMockModel, errorPart, finish, reasoning, text, toolCall } from "./mock-model.ts";
 
 /* ------------------------------------------------------------------ */
@@ -45,6 +45,8 @@ interface RecordedStore extends TurnStore {
   began: { toolCallId: string; toolName: string }[];
   recorded: Map<string, unknown>;
   heartbeats: number;
+  /** Unfinished turns, for the reload-recovery tests. */
+  unfinished: UnfinishedTurn[];
 }
 
 function createStore(seed?: Record<string, unknown>): RecordedStore {
@@ -54,6 +56,7 @@ function createStore(seed?: Record<string, unknown>): RecordedStore {
     began: [],
     recorded,
     heartbeats: 0,
+    unfinished: [],
     async flushDelta() {},
     async finishTurn(input) {
       store.finished.push({ outcome: input.outcome, error: input.error });
@@ -61,14 +64,17 @@ function createStore(seed?: Record<string, unknown>): RecordedStore {
     async heartbeat() {
       store.heartbeats += 1;
     },
-    async recordToolCall(input) {
-      recorded.set(input.toolCallId, input.output);
+    async listUnfinishedTurns() {
+      return store.unfinished;
     },
-    async getToolCall(toolCallId) {
-      return recorded.has(toolCallId) ? { output: recorded.get(toolCallId) } : undefined;
+    async recordToolCall(input) {
+      recorded.set(input.key.toolCallId, input.output);
+    },
+    async getToolCall(key) {
+      return recorded.has(key.toolCallId) ? { status: "done", output: recorded.get(key.toolCallId) } : undefined;
     },
     async beginToolCall(input) {
-      store.began.push({ toolCallId: input.toolCallId, toolName: input.toolName });
+      store.began.push({ toolCallId: input.key.toolCallId, toolName: input.toolName });
     },
   };
   return store;
@@ -642,10 +648,13 @@ describe("retry after a retryable failure", () => {
     });
     const result = await turn.run("go");
     expect(result.outcome).toBe("succeeded");
-    expect(result.attemptLog[0]?.classification).toEqual({
-      kind: "protocol-error",
-      reason: "stream ended without a terminal event (14 chars of text, no provider finish)",
-    });
+    // The reason is owned by `stream/classify.ts` now, so the §5.4 wording is
+    // written in exactly one place and every failure reads the same.
+    expect(result.attemptLog[0]?.classification).toMatchObject({ kind: "protocol-error" });
+    expect(result.attemptLog[0]?.classification).toHaveProperty(
+      "reason",
+      expect.stringContaining("stream ended without a terminal event"),
+    );
   });
 });
 
@@ -826,5 +835,132 @@ describe("the turn's own options", () => {
     // open projects.
     const workspace: Workspace = createMemoryWorkspace({ "a.ts": "content" });
     expect(await workspace.readText("a.ts")).toBe("content");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The rules that live in the agent settings                            */
+/* ------------------------------------------------------------------ */
+
+describe("staticAgentSettings", () => {
+  it("disables the SDK's own retry loop", () => {
+    // AGENTS.md §3.1 and §5.4: at most 3 attempts per turn, all of them
+    // visible. `maxRetries` **defaults to 2** and retries under the SDK's own
+    // backoff, below our classification — so left on, one turn makes up to nine
+    // requests and six of them never reach the UI. Deleting this line survived
+    // 403 tests, because every fake error in the suite was a plain `Error` and
+    // the SDK's `shouldRetry` predicate is
+    // `APICallError.isInstance(error) && error.isRetryable === true`.
+    expect(staticAgentSettings().maxRetries).toBe(0);
+  });
+
+  it("turns telemetry off, explicitly (AGENTS.md §3.1)", () => {
+    // §14.4 gives the reason: without a registered integration the SDK sends
+    // nothing, but the option counts as default-on — so a later upgrade would
+    // start sending without anybody deciding to. Deleting this line killed zero
+    // tests, which is not a property of the line but of the suite.
+    expect(staticAgentSettings().telemetry).toEqual({ isEnabled: false });
+  });
+
+  it("hands out a fresh object, so a caller cannot mutate the next turn", () => {
+    expect(staticAgentSettings()).not.toBe(staticAgentSettings());
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* A stop is not a stall                                               */
+/* ------------------------------------------------------------------ */
+
+describe("a user stop", () => {
+  const stopMidStream = async (): Promise<AgentEvent[]> => {
+    const controller = new AbortController();
+    const tools = [echoTool()];
+    const events: AgentEvent[] = [];
+    const turn = new AgentTurn({
+      model: createMockModel({
+        steps: [{ parts: [...text("t1", "half"), ...text("t1", "more")], delayMs: 1 }],
+      }),
+      instructions: "test",
+      tools,
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      sessionId: "s1",
+      turnId: "t1",
+      store: createStore(),
+      approval: approvalFor(allowAll, tools),
+      onEvent: (event) => events.push(event),
+      approve: async () => "allow-once",
+      sleep: noSleep,
+      random: () => 0.5,
+      abortSignal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 1);
+    await turn.run("go");
+    return events;
+  };
+
+  it("emits `turn-stopped`, not `attempt-failed`", async () => {
+    const events = await stopMidStream();
+    const kinds = events.map((event) => event.type);
+    expect(kinds).toContain("turn-stopped");
+    // A stop is a deliberate action. Rendering it as a failed attempt is what
+    // trained users to ignore the event that means a real failure.
+    expect(kinds).not.toContain("attempt-failed");
+    expect(kinds).not.toContain("waiting");
+  });
+
+  it("reports interrupted with NO classification — that is what says 'stop'", async () => {
+    // The invariant the event documents: a stall always carries `no-response`,
+    // so an interrupted turn without a classification is a stop.
+    const events = await stopMidStream();
+    const finished = events.filter((event) => event.type === "turn-finished");
+    expect(finished).toHaveLength(1);
+    expect(finished[0]).toMatchObject({ outcome: "interrupted" });
+  });
+
+  it("and a stop during an APPROVAL RESUME is a stop too", async () => {
+    // This used to synthesise `{ kind: "no-response" }` and emit
+    // `attempt-failed` — i.e. §5.4's 20-second stall, for a response that was
+    // never even asked for.
+    const tools = [echoTool()];
+    const events: AgentEvent[] = [];
+    const turn = new AgentTurn({
+      model: createMockModel({
+        steps: [
+          { parts: [toolCall({ toolCallId: "c1", toolName: "echo", input: { value: "x" } }), finish("tool-calls")] },
+          { parts: [...text("t1", "after"), ...text("t1", "approval")], delayMs: 1 },
+        ],
+      }),
+      instructions: "test",
+      tools,
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      sessionId: "s1",
+      turnId: "t1",
+      store: createStore(),
+      approval: approvalFor(askAll, tools),
+      onEvent: (event) => events.push(event),
+      approve: async () => "allow-once",
+      sleep: noSleep,
+      random: () => 0.5,
+    });
+
+    const paused = await turn.run("go");
+    expect(paused.outcome).toBe("awaiting-approval");
+    events.length = 0;
+
+    setTimeout(() => void turn.stop(), 1);
+    const resumed = await turn.respondToApproval({
+      approvalId: paused.openApprovals[0]!.approvalId,
+      approved: true,
+    });
+
+    const kinds = events.map((event) => event.type);
+    expect(kinds).toContain("turn-stopped");
+    expect(kinds).not.toContain("attempt-failed");
+    expect(kinds).not.toContain("waiting");
+    expect(resumed?.outcome).toBe("interrupted");
+    // The stop is named as such in the store too, not as a stall.
+    expect(resumed?.classification).toBeUndefined();
   });
 });

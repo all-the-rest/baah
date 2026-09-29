@@ -9,6 +9,7 @@
  */
 import { describe, expect, it } from "vitest";
 
+import classifySource from "../../src/stream/classify.ts?raw";
 import {
   classifyResponse,
   classifyThrownError,
@@ -424,12 +425,66 @@ describe("classifyThrownError", () => {
     expect(classifyThrownError(error)).toEqual({ kind: "no-response" });
   });
 
-  it("a missing API key is no-response, not a retryable 4xx", () => {
-    // §9: without `apiKey` the SDK throws LoadAPIKeyError. Retrying that
-    // three times would produce the identical error three times.
+  it("a missing API key is a config error, not a stall and not a retryable 4xx", () => {
+    // §9: without `apiKey` the SDK throws LoadAPIKeyError. Retrying that three
+    // times would produce the identical error three times — so it is final. It
+    // used to be reported as `no-response`, which is §5.4's 20-second-stall
+    // concept: the user was told to wait for a provider that was never called.
     const error = new Error("No API key found");
     error.name = "LoadAPIKeyError";
-    expect(classifyThrownError(error)).toEqual({ kind: "no-response" });
+    const result = classifyThrownError(error);
+    expect(result).toEqual({ kind: "config-error", code: "missing_api_key", message: "No API key found" });
+    expect(result.kind).not.toBe("no-response");
+  });
+
+  it("the abort branch of classifyResponse agrees with the thrown path, status or not", () => {
+    // The two entry points used to disagree here: `classifyThrownError` said
+    // "no response, do not retry", `classifyResponse` said "retryable 500". A
+    // cancelled request was not answered, whatever the throwable carries.
+    const error = Object.assign(new Error("The operation was aborted"), {
+      name: "AbortError",
+      statusCode: 500,
+    });
+    expect(classifyResponse({ responded: true, error })).toEqual(classifyThrownError(error));
+    expect(classifyResponse({ responded: true, error })).toEqual({ kind: "no-response" });
+  });
+
+  it("a throwable with no response evidence keeps its own message", () => {
+    // A transport failure that produced no status, no headers and no body. The
+    // content-type checks would have answered a question nobody asked, and would
+    // have thrown away the only useful thing the engine has.
+    expect(classifyResponse({ responded: true, error: new Error("socket hang up") })).toEqual({
+      kind: "protocol-error",
+      reason: "socket hang up",
+    });
+  });
+
+  it("`config-error` is reachable only for a local configuration failure", () => {
+    const kinds: string[] = [];
+    for (const error of [
+      new Error("plain"),
+      Object.assign(new Error("boom"), { statusCode: 500 }),
+      Object.assign(new Error("key"), { name: "LoadAPIKeyError" }),
+    ]) {
+      kinds.push(classifyThrownError(error).kind);
+    }
+    expect(kinds).toEqual(["protocol-error", "http-error", "config-error"]);
+  });
+
+  it("the abort set and the missing-key set are DISJOINT", async () => {
+    // The original bug was the overlap: `LoadAPIKeyError` sat in the abort set,
+    // which bought "never retried" at the price of reporting a missing key as
+    // §5.4's 20-second stall. A source-level assertion, because the property is
+    // about two private sets in this file and there is nothing else to read.
+    const code = classifySource
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/(^|[^:])\/\/.*$/gm, "$1");
+    const abortSet = code.match(/const abortLikeNames = new Set\(\[([^\]]*)\]/)?.[1] ?? "";
+    const keySet = code.match(/const MISSING_API_KEY_ERROR_NAMES = new Set\(\[([^\]]*)\]/)?.[1] ?? "";
+    expect(abortSet).not.toBe("");
+    expect(keySet).not.toBe("");
+    expect(abortSet).not.toContain("LoadAPIKeyError");
+    expect(keySet).not.toContain("AbortError");
   });
 
   it("an unrecognisable throwable is a protocol error, not a crash", () => {
@@ -454,6 +509,7 @@ describe("classification is total", () => {
         "http-error",
         "body-error",
         "protocol-error",
+        "config-error",
       ]).toContain(result.kind);
     }
   });

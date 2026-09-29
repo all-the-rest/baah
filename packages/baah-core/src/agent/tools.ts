@@ -89,12 +89,53 @@ export interface AiToolResultOutput {
  * `<never, unknown>`, because `inputSchema: z.ZodType<Input>` is checked
  * contravariantly in `Input`.
  *
- * `execute` is declared as a *method* in `tool.ts`, so its parameters stay
- * bivariant and the erased form remains callable with an unvalidated input —
- * which is exactly why {@link createSdkTool} validates against the concrete
- * schema before calling it.
+ * `execute` and `toModelOutput` are declared as *methods* in `tool.ts`, so their
+ * parameters stay bivariant and the erased form remains callable with an
+ * unvalidated input — which is exactly why {@link createSdkTool} validates
+ * against the concrete schema before calling it.
  */
 export type AnyToolDefinition = ToolDefinition<unknown, unknown>;
+
+/* ------------------------------------------------------------------ */
+/* The replay key                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The identity a recorded tool call is keyed by.
+ *
+ * The bare `toolCallId` this replaces was a correctness bug in two independent
+ * ways, and each part of the key closes one of them. See `nextToolCallKey` in
+ * `agent/loop.ts` for the full argument; in short: a reused id inside one attempt
+ * was a dropped call, and an id without a session was a record shared across
+ * sessions.
+ */
+export interface ToolCallKey {
+  /** §6.1: `tool_invocations` has the column, and so does the store. */
+  sessionId: string;
+  /** 1-based attempt number, so a retry's records stay its own. */
+  attempt: number;
+  /** The SDK's id for this call. */
+  toolCallId: string;
+  /** 0-based: how many calls with this id have already begun in this attempt. */
+  occurrence: number;
+}
+
+/**
+ * What is known about a recorded call.
+ *
+ * **The status is the whole point of the type.** Both writers of a record used
+ * to read back as "no record", which made "began without an outcome"
+ * unrepresentable — and unrepresentable means the only behaviour available for a
+ * crash in that window was to run the tool again, which for a `write` tool
+ * means corrupting the user's files rather than merely omitting a step.
+ *
+ * A union rather than a field, so that reading `output` off a `begun` record is
+ * a type error and not a runtime `undefined` that a caller forwards to the model
+ * as if it were the tool's answer.
+ */
+export type ToolCallRecord =
+  | { status: "begun" }
+  | { status: "done"; output: unknown };
 
 /** Tool output caps. Defaults follow the reference harness. */
 export interface ToolOutputLimits {
@@ -217,19 +258,41 @@ export interface ToolSetOptions {
   signal?: AbortSignal;
   limits?: ToolOutputLimits;
   /**
-   * Replay short-circuit (AGENTS.md §3.1, Plan.md §14.4). Returns the recorded
-   * output of an already-executed `toolCallId`, or `undefined` when it has not
-   * run yet.
+   * Replay short-circuit (AGENTS.md §3.1, Plan.md §14.4). Returns what is
+   * recorded for `toolCallId`, or `undefined` when the call has never begun.
    *
    * Without this a `regenerate` after a reload writes the same file twice, asks
    * the user the same question twice, or — worst — replays a `todo` list built
    * from what the model last saw and overwrites a newer edit as if it were the
    * update. The lookup is a function rather than a set so persistence can stay
    * asynchronous.
+   *
+   * The callback takes the **bare id on purpose**. The full
+   * {@link ToolCallKey} — session, attempt, occurrence — belongs to the engine,
+   * which owns the occurrence counter; if the adapter minted the key it would
+   * have to be told about the counter too, and the two could disagree about
+   * which occurrence a record belongs to. Resolving the key in one place is the
+   * property that makes a same-id reuse distinguishable from a replay.
+   *
+   * The returned **status** decides what happens, and both non-`done` outcomes
+   * are non-obvious enough to be worth stating:
+   *
+   * - `done` → short-circuit. The call has an outcome; return it.
+   * - `begun` → the crash window. See the long note at
+   *   {@link createSdkTool}'s `execute`; the call does **not** run and does
+   *   **not** silently succeed.
    */
-  lookupExecutedToolCall?: (toolCallId: string) => Promise<{ output: unknown } | undefined>;
-  /** Called when a persisted `toolCallId` was short-circuited. */
+  lookupToolCall?: (toolCallId: string) => Promise<ToolCallRecord | undefined>;
+  /** Called when a persisted call was short-circuited. */
   onReplayedToolCall?: (toolCallId: string, toolName: string) => void;
+  /**
+   * Called when a call began and never reported an outcome.
+   *
+   * The user-facing half of the same event the model sees: the engine hands the
+   * model a readable "outcome unknown" result and reports this, so neither side
+   * is told a thing that is not true.
+   */
+  onUnknownOutcomeToolCall?: (info: { toolCallId: string; toolName: string; input: unknown }) => void;
   /** Called when the model-facing output had to be shortened. */
   onTruncatedOutput?: (info: {
     toolCallId: string;
@@ -243,8 +306,8 @@ export interface ToolSetOptions {
    * Called **before** `execute`, once the arguments are validated.
    *
    * This is the "may have run" write of the idempotency record. It is
-   * deliberately a separate hook from {@link ToolSetOptions.lookupExecutedToolCall}
-   * and from a post-run record: persisting only *after* the call returns would
+   * deliberately a separate hook from {@link ToolSetOptions.lookupToolCall} and
+   * from a post-run record: persisting only *after* the call returns would
    * leave a crash in between invisible, and a tool that re-ran in that window
    * would write twice (or, for `todo`, overwrite a newer list with a stale one
    * while reporting `changed: true`).
@@ -338,14 +401,65 @@ function createSdkTool(
       // bookkeeping is never reached for an argument set we would refuse.
       const parsed = parseInput(schema, rawInput, toolName);
 
-      // Replay short-circuit: an already-executed call must not run again.
+      // Replay short-circuit: an already-*finished* call must not run again.
       // Placed after validation and before `execute`, so the tool is not
       // re-entered at all — it is not idempotent, it writes, it asks, it shows
       // UI.
-      const replayed = await options.lookupExecutedToolCall?.(toolCallId);
-      if (replayed !== undefined) {
+      const record = await options.lookupToolCall?.(toolCallId);
+      if (record?.status === "done") {
         options.onReplayedToolCall?.(toolCallId, toolName);
-        return replayed.output;
+        return record.output;
+      }
+
+      /**
+       * The crash window: begun, no outcome.
+       *
+       * This is the branch that had no correct answer available, and the choice
+       * taken is stated here so a reader can disagree with it on the evidence
+       * rather than guess what happened.
+       *
+       * The state means the tab died, the process was killed, or the store
+       * write and the result write straddled a boundary — between the moment
+       * this call was marked as about to run and the moment its result came
+       * back. **Whether the side effect happened is genuinely unknown**, and
+       * the three available responses are all lossy:
+       *
+       * 1. *Run it again.* For a `write` tool this is not a retry, it is a
+       *    second append to the user's file: measured, an append produced
+       *    `log === ["x", "x"]` while the transcript showed one write. The model
+       *    cannot undo that, and the user may not notice.
+       * 2. *Skip it silently.* Also wrong, and in the opposite direction: the
+       *    model is told a call completed, believes the work is done, and builds
+       *    its next step on a premise that is false. That is the silent omission.
+       * 3. **This one.** Do not run it, do not pretend it finished, and say so —
+       *    to the model as a readable result it can reason about, and to the user
+       *    as its own event. The model is told to *verify* before repeating,
+       *    which is the action that is correct under either answer.
+       *
+       * **Residual risk, stated plainly:** the tool's effect may have happened,
+       * and the harness cannot find out. The user sees an explicit warning rather
+       * than a silent either/or, and `read` is available to resolve it. The
+       * alternative trade — a duplicate side effect — is not recoverable by the
+       * model at all, which is why it was not taken.
+       *
+       * The returned shape is deliberately **not** `toToolErrorResult`: `ok:
+       * false` reads to a model as a malfunction to be retried, and retrying is
+       * the one thing that must not happen here.
+       */
+      if (record?.status === "begun") {
+        options.onUnknownOutcomeToolCall?.({ toolCallId, toolName, input: parsed });
+        return {
+          ok: false,
+          outcome: "unknown",
+          toolCallId,
+          toolName,
+          error:
+            `This call to ${toolName} began but never reported a result — the previous session ended ` +
+            `in the middle of it, so its effect may or may not have happened.`,
+          guidance:
+            "Do not repeat it blindly. Check the current state first (read the file, list the " +
+            "directory) and only then decide whether the work is still needed.",
+        };
       }
 
       // Mark the call as *about to* run, before it does. "May have run" is the
@@ -382,13 +496,29 @@ function createSdkTool(
      * What the **model** sees, capped. `execute` keeps the full value so the
      * transcript and the database stay lossless; only the copy handed to the
      * model is shortened, and it carries a visible marker.
+     *
+     * A tool's own `toModelOutput` runs first and may replace the rendering
+     * entirely (`ToolDefinition.toModelOutput`, `tool.ts`). It returns a string
+     * or `undefined`, and `undefined` means "use the default" — so a tool that
+     * does not care pays nothing and a tool that does gets a seam. The cap is
+     * applied to the framed text as well: framing is not a way around the limit.
+     *
+     * Synchronous on purpose. The SDK accepts a promise here; accepting one
+     * would make the whole model-facing path async for the sake of a tool that
+     * has nothing async to do. A tool that needs real work should do it in
+     * `execute` and frame the result.
      */
     toModelOutput: (args) => {
       const info = {
         toolCallId: String(args.toolCallId),
         toolName,
       };
-      const rendered = renderToolOutput(args.output);
+      const framed = definition.toModelOutput?.({
+        toolCallId: String(args.toolCallId),
+        input: args.input,
+        output: args.output,
+      });
+      const rendered = framed ?? renderToolOutput(args.output);
       const result = truncateToolOutput(rendered, limits);
       if (result.truncated) {
         options.onTruncatedOutput?.({

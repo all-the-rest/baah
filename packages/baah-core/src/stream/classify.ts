@@ -22,18 +22,36 @@
  * checks, otherwise it looks exactly like a success.
  */
 
-/** The verified meaning of one response attempt. */
+/**
+ * The verified meaning of one response attempt.
+ *
+ * `config-error` is deliberately **not** a `body-error`: the plan's error-type
+ * tables (§5.4) describe what a *provider* reports, and a missing API key is
+ * never reported by a provider — the SDK raises it locally, before any request
+ * leaves the browser (verified: without `apiKey` it throws `LoadAPIKeyError` on
+ * the first call, §9). Folding it into `body-error` would have meant inventing
+ * a code that the plan's tables do not list, and losing the one thing the UI
+ * needs: a final, self-describing verdict it can render as "please configure
+ * an API key" instead of as a stall.
+ */
 export type Classification =
   /** The stream ended cleanly with a terminal event. */
   | { kind: "success" }
-  /** Nothing came back inside the stall window. Never retried (Plan.md §5.4). */
+  /** Nothing usable came back. Never retried (Plan.md §5.4). */
   | { kind: "no-response" }
   /** The status line itself says the call failed. */
   | { kind: "http-error"; status: number; retryable: boolean; retryAfterMs?: number }
   /** HTTP 200 plus a JSON body that *is* an error object. */
   | { kind: "body-error"; code: string; message: string; retryable: boolean }
   /** HTTP 200 but the payload is unusable: wrong content type, truncated, … */
-  | { kind: "protocol-error"; reason: string };
+  | { kind: "protocol-error"; reason: string }
+  /**
+   * The local configuration is wrong, so no request could succeed.
+   *
+   * Final by construction: a missing key produces the identical error on every
+   * attempt, so retrying it three times buys nothing and hides the real problem.
+   */
+  | { kind: "config-error"; code: "missing_api_key"; message: string };
 
 /**
  * Error types that must **never** be retried (Plan.md §5.4).
@@ -195,15 +213,77 @@ export function parseRetryAfter(raw: string | undefined, nowMs: number): number 
   return Math.max(0, timestamp - nowMs);
 }
 
-const abortLikeNames = new Set([
-  "AbortError",
-  "TimeoutError",
-  "AI_LoadAPIKeyError",
-  "LoadAPIKeyError",
-]);
+/**
+ * A local cancellation: the user pressed stop, or the tab is being torn down.
+ *
+ * `TimeoutError` is here because the SDK raises it for *its own* request
+ * timeout, which is also a cancellation and also must not be retried into a
+ * duplicate request.
+ */
+const abortLikeNames = new Set(["AbortError", "TimeoutError"]);
 
 function isAbortLike(error: unknown): boolean {
   return error instanceof Error && abortLikeNames.has(error.name);
+}
+
+/**
+ * The SDK raised `LoadAPIKeyError`: no key was passed to the provider.
+ *
+ * Split out of {@link abortLikeNames} on purpose. It used to live in that set,
+ * which bought one right thing (never retried) at the price of a wrong
+ * diagnosis: `no-response` is §5.4's 20-second-stall concept — "waiting for a
+ * response that will never come" — and a key that was never configured is not a
+ * provider that went quiet. The user was told to wait for something that could
+ * not arrive. `config-error` names the actual cause.
+ *
+ * §9 pins the behaviour this models: "ohne `apiKey` wirft das SDK
+ * `LoadAPIKeyError` … Diese Meldung wird in der UI zu ‚bitte API-Key
+ * hinterlegen'." Read by name, like every other SDK error here — the package
+ * that defines the class is not resolvable from this one.
+ */
+const MISSING_API_KEY_ERROR_NAMES = new Set(["AI_LoadAPIKeyError", "LoadAPIKeyError"]);
+
+function isMissingApiKeyError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const name = (error as { name?: unknown }).name;
+  return typeof name === "string" && MISSING_API_KEY_ERROR_NAMES.has(name);
+}
+
+/**
+ * The SDK's own verdict on "the stream ended without a finish chunk".
+ *
+ * `NoOutputGeneratedError` (exported from `ai` as `AI_NoOutputGeneratedError`)
+ * is raised by the stream transform when it closed without a terminal chunk and
+ * without any output part — the *raw* §5.4 signal, named by the layer that can
+ * see the chunks. Measured against `ai@7.0.122`: `flush()` in
+ * `dist/index.js` enqueues an `error` part with
+ * `"No output generated. The model stream ended without a finish chunk."`.
+ *
+ * Read **structurally**, by name, for the same reason {@link readErrorFacts}
+ * reads an `APICallError` structurally: `@ai-sdk/provider` is not resolvable
+ * from this package, and a re-bundled copy would not share the class identity
+ * anyway. The name is part of the SDK's public surface (it is the value
+ * `AISDKError` sets from `Symbol.for('vercel.ai.error')`-style markers, and the
+ * class is exported), so a rename is a visible change rather than a silent one.
+ */
+const NO_OUTPUT_GENERATED_ERROR_NAMES = new Set([
+  "AI_NoOutputGeneratedError",
+  "NoOutputGeneratedError",
+]);
+
+/**
+ * Did the SDK tell us the stream ended without a terminal event?
+ *
+ * This is the *typed* half of the terminal-event check. The untyped half lives
+ * at the call site: `TextStreamFinishPart.rawFinishReason` is the provider's own
+ * finish reason, and the SDK leaves it `undefined` on a finish part it
+ * synthesised itself. See `agent/loop.ts` for why the raw chunk level below
+ * this is not reachable through `ToolLoopAgent`.
+ */
+export function isMissingTerminalEventSignal(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const name = (error as { name?: unknown }).name;
+  return typeof name === "string" && NO_OUTPUT_GENERATED_ERROR_NAMES.has(name);
 }
 
 /**
@@ -382,8 +462,16 @@ function classifyThrownErrorBody(error: unknown): Classification | undefined {
 /**
  * Turn the observable facts of one response attempt into a classification.
  *
- * The order of the checks is the spec (Plan.md §5.4):
+ * **This is the single implementation.** {@link classifyThrownError} is a thin
+ * adapter over it, and `agent/loop.ts` calls this function directly for every
+ * failed turn. There used to be two rule sets that disagreed on the same input
+ * (an `AbortError` carrying a 500, a missing API key), and only one of them was
+ * ever reached by a turn — so a tested-but-unreachable rule set read as
+ * coverage while the live one mislabelled the failure. The order below is the
+ * order of the spec (Plan.md §5.4):
  *
+ * 0. the local configuration is wrong, or the request was cancelled locally —
+ *    neither is a provider verdict, and neither is ever retried,
  * 1. nothing came back → `no-response` (never retried),
  * 2. `429` / `5xx` → `http-error`, retryable,
  * 3. every other `4xx` → `http-error`, final,
@@ -391,12 +479,27 @@ function classifyThrownErrorBody(error: unknown): Classification | undefined {
  * 5. inside (4): an error body → `body-error`; a stream without a terminal
  *    event, a truncated stream, an error event, or a content type that fits
  *    neither → `protocol-error`,
- * 6. otherwise → `success`.
+ * 6. a throwable with no response evidence at all → `protocol-error` carrying
+ *    its own message (there is no response to verify),
+ * 7. otherwise → `success`.
  */
 export function classifyResponse(
   facts: ResponseFacts,
   nowMs: number = 0,
 ): Classification {
+  // 0a. A local configuration error. Checked before the status because it is
+  // not a provider verdict: the SDK raises `LoadAPIKeyError` locally, before
+  // any request leaves the browser (§9), and reporting that as `no-response`
+  // tells the user the provider is silent when the truth is that the harness
+  // was never configured.
+  if (isMissingApiKeyError(facts.error)) {
+    return {
+      kind: "config-error",
+      code: "missing_api_key",
+      message: readErrorFacts(facts.error).message ?? "no API key was passed to the provider",
+    };
+  }
+
   // 1. Silence. The provider may still be generating, so this is never a retry.
   if (!facts.responded) return { kind: "no-response" };
 
@@ -405,19 +508,13 @@ export function classifyResponse(
   const headers = lowerCaseKeys({ ...(facts.headers ?? {}), ...(errorFacts.headers ?? {}) });
   const bodyText = facts.bodyText ?? errorFacts.bodyText;
 
-  // A local abort is not a provider failure and must not be retried; the caller
-  // sees the abort through the signal, but the classification has to say so too.
-  if (isAbortLike(facts.error) && status === undefined) {
-    const abortName =
-      errorFacts.message ??
-      errorFacts.name ??
-      (typeof facts.error === "object" &&
-      facts.error !== null &&
-      typeof (facts.error as { name?: unknown }).name === "string"
-        ? (facts.error as { name: string }).name
-        : "unknown");
-    return { kind: "protocol-error", reason: `request aborted: ${abortName}` };
-  }
+  // 0b. A local abort is not a provider failure and must not be retried. It
+  // outranks the status on purpose: an `AbortError` that happens to carry a
+  // `statusCode` was cancelled, not answered — the status describes a response
+  // that was abandoned. Reporting it as a retryable 5xx would be the exact
+  // "three requests for a call the user already stopped" failure this branch
+  // exists to prevent.
+  if (isAbortLike(facts.error)) return { kind: "no-response" };
 
   if (status !== undefined) {
     // 2. Rate limit first: it is the only branch that may carry Retry-After.
@@ -442,49 +539,46 @@ export function classifyResponse(
     }
   }
 
+  // 6. A throwable with no response evidence at all — no status, no headers, no
+  // body, no stream. There is nothing to verify, so the content-type checks of
+  // step 4 would answer a question nobody asked ("200 without a content-type"
+  // for a request that never got a 200) and would throw away the only useful
+  // thing the engine has: the error's own message.
+  if (
+    facts.error !== undefined &&
+    facts.stream === undefined &&
+    status === undefined &&
+    Object.keys(headers).length === 0 &&
+    bodyText === undefined
+  ) {
+    return {
+      kind: "protocol-error",
+      reason: errorFacts.message ?? "provider call failed without a usable response",
+    };
+  }
+
   // 4. A 2xx (or a status-less success) is a claim. Verify it.
   return classifySuccessPath({ ...facts, ...(bodyText === undefined ? {} : { bodyText }) }, headers);
 }
 
 /**
- * Convenience wrapper: classify a thrown provider error.
+ * The second entry point: classify a throwable the SDK rejected or emitted.
  *
- * Used by the engine when the SDK rejects instead of yielding an `error` part.
- * A local abort is reported as `no-response` so the caller never retries it —
- * the user pressed stop, and a retry would be the wrong reaction to a
- * deliberate action.
+ * **A thin adapter, not a second rule set.** Everything it does is already in
+ * {@link classifyResponse}: the throwable *is* the response evidence, and a
+ * 4xx/5xx/`Retry-After`/error body travels on the throwable itself
+ * (`statusCode`, `responseHeaders`, `responseBody` — read structurally by
+ * {@link readErrorFacts}). Delegating is what makes the two entry points agree
+ * by construction rather than by review.
+ *
+ * `responded: true` because a throwable that reached us means the attempt got
+ * far enough to have an outcome. The one case §5.4 keeps out of the retry
+ * classes — "keine Antwort überhaupt, 20 s Stillstand" — is `responded: false`
+ * plus a stall timer at the transport, which the engine does not measure; see
+ * the residual note in `agent/loop.ts`.
  */
 export function classifyThrownError(error: unknown, nowMs: number = 0): Classification {
-  if (isAbortLike(error)) return { kind: "no-response" };
-  const errorFacts = readErrorFacts(error);
-  const status = errorFacts.status;
-  const headers = lowerCaseKeys(errorFacts.headers ?? {});
-
-  if (status !== undefined) {
-    if (status === 429) {
-      const retryAfterMs = parseRetryAfter(headers["retry-after"], nowMs);
-      return retryAfterMs === undefined
-        ? { kind: "http-error", status, retryable: true }
-        : { kind: "http-error", status, retryable: true, retryAfterMs };
-    }
-    if (status >= 500 && status <= 599) {
-      return { kind: "http-error", status, retryable: true };
-    }
-    if (status >= 400 && status <= 499) {
-      return { kind: "http-error", status, retryable: false };
-    }
-    if (status < 200 || status > 299) {
-      return { kind: "protocol-error", reason: `unexpected status ${status}` };
-    }
-  }
-
-  const bodyError = classifyThrownErrorBody(error);
-  if (bodyError !== undefined) return bodyError;
-
-  return {
-    kind: "protocol-error",
-    reason: errorFacts.message ?? "provider call failed without a usable response",
-  };
+  return classifyResponse({ responded: true, error }, nowMs);
 }
 
 /** UTF-8 byte length of a string, without `Buffer` (AGENTS.md §2). */

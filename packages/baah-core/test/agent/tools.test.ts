@@ -9,7 +9,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
-import { defineTool, type ToolContext, type ToolDefinition } from "../../src/tool.ts";
+import { defineTool, toToolErrorResult, type ToolContext, type ToolDefinition } from "../../src/tool.ts";
 import { createMemoryWorkspace } from "../../src/workspace.ts";
 import {
   createToolSet,
@@ -236,7 +236,7 @@ describe("replay short-circuit", () => {
       workspace: createMemoryWorkspace(),
       cwd: ".",
       approve: async () => "allow-once",
-      lookupExecutedToolCall: async (toolCallId) => (toolCallId === "known" ? { output: "recorded" } : undefined),
+      lookupToolCall: async (toolCallId) => (toolCallId === "known" ? { status: "done", output: "recorded" } : undefined),
       beginToolCall: async (info) => {
         begin.push(info);
       },
@@ -310,12 +310,69 @@ describe("replay short-circuit", () => {
       workspace: createMemoryWorkspace(),
       cwd: ".",
       approve: async () => "allow-once",
-      lookupExecutedToolCall: async () => ({ output: "recorded" }),
+      lookupToolCall: async () => ({ status: "done", output: "recorded" }),
     });
     await expect(executeOf(set["read"] as AiTool)({ path: 99 }, { toolCallId: "known" })).rejects.toThrow(
       /Invalid input/,
     );
     expect(calls).toEqual([]);
+  });
+
+  it("does NOT re-run a call that began without an outcome, and says it is unknown", async () => {
+    // The crash window. Running it again is what corrupted the user's files
+    // before `status` existed; skipping it silently would be the opposite lie.
+    const calls: unknown[] = [];
+    const unknown: string[] = [];
+    const tool = defineTool<{ path: string }, string>({
+      id: "read",
+      description: "read",
+      access: "read",
+      inputSchema: readSchema,
+      execute: async (_context, input) => {
+        calls.push(input);
+        return "fresh";
+      },
+    });
+    const set = createToolSet({
+      tools: [tool],
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      approve: async () => "allow-once",
+      lookupToolCall: async () => ({ status: "begun" }),
+      onUnknownOutcomeToolCall: (info) => {
+        unknown.push(info.toolCallId);
+      },
+    });
+
+    const output = await executeOf(set["read"] as AiTool)({ path: "a" }, { toolCallId: "crashed" });
+
+    // The tool did not run a second time…
+    expect(calls).toEqual([]);
+    expect(unknown).toEqual(["crashed"]);
+    // …and the model is told the truth, with a way forward that is not "repeat it".
+    expect(output).toMatchObject({ ok: false, outcome: "unknown", toolCallId: "crashed" });
+    const framed = JSON.stringify(output);
+    expect(framed).toContain("may or may not have happened");
+    expect(framed).toContain("Do not repeat it blindly");
+    // Deliberately NOT the shape of a tool error, which a model reads as "this
+    // malfunctioned, try it again" — the one reaction that must not happen.
+    expect(output).not.toEqual(toToolErrorResult(new Error("anything")));
+    expect(Object.keys(output as object).sort()).toEqual([
+      "error",
+      "guidance",
+      "ok",
+      "outcome",
+      "toolCallId",
+      "toolName",
+    ]);
+  });
+
+  it("still runs a call the store has never seen at all", async () => {
+    // The `begun` branch must not swallow the ordinary first run.
+    const { set, calls } = replaySetup();
+    const output = await executeOf(set["read"] as AiTool)({ path: "a" }, { toolCallId: "brand-new" });
+    expect(output).toBe("fresh");
+    expect(calls).toHaveLength(1);
   });
 });
 
@@ -513,6 +570,111 @@ describe("output truncation", () => {
     });
     toModelOutputOf(set["read"] as AiTool)({ toolCallId: "c1", input: { path: "a" }, output: "short" });
     expect(onTruncatedOutput).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The per-tool framing seam (`ToolDefinition.toModelOutput`).
+ *
+ * It exists because the model-facing rendering used to be a fixed
+ * `JSON.stringify`, which for a structured result is unreadable: the `question`
+ * tool's `{ answers: [["SQLite WASM (Recommended)"]] }` reached the model as a
+ * bare JSON array with no indication of which question it answers and no marker
+ * that the value is the user's own answer.
+ */
+describe("a tool's own toModelOutput", () => {
+  const questionSchema = z.object({ questions: z.array(z.string()) });
+
+  const questionTool = defineTool<{ questions: string[] }, { answers: string[][] }>({
+    id: "question",
+    description: "ask the user",
+    access: "read",
+    inputSchema: questionSchema,
+    execute: async (_c, input) => ({ answers: input.questions.map((): string[] => ["yes"]) }),
+    toModelOutput: ({ input, output }) =>
+      input.questions
+        .map((question, index) => `Q${index + 1}: ${question}\nA${index + 1} (the user's own answer): ${output.answers[index]?.[0] ?? "(skipped)"}`)
+        .join("\n\n"),
+  });
+
+  const ANSWER = { answers: [["SQLite WASM (Recommended)"]] };
+  const framed = (tool: AiTool): string =>
+    toModelOutputOf(tool)({
+      toolCallId: "c1",
+      input: { questions: ["Which database?"] },
+      output: ANSWER,
+    }).value;
+
+  it("replaces the default rendering, and names the question it answers", () => {
+    const set = createToolSet({
+      tools: [questionTool] as never,
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      approve: async () => "allow-once",
+    });
+    const value = framed(set["question"] as AiTool);
+    expect(value).toContain("Which database?");
+    expect(value).toContain("SQLite WASM (Recommended)");
+    // The default would have been this, and the point is that it is not used.
+    expect(value).not.toBe('{"answers":[["SQLite WASM (Recommended)"]]}');
+  });
+
+  it("is optional: a tool without one renders exactly as before", () => {
+    // "so tools that do not care pay nothing" — the default path is untouched.
+    const plain = defineTool<{ questions: string[] }, { answers: string[][] }>({
+      id: "question",
+      description: "ask the user",
+      access: "read",
+      inputSchema: questionSchema,
+      execute: async () => ANSWER,
+    });
+    const set = createToolSet({
+      tools: [plain] as never,
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      approve: async () => "allow-once",
+    });
+    expect(framed(set["question"] as AiTool)).toBe('{"answers":[["SQLite WASM (Recommended)"]]}');
+  });
+
+  it("returning undefined falls back to the default rather than blanking the output", () => {
+    const undecided = defineTool<{ questions: string[] }, { answers: string[][] }>({
+      id: "question",
+      description: "ask the user",
+      access: "read",
+      inputSchema: questionSchema,
+      execute: async () => ANSWER,
+      toModelOutput: ({ output }) => (output.answers.length > 99 ? "too many" : undefined),
+    });
+    const set = createToolSet({
+      tools: [undecided] as never,
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      approve: async () => "allow-once",
+    });
+    expect(framed(set["question"] as AiTool)).toBe('{"answers":[["SQLite WASM (Recommended)"]]}');
+  });
+
+  it("the cap still applies to framed output — framing is not a way around it", () => {
+    const loud = defineTool<{ path: string }, string>({
+      id: "read",
+      description: "read",
+      access: "read",
+      inputSchema: readSchema,
+      execute: async () => "x",
+      toModelOutput: () => "y".repeat(60_000),
+    });
+    const onTruncatedOutput = vi.fn();
+    const set = createToolSet({
+      tools: [loud] as never,
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      approve: async () => "allow-once",
+      onTruncatedOutput,
+    });
+    const value = toModelOutputOf(set["read"] as AiTool)({ toolCallId: "c1", input: { path: "a" }, output: "x" }).value;
+    expect(value).toContain(TRUNCATION_MARKER);
+    expect(onTruncatedOutput).toHaveBeenCalledOnce();
   });
 });
 
