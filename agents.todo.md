@@ -205,6 +205,106 @@ Zeiten statt mit Schätzungen ausfüllen.**
 
 
 
+## Anforderung: Anthropic-förmige Endpunkte **und** Modellliste von beiden
+
+Vom Nutzer gefordert. Zwei Punkte, die **ein** Block sind, weil 3 an 1 hängt.
+
+### Was heute fehlt — und es ist nicht „ein Vendor"
+
+`ProviderVendor` hat genau **einen** erweiterbaren Schlitz:
+
+```ts
+export type ProviderVendor = "openai" | "anthropic" | "google" | "openai-compatible";
+//                                                                 ↑ Chat-Completions-Dialekt
+```
+
+`parseVendorId` kennt nur `openai-compatible:<label>`. Es gibt **kein**
+`anthropic-compatible:<label>`.
+
+**Die Falle, die eine naive Lösung verdeckt:** `baseUrl` gibt es bereits auch für die
+eingebauten Vendors, also *sieht* es so aus, als sei es getan. Aber **Anthropic und OpenAI
+sprechen verschiedene Drahtformate** — `/v1/messages` gegen `/v1/chat/completions`. Ein
+Anthropic-förmiger Dienst auf eigener `baseURL` lässt sich heute **nur** als
+`openai-compatible` eintragen, und das sendet die **falsche Anfrage**: kein Fehler, den der
+User sieht, sondern ein stilles Scheitern. **Eine Anforderung, die man mit dem vorhandenen
+`baseUrl`-Feld „löst", wäre schlimmer als gar keine — sie sieht gelöst aus.**
+
+- [ ] **P1 — zweiter erweiterbarer *Dialekt*, nicht ein zweiter Vendor.**
+      `anthropic-compatible:<label>` mit eigener `baseUrl` und **eigenem** Fabrikslot.
+      `ProviderVendor` wird **nicht** länger, sondern **Dialekt + Name** — die Form, die
+      zwei Dialekte trägt statt sie zu zählen.
+
+- [ ] **P2 — Required-Header an den *Dialekt*, nicht an `=== "anthropic"`.**
+      Heute: `if (vendor === "anthropic") return { "anthropic-dangerous-…": "true" }`.
+      Für die Erstpartei korrekt; für `anthropic-compatible:<label>` wäre der Header
+      **wirkungslos** — und schlimmer: er ginge an einen **fremden** Dienst und wäre eine
+      Behauptung über dessen Sicherheitsmodell, die nicht stimmt.
+      **Mit Test, der beweist, dass ein `anthropic-compatible`-Eintrag ihn NICHT bekommt.**
+
+### Modellliste — und `Plan.md` hat hier schon einmal gelogen
+
+`Plan.md` §14.4 behauptet wörtlich:
+
+> **Modellkatalog:** `@opencode-ai/models` (models.dev) — CORS `*` ist **gemessen**. Das SDK
+> selbst **kann keine Modelle auflisten** — es gibt nur `model(id)`-Fabriken.
+
+**Beides ist falsch, und beides hat derselbe Fehler erzeugt: es wurde nicht ausprobiert.**
+Gleiche Fehlerklasse wie `rawFinishReason`. Und die Behauptung *„kann keine Modelle
+auflisten"* hat vermutlich dazu geführt, dass der Wizard heute **frei tippen** lässt
+(E2E: *„the wizard says no model catalogue is wired, rather than inventing one"*).
+
+**Dass `/v1/models` funktioniert, ist gemessen** — `Plan.md:973` und `:987`:
+
+> OpenAI: **kein ACAO** auf `/v1/chat/completions` und `/v1/responses` — **nur
+> `/v1/models` hat `*`** · `GET /v1/models → 401 + access-control-allow-origin: *`
+
+**`/v1/models` ist der einzige Endpunkt, den OpenAI im Browser erlaubt.** Die Anforderung
+ist damit nicht nur sinnvoll, sie ist die Lösung **ohne** das 6,35-MB-Bundle
+(`@opencode-ai/models/snapshot`, das laut `Plan.md:1510` nur per dynamischem `import()`
+ladbar ist und sonst den Bundle dominiert).
+
+- [ ] **P3 — Modellliste über einen injizierten `fetch`, beide Antwortformen korrekt.**
+      Offener Pfad, zwei Formen:
+      - **OpenAI**: `{ data: [{ id, … }] }`
+      - **Anthropic**: `{ data: [{ id, display_name, … }], has_more, first_id, last_id }`
+      **Und Anthropic paginiert.** Ein Loader, der nur `data[].id` liest, funktioniert für
+      OpenAI und **halb** für Anthropic: ohne `display_name` zeigt der Wizard einem Menschen
+      `claude-haiku-4-5-20251001` statt eines Namens. Und `has_more` heißt: die erste Seite
+      ist **keine vollständige Liste**. **Eine unvollständige Modellliste, die als
+      vollständige dargestellt wird, ist dieselbe Lüge wie die gekappte `grep`-Suche** —
+      nur teurer, weil der User danach ein Modell wählt, das fehlt.
+      **Also:** vollständig paginieren **oder** ehrlich als unvollständig markieren.
+      `display_name` verwenden, wenn da; auf `id` zurückfallen, wenn nicht.
+      **Kein 6,35-MB-Bundle** — `/v1/models` ist der einzige erlaubte Endpunkt, und ein
+      zweiter Katalog wäre eine zweite Wahrheit über dieselbe Sache.
+
+- [ ] **P4 — der Probe wird die Modellliste.** Ein Aufruf, der **Key, CORS und
+      Erreichbarkeit** in einem beantwortet. Genau `/v1/models` unterscheidet bei OpenAI
+      **beides** — heute fehlt uns nur die Aussage. Anthropic braucht den Header; ob
+      `/v1/models` dort ACAO trägt, ist **unbestätigt** und muss der Wizard sagen, statt eine
+      leere Liste zu zeigen.
+
+- [ ] **P5 — ein Anthropic-Turn durch die App**, per gefälschtem Endpunkt.
+      ⚠️ **Heute fährt die E2E-Suite ausschließlich `openai-compatible`** („die ist ehrlich,
+      weil der Fake genau das ist"). `anthropic` ist also **deklariert, header-behandelt,
+      dokumentiert — und nie ausgeführt worden.** Dieselbe Fehlerklasse wie
+      `rawFinishReason`: ein Pfad, den kein Test sieht, weil die Tests einen anderen Provider
+      fahren. **Ohne P5 ist „Anthropic wird unterstützt" eine Behauptung, keine Tatsache.**
+
+### Reihenfolge und Abhängigkeiten
+
+`P1 → P3 → P4`, `P5` über allem. Block startet, sobald der Screenshot-Agent durch ist
+(Hostregel: **ein Agentenstrom, serielle Beauftragung**).
+
+### Aus dem CI-Lauf, gehört hierher
+
+- [ ] **`@opencode-ai/models` als Quelle streichen oder als Fallback begründen.** Die
+      Begründung in §14.4 ist **falsch**; die Korrektur gehört an dieselbe Stelle, und die
+      Frage *„behalten wir es als Fallback für Endpunkte ohne `/v1/models`?"* ist offen.
+
+---
+
+
 ## Welle 4 — Ausbau
 
 - [ ] **`shell`** (`just-bash`) auf der `Workspace`-Abstraktion, mit Kommando-Allow-Liste
