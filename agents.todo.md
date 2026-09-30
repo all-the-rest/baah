@@ -169,6 +169,41 @@ konsumieren. Block A fixt es.
 - [ ] **UI-Review** (Screenshots + Vision-Analyse) — Skill `ui-review`
 - [ ] **Befunde aus dem UI-Review beheben**, nicht nur protokollieren
 - [ ] **Manuelle Browser-Prüfung** `Plan.md` §15.1–15.4 abarbeiten
+- [~] **CI-Erstlauf war rot, Ursache gefunden und behoben.** `ERR_PNPM_FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE`
+      in **beiden** Jobs, vor dem ersten Test: der gepushte Lockfile hatte keinen
+      `importers:`-Block. Ein gefiltertes `pnpm install` schreibt ihn halb. Regel in
+      `AGENTS.md` §7.2a. → `3dc00da`. **Zweiter Lauf läuft.**
+- [ ] **E2E sharden / Docker-Image — gemessen beantwortet: beides noch nicht.** Siehe
+      „CI-Laufzeiten" unten.
+
+### CI-Laufzeiten — was die Zeit frisst, ist nicht die Testanzahl
+
+| | |
+|---|---|
+| E2E-Suite | **44 Tests, 1,6 min** lokal, Chromium, 1 Worker |
+| Doppelte Arbeit | `quality` **und** `e2e` machen beide `checkout` + `install` + `build` |
+| Parallelität | die zwei Jobs haben `needs: []` — sie laufen **nebeneinander** |
+
+**Sharding: nein.** 44 Tests auf Shards zu verteilen, deren jeder Checkout, `pnpm install`
+und Browser-Install braucht, macht den Lauf **langsamer** — der Overhead pro Shard ist
+Minuten, die Arbeit ist 1,6 Minuten. Die nützliche Form von Sharding — Jobs laufen
+nebeneinander — ist **schon da**. **Auslöser zum Neudenken: >200 Tests oder >10 min.**
+
+**Docker-Image: nein für die App** (`AGENTS.md` §2, es gibt keinen Server zu containerisieren;
+die E2E serviert ein statisches `dist`), **ja möglicherweise für die Toolchain** — aber
+`actions/cache` deckt den Browser schon ab, und das **Systembibliotheken-Desaster dieser
+Sitzung** (20 Bibliotheken mitten im Lauf verschwunden) zeigte: der Cache gehört dem Host,
+nicht einem Image.
+
+**Die Optimierung, die sich lohnt, ist keine der beiden:** `quality` und `e2e` bauen
+dasselbe. **Einen** dieser Builds einzusparen ist der Hebel. ⚠️ `dist` zu cachen ist fragil;
+die saubere Form ist ein gemeinsamer Build-Job mit `upload-artifact`.
+
+⚠️ **Dieser Eintrag hat noch keinen echten Messpunkt:** der erste Lauf starb an der
+Installation, der zweite war zum Schreiben nicht durch. **Nach dem zweiten Lauf mit echten
+Zeiten statt mit Schätzungen ausfüllen.**
+
+
 
 ## Welle 4 — Ausbau
 
