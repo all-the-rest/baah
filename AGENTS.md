@@ -343,7 +343,25 @@ kaputter Scanner alle anderen bestehen.
 
 Bekannte Grenzen, im Doc-Kopf der Datei und nicht versteckt: er ist **regex-basiert, kein
 Parser**. `${…}`-Interpolation gilt ihm als String, und ein Regex-Literal mit einem
-Quote-Zeichen würde den String-Scan früh beenden. Er kennt außerdem **nur `baah-core`**.
+Quote-Zeichen würde den String-Scan früh beenden.
+
+**Es gibt inzwischen fünf Source-Gates, nicht einen.** `no-explicit-any` (nur
+`baah-core`), `no-bare-void` und `no-console` (je in `baah-core` **und** `baah-storage`).
+Der Kommentar-/String-Stripper ist deshalb **viermal dupliziert**, weil §4 einem Paket
+verbietet, aus dem Testbaum des anderen zu importieren. Das ist eine **Folge der
+Schichtregel**, in jeder Datei benannt statt wegworkaroundet. `no-bare-void` scannt in
+beiden Paketen nur `src/` und verfehlt **zeilenübergreifende Operanden** in `test/`.
+
+**Warum es Gates braucht:** `AGENTS.md` §5s „kein `console.error`" hatte **null**
+Vollzug. Die Mutation, die auf die Konsole schrieb, starb nur, weil vier Tests zufällig
+der Event-Stream lasen — die Variante, die **verhaltensrichtig *und* auf die Konsole
+schreibt**, tötet ausschließlich das Gate.
+
+**Und die Lehre aus der dritten Fundstelle:** eine Quelltext-Assertion, die ein
+**whitespace-empfindliches** Muster zählt, hört auf zu greifen, sobald der Aufruf
+umformatiert wird. `verify-replay-window.test.ts:511` zählte
+`/store\.heartbeat\(/g` und wurde still zu einem No-Op, als der Aufruf auf zwei Zeilen
+umgebrochen wurde. → **Jedes Gate braucht einen Selbsttest mit gepflanztem Material.**
 
 Gemessen: bei 3 von 4 `any`-Mutationen war `tsc` **sauber** und die gesamte Verhaltens-Suite
 grün. Der Gate ist damit nicht Kosmetik, sondern der einzige Vollzug dieser Regel.

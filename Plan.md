@@ -1719,6 +1719,55 @@ Ein Turn ohne `heartbeat_at` meldet `COALESCE(heartbeat_at, started_at)` — ein
 parst als „unendlich alt" und würde einen eben erzeugten Turn sofort schließen.
 
 
+#### Nachtrag: ein **zweiter** Port neben `TurnStore` — der Read-Port
+
+`AGENTS.md` §3.1 verlangt, dass der **Teilttext einen Reload überlebt**. Gemessen war das
+erfüllt und trotzdem unbrauchbar: `TurnStore` hatte **keine einzige Lesemethode** — kein
+`listParts`, kein `getMessages`, kein `listMessages` — und `recoverStaleTurns` liefert
+`UnfinishedTurn[]` mit `turnId`/`heartbeatAt`/`startedAt` und **ohne Text**. Die App konnte
+also nach einem Reload sagen, **dass** ein Turn starb, aber nicht, **was er sagte**.
+
+```ts
+// packages/baah-storage/src/transcript.ts
+read(input: { sessionId: string; turnId?: string; limit?: number }): Promise<Transcript>;
+```
+
+`createTurnStore` bleibt **unberührt** und bleibt der **Schreib**-Pfad. Die App
+injiziert **zwei** Dinge, nicht einen Gott-Objekt.
+
+**Warum in `baah-storage` und nicht in `baah-core`:** `TurnStore` steht in core, weil
+**core es konsumiert**. Niemand konsumiert den Reader — in core wäre er eine tote
+Abstraktion (§5).
+
+Drei Entscheidungen, die **gemessen** und nicht geraten sind:
+
+- **Session ist die Pflichthälfte, Turn die Verengung.** Mit einer Turn-Id allein wäre ein
+  Cross-Session-Read möglich und *„kein solcher Turn hier"* von *„dieser Turn sagte
+  nichts"* **ununterscheidbar** — und die UI rendert das verschieden. Ein genannter Turn
+  wird auf Existenz **in dieser Session** geprüft; ein fehlender ist eine Ablehnung.
+- **Die Read ist mit dem letzten Flush konsistent, und die Grenze ist exakt.** Die
+  Leitlinie im Auftrag war, ein Read könnten einen laufenden Turn „verpassen". **Gemessen
+  ist das Gegenteil:** `flushDelta` schreibt den kumulierten Part-Text **in derselben
+  Transaktion** wie den Delta-Log-Eintrag, also sind nach drei Flushes das neueste
+  `part_deltas.content_text` und `parts.content_text` **derselbe String**. Das Log ist ein
+  **Idempotenz-Anker, kein Zwischenlager**. Ein Read verfehlt also nie einen fertigen Part;
+  ein laufender ist höchstens `DELTA_FLUSH_INTERVAL_MS` (100 ms) hinten und kommt **mit**
+  Text und `status: "streaming"` zurück, damit die UI ihn als in Flug markieren kann.
+- **Eine geschlossene DB lehnt mit `database_closed` ab** — und im ganzen Lesepfad steht
+  kein `catch`. Aus demselben Grund wird eine unbekannte Session **nicht** als leeres
+  Array beantwortet: das wäre die Lüge *„hier war nichts"* in einer Form, die die UI
+  anzeigt.
+
+Parts werden **über die Id** gehängt, **nicht** über die Position zippend — ein Zip ist
+genau in dem Fall falsch, für den es `truncated` gibt.
+
+**Offen, ehrlich benannt:** der Port ist **nicht** in `baah-web` verdrahtet. Zwei Ports
+existieren und sind exportiert; die App nimmt zwei. Das ist der nächste Block. Und die
+`Transcript`-Form ist ein **gewähltes** Format — `Plan.md` sagt nichts darüber, welche
+Spalten eine Transkript-Ansicht braucht, also sind `model` / `usage` / `parentId`
+absichtlich nicht drin. Braucht die UI sie, **bricht es kompiliert** statt still.
+
+
 ### 16.2 Tools: Injektions-Verträge
 
 `todo` und `question` brauchen Zustand bzw. UI, den ein Tool nicht besitzen
