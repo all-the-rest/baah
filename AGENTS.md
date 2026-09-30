@@ -256,6 +256,16 @@ Während Build-Subagenten schreiben, gilt im Repo:
   Commit-Hinweis und zieht die Dateien beim nächsten Block-Commit nach.
 - Faustregel vor jedem Orchestrator-Commit: `git status --short` muss genau
   die Dateien zeigen, die der aktuelle Commit enthalten soll.
+- **Ein `package.json`-Commit enthaelt die Lockfile-Aenderung mit**, die ihn
+  verursacht hat. `pnpm install --frozen-lockfile` prueft das in CI, und **der
+  erste Push dieser Sitzung ist daran gescheitert**:
+  `ERR_PNPM_FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE`, weil der gepushte Lockfile
+  keinen `importers:`-Block hatte — ein gefiltertes `pnpm install` schreibt ihn
+  halb. **Vor dem Push pruefen:** `git status --short pnpm-lock.yaml` muss leer
+  sein, und `pnpm install --frozen-lockfile` muss lokal durchlaufen.
+  *Lokal gruen sagt nichts:* der Fehler faellt nur dort auf, wo der Lockfile
+  unvollstaendig ist — lokal war er es nicht, weil die Arbeitskopie die
+  vollstaendige war und nur nicht committet.
 
 ### 7.2b Append-only-Dateien werden nie mit `write` überschrieben
 
