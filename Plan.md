@@ -1886,3 +1886,105 @@ das **erst nach geklärter Permission** `true` wird.
 `applyReply(grants, reply, action, resource)`. Die Engine kapselt das gegen ein
 schmales `PermissionEngine`-Interface, damit sie nicht von den konkreten
 Exportnamen abhängt.
+
+---
+
+## 17. PWA und Ablage — Zielbild und die zwei Schichten
+
+Ergänzt am 2026-09-30, nachdem ein **unabhängiger Prüfer** die Architektur gegen das
+PWA-Ziel aus `AGENTS.md` §2a geprüft hat (`HEAD = 1fb9821`, ganze Historie). Vorher
+gab es dieses Ziel als **Behauptung in einer Regel, aber als keinen Ort in der
+Spezifikation** — ein Verweis aus `AGENTS.md` zeigte auf eine Stelle, die nicht
+existierte.
+
+### 17.1 Wo die Daten heute liegen — gemessen, nicht behauptet
+
+| Ort | Was | Lebensdauer |
+|---|---|---|
+| OPFS `/opfs-sahpool/baah.sqlite3` | **Sessions, Messages, Parts** (SQLite-WASM, `opfs-sahpool`, im Web Worker) | stirbt mit „Website-Daten löschen" |
+| `localStorage["baah.session.v1"]` | Session-Zeiger | dito |
+| `localStorage["baah.settings.v1"]` | Settings, Theme, Instruktionen, Permissions, **API-Keys** | dito |
+| Arbeitsspeicher | **der Workspace selbst** | Reload |
+| `baah-settings-<ts>.json` (Download) | **nur Settings** — 0 Sessions, 0 Transcript | manuell |
+
+**„Website-Daten löschen" löscht das restlos, und es gibt keinen Weg, die Daten vorher
+herauszuholen.** Ein Gerätewechsel nimmt alles mit. Das ist der praktische Kern von
+„Projektordner als Wahrheitsquelle".
+
+### 17.2 Das Zielbild
+
+> **Der Projektordner trägt Sessions und Verlauf. Der Browser trägt den
+> Arbeitsspeicher. Kein Server.**
+
+### 17.3 Warum es zwei Schichten sein müssen — und was **nicht** geht
+
+**Nicht möglich: die SQLite-Datei in den Projektordner schreiben.** Zwei Gründe, und
+sie sind verschieden — was `AGENTS.md` §2a jetzt mit „Plattform" bzw. „Bibliothek"
+markiert:
+
+- **Plattform.** `FileSystemFileHandle.createSyncAccessHandle()` existiert überall, aber
+  der File-System-Spec (§2.3.3) weist es außerhalb eines *„bucket file system"* mit
+  `InvalidStateError` ab, und ein Bucket-Dateisystem ist genau die OPFS-Wurzel.
+- **Bibliothek.** `@sqlite.org/sqlite-wasm` hat **keinen VFS, der ein Handle annimmt**;
+  `installOpfsSAHPoolVfs({ directory })` will einen String-Pfad **innerhalb** von OPFS.
+
+**Also wandert die Wahrheitsquelle, nicht die Datei:**
+
+1. **Projektordner = Wahrheitsquelle.** Transcript als Dateien (z. B.
+   `.baah/sessions/<id>/…` plus eine Menschenlesbare Zusammenfassung), geschrieben
+   über `FileSystemDirectoryHandle.createWritable()`. Portabel, lesbar, versionierbar,
+   überlebt das Löschen der Website-Daten.
+2. **OPFS/SQLite = Arbeitsspeicher.** Transaktional, und es trägt die Resume- und
+   Interrupt-Abfragen (`listUnfinishedTurns`, `closeTurnParts`, `finishTurn`), die auf
+   Dateien nicht billig sind.
+3. **Abgleich** in beide Richtungen: Schreiben in den Ordner bei jedem Turn-Ende,
+   Import beim Öffnen. Ein Konfliktfall wird **benannt**, nicht überschrieben.
+
+### 17.4 Was die PWA-Installation tatsächlich bringt
+
+`Plan.md` §822-824 behauptete, eine installierte PWA behalte die Datei-Freigaben „ohne
+erneute Rückfrage". **Diese Behauptung ist widerlegt** — nicht von mir, sondern von der
+eigenen Spezifikation an anderer Stelle plus der Chrome-Dokumentation:
+
+> `Plan.md:1129-1131`: „Permission nur per Klick auf den Main Thread. ⇒ Nach jedem
+> Kaltstart ein ‚Projekt wieder öffnen'-Button."
+>
+> Chrome, *Permission persistence*: „The web app can continue to save changes to the
+> file without prompting **until all tabs for its origin are closed. Once a tab is
+> closed, the site loses all access.**"
+
+**Es gibt damit **keinen** belegten PWA-Gewinn für die Freigabe** — und genau das ist
+der Grund, warum die Ordner-Freigabe **nicht** die kritische Eigenschaft des Ziels ist.
+Die kritischen Eigenschaften sind: die Daten liegen im Ordner (17.3), die App ist
+installierbar und offline lauffähig (Manifest, Service Worker, Icons — **alle drei
+fehlen**, `dist/` enthält **null** Bilddateien).
+
+Ob es in Chromium eine installationsgebundene Berechtigungslogik gibt, ist **nicht
+gemessen** und wird hier **nicht behauptet**. Es ist ein **offenes Gate**: eine
+manuelle Messung auf einem echten Gerät (installieren, schließen, öffnen,
+`queryPermission({mode:"readwrite"})`).
+
+### 17.5 `storage.persist()` — der Schutz sitzt auf einem Pfad, den niemand geht
+
+`Plan.md` §1136-1138 begründet `storage.persist()` damit, dass OPFS per Default
+best-effort ist und Safari skript-erzeugte Daten nach 7 Tagen ohne Interaktion löscht.
+Gemessen: `storage.persist()` steht in `baah-core/src/workspace/opfs.ts` — und
+**diese Funktion wird von der App nie gerufen**. Für die **Datenbank**, die in OPFS
+liegt, wird der Schutz **nie** angefragt.
+
+### 17.6 Reihenfolge, und was zuerst kommt
+
+| # | Block | Schwere | Kosten |
+|---|---|---|---|
+| 1 | `queryPermission` bei Kaltstart, Ordner wirklich öffnen (`showDirectoryPicker` **im Onboarding**, `createFileSystemAccessWorkspace` **in der Composition Root**, `workspaceMode` aus dem echten Workspace, `onOpen` verdrahten) | high | der schwierige Teil ist der Kaltstart, nicht der Picker |
+| 2 | `storage.persist()` für die Datenbank + sichtbarer Zustand | medium | eine Zeile plus UI |
+| 3 | Manifest, Icons, `theme-color`, Service Worker mit Precache der 16 `dist/`-Dateien | critical (fehlt komplett) | ~1 Tag |
+| 4 | Transcript-Export über `showSaveFilePicker` (`createTranscriptReader` existiert bereits) | high | Voraussetzung dafür, dass ein Browser-Speicher je eine Wahrheitsquelle sein darf |
+| 5 | Zwei-Schichten-Ablage (17.3) | high | der eigentliche Zielbau |
+| 6 | `dist/assets/worker-*.ts` — **20 738 Byte untranspiliertes TypeScript** werden ausgeliefert und referenziert | medium | vor Block 3, sonst wird der Precache mit Müll gebaut |
+
+**Und was manuell bleibt und darum **kein** Befund ist:** installierte PWA auf echtem
+Gerät · Reload nach Kaltstart · überlebt die Ordner-Freigabe · `storage.persist()` in
+einem echten Browser · „Website-Daten löschen", Deinstallation, Gerätewechsel · zweiter
+Tab gegen `opfs-sahpool` (der Code markiert das selbst als `UNVERIFIED`,
+`errors.ts:126-130`).

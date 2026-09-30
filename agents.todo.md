@@ -1789,6 +1789,164 @@ heißen 4 auf einem Runner mit eigenem cgroup und **2** auf `code-dev`. Ich habe
 
 ---
 
+## ⭐ Unabhängiger PWA-/Speicher-Audit über die **ganze** Historie — 17 Befunde
+
+Beauftragt vom Nutzer („Ausnahme heute: alles"), gelaufen in **eigener Session**,
+`HEAD = 1fb9821`, 61 Commits. Zwei `critical`, vier `high`, sieben `medium`, fünf
+`low`. **Der Prüfer hat mich an drei Stellen korrigiert** — die wichtigste zuerst.
+
+### 🔴 B1 — mein Gate hat `main` **rot** gemacht (critical)
+
+```text
+pnpm check → exit 1, 12 × TS2591/TS2339
+scripts/browser-only.ts:53   Cannot find name 'node:fs'
+test/browser-only.test.ts:35 dito
+```
+
+`baah-web/tsconfig.json` hat `"types": ["vite/client"]` und **kein** `@types/node`, und
+der Test zog das Skript über den Import mit ins Programm. **Folge: `pnpm test` startete
+nie**, weil `check` mit `&&` verkettet ist — die 414 Unit-Tests waren nur grün, wenn man
+sie einzeln aufrief.
+
+**Das ist die siebte Instanz derselben Fehlerklasse: etwas ausgeliefert, das den
+verpflichtenden Prüfbefehl unbenutzbar macht.** Bei dreien davon war es ein Agent, der
+etwas gebaut hat; **diesmal war es mein eigenes Gate**, in derselben Sitzung, im Commit
+direkt davor.
+
+- [x] **behoben**: das Modul ist **Node-frei** (`scripts/browser-only.ts` importiert
+      nichts), der Dateibaum wandert nach `scripts/check-browser-only.mjs` (Plain JS, kein
+      Compile-Schritt). `pnpm check` rc=0, **1876** Unit-Tests, 0 Typfehler.
+      → **Strukturell, nicht kosmetisch: die reine Logik eines Gates ist der Teil, den man
+      testen will**, und ein Scanner-Test, der ein Dateisystem braucht, wird übersprungen,
+      sobald das Dateisystem unbequem ist.
+
+### 🔴 B2 — es gibt **keine** installierbare PWA (critical)
+
+`public/` existiert nicht. `dist/` = 16 Dateien: 1 HTML, 1 CSS, 13 JS, 1 WASM, und
+**null Bilddateien**. 0 Treffer für `serviceWorker|manifest|workbox` im ganzen Repo, 0 für
+`beforeinstallprompt|appinstalled|display-mode|standalone`. Kein Favicon.
+
+### 🟠 B3 — der Projektordner ist **überhaupt nicht verdrahtet** (high)
+
+**Meine Formulierung „nicht die Wahrheitsquelle" war zu schwach.** Gemessen:
+
+```text
+showDirectoryPicker in src/            0 Aufrufe
+createFileSystemAccessWorkspace        nirgends konstruiert
+runtime.ts:336   workspaceMode: "memory"   (String-Literal)
+AppShell.tsx:381 onWorkspace={() => undefined}
+AppShell.tsx:556 onOpen={() => undefined}
+WorkspacePanel.tsx:120  disabled={… mode !== "local-directory"}   → immer disabled
+```
+
+Es ist nicht „nicht die Quelle", es ist **keine Quelle**. Und die UI **behauptet** dem
+Nutzer `mode = "memory"`, was für die Datenbank falsch ist.
+
+### 🟠 B4 — meine „Plattformgrenze"-Begründung war **falsch** (high)
+
+Ich schrieb in `AGENTS.md` §2a: *„`FileSystemSyncAccessHandle` … den gibt es **nur in
+OPFS**."* **Falsch.** Die Methode existiert auf *jedem* `FileSystemFileHandle`;
+**beschränkt sind die Dateien** — der Spec (§2.3.3) lässt den Aufruf außerhalb eines
+*„bucket file system"* mit `InvalidStateError` scheitern.
+
+Und es fehlte ein **zweiter, unabhängiger** Blocker, der die eigentliche Grenze ist:
+`@sqlite.org/sqlite-wasm` hat **keinen VFS, der ein Handle annimmt**
+(`installOpfsSAHPoolVfs({directory})` will einen String-Pfad **innerhalb** OPFS). Das ist
+eine **Bibliotheks**-grenze mit einem Ausweg (`wa-sqlite`, eigener VFS), nicht Physik.
+
+> **Wer eine Bibliotheksgrenze für Physik hält, schließt die Baustelle — und prüft nie
+> den Ausweg.** Die falsche Begründung ist gefährlicher als der falsche Schluss, weil
+> sie die **Suche** einstellt statt das Ergebnis.
+→ §2a und `Plan.md` §17.3 trennen jetzt **Plattform** / **Bibliothek** / **nicht gebaut**,
+  und eine als „Plattformgrenze" bezeichnete Bibliotheksgrenze gilt als **ungemessen**.
+
+### 🟠 B5 — `Plan.md` widersprach **sich selbst** über den PWA-Gewinn (medium)
+
+§822-824 behauptete, eine installierte PWA behalte Datei-Freigaben „ohne erneute
+Rückfrage". §1129-1131 im **selben Dokument** sagt das Gegenteil, und die
+Chrome-Doku bestätigt es: *„until all tabs for its origin are closed. Once a tab is
+closed, the site loses all access."*
+
+> **Damit gibt es keinen belegten PWA-Gewinn für die Freigabe** — und genau das erklärt,
+> warum die Ordner-Freigabe nicht die kritische Eigenschaft ist. Die kritischen sind: die
+> Daten liegen im Ordner, und die App ist installierbar und offline lauffähig.
+Ob es eine installationsgebundene Berechtigungslogik gibt, ist **nicht gemessen** und
+wird **nicht behauptet** — offenes Gate.
+
+### 🟠 B6 — der Schutz sitzt auf einem Pfad, den niemand geht (medium)
+
+`storage.persist()` steht in `baah-core/src/workspace/opfs.ts` (3 Treffer, alle dort) —
+und **diese Funktion wird nie gerufen**. Für die **Datenbank**, die in OPFS liegt, wird
+der Schutz **nie** angefragt. `Plan.md` §1136 begründet ihn als Voraussetzung dafür, dass
+OPFS überhaupt eine Wahrheitsquelle *eines Geräts* ist.
+
+### 🟠 B7 — meine Gate-Korrektur war nur halb gezogen (medium) — **die beste Lehre**
+
+Ich hatte in `1fb9821` dokumentiert: *„ein Import-Specifier ist **immer** ein String-
+Literal, und ein strippendes Gate ist für `node:fs` **blind**"*, und die Konsequenz **nur**
+für `FORBIDDEN` gezogen. **Für `REQUIRED` nicht.** Und dort lagen zwei reine
+String-Alternativen:
+
+```text
+### browser-database via specifier string
+  stripped: 'import x from                        ;'    ← String-Inhalt gelöscht
+  missing : filesystem-access, origin-private-storage, database-off-main-thread, web-storage
+```
+
+**`browser-database` fehlte trotz echtem `import … from "@sqlite.org/sqlite-wasm"`.**
+Derselbe Fehler, eine halbe Datei entfernt, und ich hatte ihn gerade erst behoben.
+
+> **Ein Gate muss lesen, **wie** die gesuchte Sache geschrieben wird.** Ein Aufruf ist
+> Code, ein Import-Specifier ein String, ein Query-Parameter ein String. Drei Formen,
+> zwei Regeln (`code` / `specifier`). Und: **ein Gate, das bei *Abwesenheit* lügt, wird
+> genauso ignoriert wie eines, das bei *Verstößen* lügt** — der Fehler fällt nur nicht
+> auf, weil nichts rot wird.
+
+### 🟠 B8 — Gate-Lücken, die der Prüfer gefunden und ich geschlossen habe
+
+| Lücke | geschlossen |
+|---|---|
+| `filesystem-access` war durch OPFS' eigenes `getFileHandle()` erfüllbar — eine App **ohne** Ordner bestand das Kriterium | eigene Fähigkeit `project-folder`, **nur** `show*Picker` |
+| `fetch("/api/…")` auf die eigene Origin war erlaubt | Regel `own-origin-fetch` (Pfad-relativ, kein `//`) |
+| `Buffer` war nicht verboten, obwohl §2 es wörtlich nennt | Regel `node-buffer` |
+| nacktes `process` ohne `.` | Muster auf `\bprocess` |
+| Ausgabe zählte „4 package trees" bei **13** `src/`-Bäumen; die drei Zahlen widersprachen sich | eine Zahl, aus dem Pfad abgeleitet, plus Selbsttest |
+
+### 🟠 B9 — meine Messungen, die **falsch** waren
+
+| Meine Angabe | Gemessen |
+|---|---|
+| „`queryPermission`/`requestPermission`: **0 Treffer** über `packages/*/src`" | **14 Treffer**, 13 davon Code in `baah-core/src/workspace/file-system-access.ts`. `0` gilt nur für `packages/baah-web/src`. **Schlussfolgerung blieb richtig** — `assertHandlePermission` wird von niemandem gerufen — **die Zahl trug sie nicht.** |
+| „Sessions liegen in OPFS, nicht im Projektordner" | richtig, aber **zu schwach**: es ist nicht „nicht die Quelle", es ist **überhaupt keine** (B3) |
+| „`public/manifest.webmanifest` FEHLT" | richtig und **schwächer** als möglich: `dist/` hat **null** Bilddateien |
+
+### 🟡 B10 — `dist/assets/worker-KjvADLM3.ts`: 20 738 Byte **untranspiliert** ausgeliefert
+
+Und **referenziert** von `dist/assets/src-24UO2SWA.js`. Ursache: der `exports`-Eintrag
+`"./worker": "./src/worker.ts"` zusammen mit `?worker&url`. **Vor** dem Precache-Block
+(B2) zu beheben — sonst baut man den Service-Worker-Cache mit Müll.
+
+### 🟡 B11 — kleinere Befunde
+
+- `index.html`: `<title>opencode-harness-web</title>` (der Commit `1dc13dd` hat auf
+  `baah` umbenannt) und `lang="en"` bei durchgehend deutscher UI-Prosa (§5).
+- `§2`s Begründungsabsatz zur Test-Harness-Ausnahme hing nach dem Einfügen von §2a/§2b
+  als **Schluss von §2b** → eigene Überschrift.
+- `collectSources` scannt `packages/baah-web/vite.config.ts` mit (86 statt 85), obwohl der
+  Docstring `src/**` sagt. Bewusst behalten — eine Config-Datei ist ausgelieferter Code
+  — aber der Docstring wurde korrigiert, damit die Zahl erklärbar bleibt.
+
+### Der Prüfer hat **nicht** geprüft — und das ist der Grund für §2b
+
+`pnpm e2e` und `pnpm build` als eigene Schritte (beide brechen vorher ab), und **sieben
+manuelle Gates**: installierte PWA auf echtem Gerät · Reload nach Kaltstart · überlebt
+die Ordner-Freigabe · `storage.persist()` im echten Browser · „Website-Daten löschen",
+Deinstallation, Gerätewechsel · zweiter Tab gegen `opfs-sahpool` (vom Code selbst als
+`UNVERIFIED` markiert) · ob der echte OPFS-Pfad im Browser bootet.
+
+**Commit-Range für den nächsten Lauf:** siehe Commit-Message. Nächster Prüfer-Commit ist
+der Stand **nach** diesem Block.
+
 ## Abgehakt
 
 *(nach unten wandern, mit Commit-Referenz)*

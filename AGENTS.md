@@ -84,13 +84,38 @@ Sessions und Verlauf ist. Kein Server — zu keinem Zeitpunkt, für nichts.
 2. **Speicherung** nur über Browser-Speicher: Local Storage, Session Storage,
    IndexedDB, Cache Storage, OPFS.
 3. **Die Session-Datenbank liegt im Browser.** Heute: SQLite-WASM als
-   `opfs-sahpool` in einem Web Worker (`baah-storage`). Das ist eine
-   **Plattformgrenze**, keine Designentscheidung: `opfs-sahpool` braucht einen
-   `FileSystemSyncAccessHandle`, und den gibt es **nur in OPFS**. Ein per
-   `showDirectoryPicker()` gewählter Ordner liefert nur `createWritable()`, also
-   einen Schreibstrom ohne Zufallszugriff. **SQLite lässt sich dort nicht öffnen.**
-   Wer das ändern will, muss die *Wahrheitsquelle* verlagern, nicht die Datei
-   hinschreiben — siehe `Plan.md` zur Zwei-Schichten-Ablage.
+   `opfs-sahpool` in einem Web Worker (`baah-storage`). **Zwei** Grenzen, und
+   sie sind **verschieden** — das ist der Punkt, an dem §2a in seiner ersten
+   Fassung falsch war:
+   - **Plattform:** `createSyncAccessHandle()` existiert auf *jedem*
+     `FileSystemFileHandle`. **Beschränkt sind die Dateien**: der
+     File-System-Spec (§2.3.3) lässt den Aufruf außerhalb eines *„bucket file
+     system"* mit `InvalidStateError` scheitern, und ein Bucket-Dateisystem ist
+     per Spec genau die OPFS-Wurzel. Ein `showDirectoryPicker()`-Handle ist nie
+     eines.
+   - **Bibliothek:** `@sqlite.org/sqlite-wasm` bringt **keinen VFS mit, der ein
+     Handle annimmt.** `installOpfsSAHPoolVfs({ directory })` erwartet einen
+     **String-Pfad innerhalb von OPFS**. Selbst wenn die Plattform es erlaubte,
+     gäbe es keinen Weg, `opfs-sahpool` einen gewählten Ordner zu geben, ohne
+     die Bibliothek zu patchen oder einen eigenen VFS zu bauen.
+
+   → **Wer die zweite Grenze für Physik hält, hält sie für unabänderbar**, und
+   `wa-sqlite` oder ein selbst gebauter VFS werden nie evaluiert.
+
+   ⚠️ **Regel für jede hier genannte Grenze:** sie wird mit einem dieser beiden
+   Wörter markiert — **Plattform** (nicht änderbar) oder **Bibliothek** (eine
+   Designentscheidung mit Ausweg). **Eine als „Plattformgrenze" bezeichnete
+   Bibliotheksgrenze gilt als ungemessen** und ist vor der nächsten Welle zu
+   belegen oder zu streichen. Die dritte Variante — „nicht gebaut" — ist die
+   häufigste und darf nie wie eine der beiden anderen formuliert werden.
+
+4. **Der Projektordner ist die Wahrheitsquelle — und ist heute nicht verdrahtet.**
+   `showDirectoryPicker` wird **null** mal aufgerufen,
+   `createFileSystemAccessWorkspace` nirgends konstruiert, `workspaceMode` ist
+   das Literal `"memory"`, und der Ordnungs-Knopf ist permanent deaktiviert.
+   Das ist kein „nicht die Wahrheitsquelle", das ist **überhaupt keiner**, und
+   `pnpm check:browser-only` meldet es bei jedem Lauf als
+   `KNOWN-UNSATISFIED "project-folder"`.
 
 **Vollzug, nicht Notiz:**
 
@@ -126,7 +151,19 @@ läuft es grün durch, weil nichts Verbotenes importiert wurde.
 
 Selbsttest mit **gepflanztem Material** in
 `packages/baah-web/test/browser-only.test.ts`, beide Hälften: ein Quellensatz ganz
-ohne Browser-Fähigkeit muss **alle fünf** als fehlend melden.
+ohne Browser-Fähigkeit muss **alle** Fähigkeiten als fehlend melden, und ein leerer
+Quellensatz ist **kein** Durchgang.
+
+⚠️ **Was das Gate erkennt und was nicht — steht hier, damit es nicht stillschweigend
+zu viel behauptet.** Es erkennt **Löschung**: weg mit der Browser-Datenbank, und
+`browser-database` fehlt. Es erkennt **keine Fehlverdrahtung**: ein
+`fetch("https://sync.example.invalid/…")` **neben** einem unveränderten
+`sqlite3InitModule`-Import besteht beide Hälften, weil das aus Quelltext von einem
+Provider-Aufruf nicht unterscheidbar ist. Und es erkennt keine **Verdrahtung**: eine
+Fähigkeit in einer nie aufgerufenen Funktion erfüllt es. Beides ist gemessen und
+liegt als Test im Selbsttest, damit die Beschreibung hier nicht veralten kann.
+
+### 2. (Fortsetzung) Warum die Test-Harness-Ausnahme erlaubt ist
 
 ### 2b. Die Einhaltung wird **unabhängig** geprüft, über einen Commit-Range
 

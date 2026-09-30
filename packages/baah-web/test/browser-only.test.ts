@@ -2,97 +2,141 @@
  * The browser-only gate's self-test, and it is the part that makes the gate mean
  * something.
  *
- * ## The problem this file exists for
+ * ## Scope, and why it is narrow on purpose
+ *
+ * This file tests the **pure** part: `scanBrowserOnly`, `stripCommentsAndStrings`,
+ * `verifyRepository`. It **cannot** read the repository, because `baah-web`'s
+ * TypeScript program has `"types": ["vite/client"]` and no `@types/node` — and
+ * adding Node types there is §2's failure mode, in the very package that must not
+ * have them. The first version of this gate imported `node:fs` and put `pnpm check`
+ * into **12 compile errors** on the commit that introduced it.
+ *
+ * So the repository-level assertions live in `verifyRepository`, which the CLI
+ * runs on **every** `pnpm check`. That is strictly better than a test: it cannot be
+ * forgotten, and it needs no fixture to remember to point at the real tree.
+ *
+ * ## What this file is for
  *
  * A gate that only lists **forbidden** constructs is half a gate. Delete the
- * persistence layer and it passes, because nothing forbidden was imported. That
- * is a green gate that proves nothing — and this project has now hit that shape
- * seven times in different clothes: the truncated `grep` search reported as
- * complete, the model list that silently paginated once, 44 green E2E tests that
- * never looked at a phone, a screenshot harness that would have skipped
- * everything and still exited 0.
+ * persistence layer and it passes, because nothing forbidden was imported — a
+ * green gate that proves nothing. This project has hit that shape seven times in
+ * different clothes: the truncated `grep` search reported as complete, the model
+ * list that silently paginated once, 44 green E2E tests that never looked at a
+ * phone, a screenshot harness that would have skipped everything and exit 0.
  *
- * So this gate has a **required** half as well, and that is the half that
- * carries the requirement: the browser capabilities the project is defined by
- * must be *in use*. A server-backed persistence layer satisfies the forbidden
- * half perfectly and fails the required half completely.
+ * And the required half only carries the requirement if it can tell the **target
+ * state** from **zero**. That is what `project-folder` is for.
  *
- * ## What each test is for
+ * ## Three mistakes these tests caught, all in the gate's reading rules
  *
- * 1. the reader really reads the repository, and the repository passes — so a
- *    broken scan cannot look like a clean bill of health;
- * 2. the forbidden half catches **planted** material, one rule at a time;
- * 3. the required half has teeth: a source set with no browser capability at all
- *    must report **all five** missing. Without this, a gate that had lost its
- *    required list would pass silently.
+ * 1. **An import specifier is a string literal.** A scanner that blanks strings is
+ *    blind to every `node:fs` import in the repository, and reported itself as
+ *    coverage. Forbidden rules got a `where`.
+ * 2. **A query string is a string literal too** — same mistake one half a file
+ *    away, going the other direction: `@sqlite.org/sqlite-wasm` and `?worker&url`
+ *    were `code` alternatives, so they could never match, and the gate reported
+ *    `browser-database` as missing on a repository that has it. **A gate that lies
+ *    about absence gets its absence report ignored**, which is the same failure as
+ *    a gate that lies about violations.
+ * 3. `AGENTS.md` §2a said File System Access **or** OPFS. OPFS has
+ *    `getFileHandle`, so an app with no folder at all satisfied a capability that
+ *    exists to say the folder must be there. Two things are not one thing.
  *
- * The planted sources are assembled from fragments. That is not superstition:
- * the stripper blanks string bodies, so a planted token inside a string is
- * invisible to the scan, and building from fragments keeps that true even if
- * somebody later scans test trees too.
+ * Planted tokens are assembled from fragments: the stripper blanks string bodies,
+ * so a planted token inside a string is invisible to the scan, and fragments keep
+ * that true even if somebody later scans test trees.
  */
 
-import { existsSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-import { collectSources, scanBrowserOnly, stripCommentsAndStrings } from "../../../scripts/browser-only.ts";
-
-const REPO_ROOT = new URL("../../../", import.meta.url).pathname;
-
-/** Every `src/` source in the repository, keyed by repo-relative path. */
-function realSources(): Record<string, string> {
-  return collectSources(REPO_ROOT);
-}
-
-describe("the browser-only gate reads the repository", () => {
-  it("finds the sources rather than matching nothing", () => {
-    const sources = realSources();
-    // A vacuous pass is the failure mode. Eleven packages have a src/ tree, and
-    // a threshold of 50 is low enough never to be the thing that breaks and high
-    // enough that "the glob silently matched nothing" cannot pass.
-    expect(Object.keys(sources).length).toBeGreaterThan(50);
-    expect(Object.keys(sources).some((p) => p.includes("baah-core/"))).toBe(true);
-    expect(Object.keys(sources).some((p) => p.includes("baah-storage/"))).toBe(true);
-    expect(Object.keys(sources).some((p) => p.includes("baah-tools/"))).toBe(true);
-  });
-
-  it("does not read test trees, which would scan planted material", () => {
-    const sources = realSources();
-    const testish = Object.keys(sources).filter(
-      (p) => p.includes("/test/") || p.includes(".test.") || p.includes("scripts/"),
-    );
-    expect(testish).toEqual([]);
-  });
-
-  it("the repository itself passes: no server form, all required capabilities in use", () => {
-    const report = scanBrowserOnly(realSources());
-    const detail = [
-      ...report.violations.map((v) => `${v.rule} in ${v.file}:${v.line} (${v.text})`),
-      ...report.missing.map((id) => `missing capability: ${id}`),
-    ].join("\n");
-    expect(detail).toBe("");
-    expect(report.filesScanned).toBeGreaterThan(50);
-  });
-});
+import {
+  CAPABILITY_IDS,
+  KNOWN_UNSATISFIED,
+  REQUIRED,
+  stripCommentsAndStrings,
+  verifyRepository,
+  type Report,
+} from "../../../scripts/browser-only.ts";
 
 /**
- * A source that satisfies **all five** required capabilities and breaks none of
- * the forbidden ones.
+ * Satisfies **all** required capabilities and breaks none of the forbidden ones.
  *
- * The forbidden-rule tests below are only about the forbidden half, so they need
- * this filler to keep the two halves apart. The first version used a two-line
- * filler that satisfied only two capabilities, and eleven tests failed for a
- * reason that had nothing to do with what they were checking — a test that
- * measures one thing and asserts another is a test that measures noise.
+ * The forbidden-rule tests are only about the forbidden half, so they need this
+ * filler to keep the halves apart. An earlier two-capability filler made eleven
+ * tests fail for a reason that had nothing to do with what they were checking — a
+ * test that measures one thing and asserts another measures noise.
  */
 const ALL_CAPABILITIES = [
   `import sqlite3InitModule from "@sqlite.org/sqlite-wasm";`,
+  `const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });`,
   `const dir = await navigator.storage.getDirectory();`,
   `const handle = await showDirectoryPicker();`,
   `localStorage.getItem("k");`,
-  `const worker = new Worker(new URL("./w.ts", import.meta.url), { type: "module" });`,
   `await sqlite3InitModule(); void dir; void handle; void worker;`,
 ].join("\n");
+
+/** Everything except the one capability that is known not to be met yet. */
+const ALL_BUT_PROJECT_FOLDER = ALL_CAPABILITIES
+  .split("\n")
+  .filter((line) => !line.includes("showDirectoryPicker"))
+  .join("\n");
+
+/**
+ * Scan a planted source **alongside** the all-capabilities filler.
+ *
+ * The filler lives under its own path. It shared `packages/x/src/a.ts` with the
+ * planted sources at first, and because a later spread key overwrites an earlier
+ * one the filler was simply **replaced** — so seventeen tests failed on a missing
+ * capability that had never been there. A helper that silently discards the setup
+ * it is supposed to provide is worse than no helper: every failure points at the
+ * rule under test instead of at the harness.
+ */
+const scan = (sources: Record<string, string>): Report =>
+  verifyRepository({ "packages/x/src/filler.ts": ALL_CAPABILITIES, ...sources });
+
+describe("the gate reads code the way code is written", () => {
+  it("a capability that lives in a STRING is matched in raw source", () => {
+    // The mistake the audit found: `@sqlite.org/sqlite-wasm` and `?worker&url` are
+    // string contents, so they cannot match in blanked source. Both are the real
+    // repository's spelling, and the gate reported them missing.
+    const report = scan({
+      "packages/baah-storage/src/worker.ts": [
+        `import sqlite3InitModule from "@sqlite.org/sqlite-wasm";`,
+        `import workerUrl from "./worker.ts?worker&url";`,
+      ].join("\n"),
+    });
+    expect(report.satisfied["browser-database"]).toBeDefined();
+    expect(report.satisfied["database-off-main-thread"]).toBeDefined();
+  });
+
+  it("the identifier alone is enough for browser-database", () => {
+    const report = scan({ "packages/x/src/w.ts": `await sqlite3InitModule();\n` });
+    expect(report.satisfied["browser-database"]).toBeDefined();
+  });
+
+  it("project-folder is NOT satisfied by OPFS's own getFileHandle", () => {
+    // The third mistake. §2a said "FSAA **or** OPFS", and OPFS has
+    // `getFileHandle`, so an app with no folder at all passed a capability whose
+    // whole job is to say the folder must be there.
+    const report = verifyRepository({
+      "packages/x/src/a.ts": [
+        `const root = await navigator.storage.getDirectory();`,
+        `const file = await root.getFileHandle("baah.sqlite3", { create: true });`,
+        `await sqlite3InitModule();`,
+        `new Worker(url);`,
+        `localStorage.getItem("k");`,
+      ].join("\n"),
+    });
+    expect(report.violations).toEqual([]);
+    expect(report.satisfied["origin-private-storage"]).toBeDefined();
+    expect(report.satisfied["project-folder"]).toBeUndefined();
+    expect(report.missing).toContain("project-folder");
+  });
+
+  it("showDirectoryPicker alone satisfies project-folder", () => {
+    expect(scan({ "packages/x/src/a.ts": `await showDirectoryPicker();\n` }).missing).toEqual([]);
+  });
+});
 
 describe("the forbidden half catches planted material", () => {
   const cases: readonly { readonly name: string; readonly code: string }[] = [
@@ -102,16 +146,19 @@ describe("the forbidden half catches planted material", () => {
     { name: "node-net", code: `import http from "${["node", "http"].join(":")}";` },
     { name: "node-net", code: `import { spawn } from "${["node", "child_process"].join(":")}";` },
     { name: "node-process-global", code: `const key = process.env.OPENAI_API_KEY;` },
+    { name: "node-process-global", code: `export const cwd = process.cwd();` },
+    { name: "node-buffer", code: `const b = Buffer.from("x", "utf8");` },
     { name: "commonjs-require", code: `const fs = require("fs");` },
     { name: "server-listen", code: `const server = createServer(handler); server.listen(8080);` },
     { name: "server-listen", code: `Deno.serve(() => new Response("hi"));` },
     { name: "own-transport", code: `const ws = new WebSocket("wss://example.invalid");` },
     { name: "own-transport", code: `const es = new EventSource("/events");` },
+    { name: "own-origin-fetch", code: `await fetch("/api/sessions", { method: "POST" });` },
   ];
 
   for (const { name, code } of cases) {
-    it(`flags ${name} in: ${code.slice(0, 48)}…`, () => {
-      const report = scanBrowserOnly({ "packages/x/src/a.ts": ALL_CAPABILITIES + "\n" + code });
+    it(`flags ${name} in: ${code.slice(0, 52)}…`, () => {
+      const report = scan({ "packages/x/src/a.ts": code });
       // Asserted first, so a failure says which half is wrong rather than
       // reporting a violation that was never looked for.
       expect(report.missing).toEqual([]);
@@ -119,114 +166,157 @@ describe("the forbidden half catches planted material", () => {
     });
   }
 
+  it("a provider fetch at an absolute URL is not a violation", () => {
+    // The rule is about OUR origin. A provider call is the whole point of the app.
+    for (const url of ["https://api.openai.com/v1/chat/completions", "https://e2e.invalid/v1/models"]) {
+      const report = scan({ "packages/x/src/a.ts": `await fetch("${url}");` });
+      expect(report.violations, url).toEqual([]);
+    }
+  });
+
+  it("reports one planted mistake once, not twice under two rules", () => {
+    const report = scan({ "packages/x/src/a.ts": `import { readFile } from "node:fs/promises";\n` });
+    expect(report.violations.map((v) => v.rule)).toEqual(["node-fs"]);
+  });
+
+  it("finds a specifier however the import is spelled", () => {
+    for (const code of [
+      `import fs from "node:fs";`,
+      `import "node:fs";`,
+      `const m = await import("node:fs");`,
+      `const fs = require("node:fs");`,
+    ]) {
+      expect(scan({ "packages/x/src/a.ts": code }).violations.map((v) => v.rule), code).toContain(
+        "node-fs",
+      );
+    }
+  });
+
   it("reports the line, so a violation can be found without grepping", () => {
-    const report = scanBrowserOnly({
+    const report = scan({
       "packages/x/src/a.ts": "const a = 1;\nconst b = 2;\nimport fs from \"node:fs\";\n",
     });
     expect(report.violations[0]?.line).toBe(3);
     expect(report.violations[0]?.file).toBe("packages/x/src/a.ts");
   });
-
-  it("reports one planted mistake once, not twice under two rules", () => {
-    // A gate that reports the same violation twice trains the reader to skip
-    // lines. `node:fs/promises` is filesystem-only, so it must not also light up
-    // the network rule.
-    const report = scanBrowserOnly({
-      "packages/x/src/a.ts": `import { readFile } from "node:fs/promises";\n`,
-    });
-    expect(report.violations.map((v) => v.rule)).toEqual(["node-fs"]);
-  });
-
-  it("finds a specifier however the import is spelled", () => {
-    // Four spellings, one rule. The stripper blanks string bodies, so a
-    // specifier is only ever visible to a raw-source rule anchored to an import
-    // position — which means the anchor has to cover all of these, or the gate
-    // is blind to the one the codebase happens to use.
-    const spellings = [
-      `import fs from "node:fs";`,
-      `import "node:fs";`,
-      `const m = await import("node:fs");`,
-      `const fs = require("node:fs");`,
-    ];
-    for (const code of spellings) {
-      const report = scanBrowserOnly({ "packages/x/src/a.ts": code });
-      expect(report.violations.map((v) => v.rule), code).toContain("node-fs");
-    }
-  });
 });
 
-describe("prose about a forbidden API is not a violation", () => {
-  it("ignores comments", () => {
-    const report = scanBrowserOnly({
-      "packages/x/src/a.ts": "/** we do NOT use node:fs here, see AGENTS.md §2 */\nconst a = 1;\n",
-    });
-    expect(report.violations).toEqual([]);
-  });
-
-  it("ignores strings", () => {
-    const report = scanBrowserOnly({
-      "packages/x/src/a.ts": `const msg = "createServer is banned";\n`,
-    });
-    expect(report.violations).toEqual([]);
-  });
-
-  it("still flags the same token in code, one line later", () => {
-    const report = scanBrowserOnly({
-      "packages/x/src/a.ts": `const msg = "createServer is banned";\nconst s = createServer(h);\n`,
-    });
-    expect(report.violations.map((v) => v.rule)).toEqual(["server-listen"]);
-  });
-});
-
-describe("the required half has teeth", () => {
-  it("a source set with no browser capability at all fails on all five", () => {
-    // The load-bearing test of the whole file. A server-backed persistence layer
-    // would sail past every forbidden rule in this gate, and this is the only
-    // assertion that says so out loud.
-    const report = scanBrowserOnly({
+describe("the required half is not satisfied by nothing", () => {
+  it("a source set with no browser capability at all fails on every one", () => {
+    const report = verifyRepository({
       "packages/api/src/server.ts": `const app = createServer(handler);\napp.listen(3000);\n`,
     });
-    expect(report.missing.sort()).toEqual([
-      "browser-database",
-      "database-off-main-thread",
-      "filesystem-access",
-      "origin-private-storage",
-      "web-storage",
-    ]);
+    expect([...report.missing].sort()).toEqual([...CAPABILITY_IDS].sort());
   });
 
   it("an empty source set is not a pass either", () => {
-    // The vacuous case. An empty map must not read as "no problems found".
-    const report = scanBrowserOnly({});
+    const report = verifyRepository({});
     expect(report.filesScanned).toBe(0);
-    expect(report.missing).toHaveLength(5);
-  });
-
-  it("a browser-resident database satisfies the half a server cannot", () => {
-    const report = scanBrowserOnly({
-      "packages/baah-storage/src/worker.ts": [
-        `import sqlite3InitModule from "@sqlite.org/sqlite-wasm";`,
-        `const dir = await navigator.storage.getDirectory();`,
-        `const handle = await showDirectoryPicker();`,
-        `localStorage.getItem("k");`,
-        `new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });`,
-      ].join("\n"),
-    });
-    expect(report.missing).toEqual([]);
-    expect(report.violations).toEqual([]);
+    expect(report.missing).toHaveLength(CAPABILITY_IDS.length);
+    expect(report.problems.length).toBeGreaterThan(0);
   });
 
   it("records which file satisfied each capability, so the report is readable", () => {
-    const report = scanBrowserOnly({
+    // Deliberately **not** `scan()`: the all-capabilities filler would win the
+    // race and the assertion would name the filler instead of the planted file.
+    const report = verifyRepository({
       "packages/baah-storage/src/w.ts": `import sqlite3InitModule from "@sqlite.org/sqlite-wasm";\n`,
     });
     expect(report.satisfied["browser-database"]).toBe("packages/baah-storage/src/w.ts");
   });
 });
 
+describe("the known-unsatisfied list cannot rot in either direction", () => {
+  it("a tracked gap does not become a problem", () => {
+    // The load-bearing pair. `project-folder` is genuinely unmet today, and a gate
+    // that fails for a *planned* gap is a gate people learn to skip.
+    const report = verifyRepository({ "packages/x/src/a.ts": ALL_BUT_PROJECT_FOLDER });
+    expect(report.missing).toContain("project-folder");
+    expect(report.problems).toEqual([]);
+  });
+
+  it("a tracked gap that got FIXED is a problem, so the entry cannot go stale", () => {
+    const report = verifyRepository({ "packages/x/src/a.ts": ALL_CAPABILITIES });
+    expect(report.missing).toEqual([]);
+    expect(report.problems).toContainEqual(expect.stringContaining('delete the entry'));
+  });
+
+  it("an untracked gap is a problem", () => {
+    const report = verifyRepository({
+      "packages/x/src/a.ts": `const a = 1;\n`,
+    });
+    expect(report.problems.join("\n")).toContain("untracked missing capability");
+    expect(report.problems.join("\n")).toContain("origin-private-storage");
+  });
+
+  it("every entry names a real capability and carries a reason, not just an id", () => {
+    for (const [id, reason] of Object.entries(KNOWN_UNSATISFIED)) {
+      expect(REQUIRED.some((c) => c.id === id), `${id} is not a capability`).toBe(true);
+      expect(reason.length, `${id} needs a reason`).toBeGreaterThan(60);
+    }
+  });
+
+  it("the capability list is non-empty and every id is unique", () => {
+    expect(CAPABILITY_IDS.length).toBeGreaterThanOrEqual(5);
+    expect(new Set(CAPABILITY_IDS).size).toBe(CAPABILITY_IDS.length);
+  });
+});
+
+describe("the documented limit: deletion yes, miswiring no", () => {
+  it("a remote call BESIDE an untouched database import passes both halves", () => {
+    // Measured before it was documented, and kept as a test so the documentation
+    // cannot quietly become false. What passes is a *remote* call to an absolute
+    // URL next to the database import — indistinguishable, from source text, from
+    // a provider call. Claiming otherwise would be overclaiming, which is the
+    // defect this project has spent the session fixing.
+    //
+    // Built on the "all but project-folder" base, so the only missing capability is
+    // the tracked one. Asserting `missing` on a source set that lacked four
+    // capabilities in the first place would have been a test about the fixture.
+    const report = verifyRepository({
+      "packages/baah-storage/src/w.ts": [
+        ALL_BUT_PROJECT_FOLDER,
+        `await fetch("https://sync.example.invalid/turns", { method: "POST" });`,
+      ].join("\n"),
+    });
+    expect(report.violations).toEqual([]);
+    expect(report.missing).toEqual(["project-folder"]);
+  });
+
+  it("a same-origin call IS caught even beside the database import", () => {
+    const report = verifyRepository({
+      "packages/baah-storage/src/w.ts": [
+        `import sqlite3InitModule from "@sqlite.org/sqlite-wasm";`,
+        `await fetch("/api/sessions", { method: "POST" });`,
+      ].join("\n"),
+    });
+    expect(report.violations.map((v) => v.rule)).toContain("own-origin-fetch");
+  });
+});
+
+describe("prose about a forbidden API is not a violation", () => {
+  it("ignores comments", () => {
+    const report = scan({
+      "packages/x/src/a.ts": "/** we do NOT use node:fs here, see AGENTS.md §2 */\nconst a = 1;\n",
+    });
+    expect(report.violations).toEqual([]);
+  });
+
+  it("ignores strings", () => {
+    expect(scan({ "packages/x/src/a.ts": `const msg = "createServer is banned";\n` }).violations).toEqual([]);
+  });
+
+  it("still flags the same token in code, one line later", () => {
+    const report = scan({
+      "packages/x/src/a.ts": `const msg = "createServer is banned";\nconst s = createServer(h);\n`,
+    });
+    expect(report.violations.map((v) => v.rule)).toEqual(["server-listen"]);
+  });
+});
+
 describe("the stripper the other gates share", () => {
   it("preserves offsets and newlines, so line numbers stay true", () => {
-    const src = 'a\n// comment\nb\n';
+    const src = "a\n// comment\nb\n";
     const out = stripCommentsAndStrings(src);
     expect(out.length).toBe(src.length);
     expect(out.split("\n")).toHaveLength(src.split("\n").length);
@@ -235,15 +325,9 @@ describe("the stripper the other gates share", () => {
   });
 
   it("does not treat a regex literal as a string", () => {
-    // A `//` inside a regex is not a line comment. Getting this wrong would blank
-    // the rest of the file and hide a real violation after it.
-    const out = stripCommentsAndStrings('const re = /a\\/\\/b/g;\nconst after = 1;\n');
+    // A `//` inside a regex is not a line comment. Getting this wrong blanks the
+    // rest of the file and hides a real violation after it.
+    const out = stripCommentsAndStrings("const re = /a\\/\\/b/g;\nconst after = 1;\n");
     expect(out).toContain("const after");
-  });
-});
-
-describe("the gate is wired where it can be run", () => {
-  it("the script exists at the path the self-test imports", () => {
-    expect(existsSync(new URL("../../../scripts/browser-only.ts", import.meta.url).pathname)).toBe(true);
   });
 });
