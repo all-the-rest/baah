@@ -16,6 +16,65 @@
 
 **Legende:** `[ ]` offen · `[~]` in Arbeit · `[x]` fertig · `[!]` Blocker
 
+
+---
+
+## Stand (30.09.2026) — die Liste darunter ist ein Log, nicht mehr die Queue
+
+**Gemessen, nicht geschätzt:**
+
+```
+core     570 Tests   storage 457   web 396/397   E2E 44 (0 skipped)
+11 Pakete, alle typisieren. 35 Commits, UNGEPUSHT — die CI ist nie gelaufen.
+```
+
+| Welle | Stand |
+|---|---|
+| **0** Fundament, Recherche, Repo | ✅ |
+| **1** Storage, Workspaces, Rechte, Suche, Basis-Tools | ✅ gebaut **und** verifiziert (jeder Block mit 12–31 Mutationen) |
+| **2** Engine, Runtime, Oberfläche | ✅ gebaut · Verifikation: 3 Blöcke grün, 2 Agenten laufen (Core-Leak, Web-Löschung) |
+| **3** E2E, UI-Review | E2E ✅ 8/8 Szenarien · **UI-Review noch offen** — die Oberfläche existiert jetzt, also ist es endlich sinnvoll |
+| **4** `shell`, `git`, `task`, `webfetch`, `skill`, Service-Worker | **offen** — kein einziges dieser Tools existiert |
+
+### Kritischer Pfad, in dieser Reihenfolge
+
+1. **W2-K und W2-L landen** → Baum wird grün → **`git push`** (35 Commits). Erst dann läuft
+   die CI zum ersten Mal, und **das ist ein offenes Gate, kein erledigter Punkt**: der
+   Workflow ist gelesen und per YAML geparst, aber nie ausgeführt. `AGENTS.md` §8 verlangt
+   für den Push eine ausdrückliche Anweisung — **die habe ich noch nicht.**
+2. **Wave 3: UI-Review.** Screenshots + Vision-Analyse der *echten* Oberfläche, dann die
+   Befunde beheben, nicht nur protokollieren. Erster Blick auf etwas, das ein Mensch
+   benutzen würde.
+3. **Wave 4: die fehlenden Tools.** `Plan.md` §4 verspricht `shell`, `git`, `task` und
+   `webfetch`; **keines davon ist gebaut.** Das ist die größte einzelne Lücke zwischen
+   Spezifikation und Wirklichkeit.
+
+### Was ich als Orchestrator falsch gemacht habe — zum Nachlesen
+
+- **Eine unbewiesene Hypothese als Auftrag formuliert.** „`todo`/`question` sind vielleicht
+  keine Callable-Tools" — falsch, und ich hatte es als Instruktion gegeben statt als Frage.
+- **Ein Feld gefeiert, ohne zu fragen, ob es überall vorkommt.** `rawFinishReason` fehlt auf
+  dem OpenAI-Responses-Pfad; **jeder** erfolgreiche Turn las sich als Trunkierung. Ein
+  *besseres* Signal ist nicht ein Signal, das überall existiert.
+- **Aus gekürzter Ausgabe geschlossen.** Ich meldete „alle Tool-Pakete sauber" aus einer
+  `head -20`-gekürzten Pipe. Drei Pakete waren rot, `main` war rot, ein Subagent fand es.
+- **Die sicherere Vorgabe war falsch.** „Abwesenheit ist kein Beweis für Trunkierung" hätte
+  §5.4s Verdict ersatzlos gestrichen. Es galt, sie auszuprobieren statt sie zu akzeptieren.
+- **Zweimal einen Agenten ohne Antwort enden lassen.** Bei ~5700 Zeilen eigener Arbeit gibt
+  er nichts Berichtetes zurück — und Tests ohne jemanden, der sagt, was sie prüfen, sind
+  Hoffnung. Regel: **fehlender Bericht = Block unverifiziert**, Zustand messen.
+
+### Muster, die sich in dieser Sitzung wiederholt haben
+
+| Muster | Wo |
+|---|---|
+| Ein Test, der eine Eigenschaft **behauptet, die er nicht prüft** | `removeEventListener` · `get()`-Kopie · `MAX_CONTENT_LENGTH` · `b\pm t\d+\$` · `console`-Gate |
+| Ein Messgerät, das **lügt statt zu schweigen** | 7 Überlebende in 403 · Wrapper-Restore · `&&` nach Fehlschlag · `sed` ohne Match |
+| Eine **Mutation, die keine Mutation ist** | `lastFlushAt.clear()` nach der Schleife · `text-start` außerhalb der Union |
+| Ein **grüner Lauf, der nichts beweist** | Fake deckte die *richtige* Ecke des Fehlers ab (Responses-Pfad) |
+| Ein Agent, der **sich selbst korrigiert** — die häufigste und beste Form | 6× in dieser Sitzung |
+
+
 ---
 
 ## Welle 1 — Fundament (abschließen)
