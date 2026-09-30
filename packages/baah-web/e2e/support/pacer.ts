@@ -16,6 +16,9 @@
  *     no matter how many are left. That is a *signal*, not a sleep: the test
  *     asserts what has and has not arrived, and only then decides when the rest
  *     comes.
+ * - a second, **prospective** gate. `gate` holds the **next** stream from its
+ *     very first event, which `release` structurally cannot do — see
+ *     {@link PacerCommand}.
  *
  * Only responses carrying `x-baa-e2e-stream: 1` are re-streamed; everything
  * else (the app's own assets) passes through the native `fetch` untouched.
@@ -26,6 +29,23 @@ import type { Page } from "@playwright/test";
 export type PacerCommand =
   | { readonly op: "release"; readonly count: number }
   | { readonly op: "releaseAll" }
+  /**
+   * Hold the **next** stream at zero events, from the moment it is created.
+   *
+   * `release` cannot express this, and the reason is structural rather than an
+   * oversight: it sets the budget to `last().emitted + n`, i.e. it counts from
+   * the stream that is *already* delivering. A stream that does not exist yet
+   * has no `emitted` to count from, so arming the gate before the request goes
+   * out means arming it against the previous stream's tally. That is why the
+   * page-global budget exists at all, and why the gate below is a separate,
+   * one-shot arming rather than another number on the same dial.
+   *
+   * One-shot on purpose: it is consumed by the first stream created after it, so
+   * a test can arm it *before* clicking and the request it is about to cause is
+   * the one that gets held. A later `release`/`releaseAll` cancels an arming that
+   * has not been used, so "let everything through" is always the last word.
+   */
+  | { readonly op: "gate" }
   | { readonly op: "delay"; readonly ms: number }
   | { readonly op: "errorAt"; readonly count: number }
   | { readonly op: "state" };
@@ -64,6 +84,10 @@ function installBaaE2EPacer(marker: string): void {
   let delayMs = 0;
   let errorAt: number | null = null;
   let budget: number | null = null;
+  // A budget that is armed but not yet attached to a stream. `release` cannot
+  // do this: it counts from the current record, so it can only ever gate a stream
+  // that already exists.
+  let armedBudget: number | null = null;
   let streams = 0;
   const waiters: Array<() => void> = [];
 
@@ -95,6 +119,8 @@ function installBaaE2EPacer(marker: string): void {
     if (input === null || typeof input !== "object") return state();
     if (input.op === "release") {
       errorAt = null;
+      // An explicit budget supersedes an arming that was never used.
+      armedBudget = null;
       // A budget, not a remainder: comparing it against the number of events
       // already written makes the command order-independent, so a test can arm
       // the gate before the request it is about to make.
@@ -102,8 +128,13 @@ function installBaaE2EPacer(marker: string): void {
       notify();
     } else if (input.op === "releaseAll") {
       errorAt = null;
+      armedBudget = null;
       budget = null;
       notify();
+    } else if (input.op === "gate") {
+      // Armed, not applied. The next stream created picks it up at
+      // `emitted === 0` and therefore never delivers an event.
+      armedBudget = 0;
     } else if (input.op === "delay") {
       delayMs = input.ms;
     } else if (input.op === "errorAt") {
@@ -149,6 +180,14 @@ function installBaaE2EPacer(marker: string): void {
     };
     records.push(record);
     streams += 1;
+
+    // An arming made before this request is consumed here, before `start` runs:
+    // the stream is then gated at `emitted === 0` and delivers nothing at all
+    // until a `release` says otherwise.
+    if (armedBudget !== null) {
+      budget = armedBudget;
+      armedBudget = null;
+    }
 
     const headers = new Headers(response.headers);
     headers.delete("content-length");

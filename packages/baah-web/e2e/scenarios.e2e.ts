@@ -370,55 +370,99 @@ test.describe("§15.6 — Approval-Pause und -Fortsetzung", () => {
    * The second path for the `status: "running"`-on-resume rule, and the only place
    * in the repo where the status is observed **while** a continuation is in flight.
    *
-   * The unit test pins the transition. This pins the *window*, and it gets there by
-   * a different mechanism on purpose: the continuation's requests are **aborted**, so
-   * the `fetch` never resolves and the turn is provably still running for as long as
-   * the assertion takes. (`{ kind: "abort" }` is the harness's transport failure; the
-   * alternative — holding a stream open with the pacer — cannot gate the *second*
-   * request alone, because the pacer's budget is page-global and is counted against
-   * the previous stream.)
+   * The unit test pins the transition. This pins the *window*.
    *
-   * A runtime that published `running` for one tick and `idle` afterwards would
-   * satisfy the unit test and leave the status bar lying for the whole continuation,
-   * which is the part a user is looking at.
+   * ## The window is a state, not a duration
+   *
+   * The previous version of this test scripted the continuation's requests as
+   * `{ kind: "abort" }` and commented that "the classification of an aborted
+   * request is retryable" — so the turn would stay in flight across several
+   * attempts. **That comment was false, and the test was flaky because of it.**
+   * `route.abort` makes `fetch` reject *without a response*, which classifies as
+   * `no-response`, and `isRetryable` (`packages/baah-core/src/agent/loop.ts`)
+   * answers `no-response` with `false` — a transport abort is never retried. The
+   * turn therefore ended after attempt 1 of 3, within milliseconds of the click,
+   * and the assertion below (`toHaveCount(0)`, i.e. "the turn has not finished
+   * yet") was a race against a window of a few milliseconds. It failed 4 runs in
+   * 8.
+   *
+   * Worth being exact about *why* the old comment was wrong, because the code does
+   * not say what the comment claimed. `isRetryable` has `success`, `no-response`
+   * and `config-error` falling through to a single `return false`, and the
+   * justification written into that group is about its **config** member —
+   * "§5.4's rule for `invalid_api_key` … 'Key ist falsch, nicht kaputt'". It says
+   * nothing about `no-response`. So the test's claim was not a rule the engine
+   * contradicted; it was a rule that was never there, and the code is
+   * unambiguous: an abort is not retried.
+   *
+   * Making the machine slower would have made that test *pass*, which is why it
+   * is not a flake to be re-run: a test that arranges for a claim to look true is
+   * not a test of the claim. The window has to be a **state the test creates**.
+   *
+   * So the continuation's response is delivered and then **held open** by the
+   * pacer (`support/pacer.ts`): `route.fulfill` hands the page the real bytes, and
+   * the pacer re-delivers them through a `ReadableStream` one SSE event at a time.
+   * `pacer.command({ op: "gate" })` holds the **next** stream at zero events, so
+   * the response the SDK is reading has arrived and is delivering nothing — the
+   * turn is mid-request, and no amount of machine speed ends it.
+   *
+   * `gate` is a separate op rather than a `release` count because `release` sets
+   * its budget from `last().emitted`: it can only gate a stream that already
+   * exists, so it cannot address the *second* request of a turn. The old comment
+   * said the pacer "cannot gate the second request alone" — true of `release`,
+   * not of the pacer.
    */
   test("the status bar says the turn is running while the continuation is in flight", async ({
     app,
     provider,
+    pacer,
   }) => {
     const toolCallId = "call_env_running";
     await provider.script([
       { reply: { kind: "sse", turn: chatToolCallTurn({ toolCallId, toolName: "read", input: { path: ".env" } }) } },
-      // Every continuation request dies at the transport. The engine classifies that
-      // as retryable and backs off, so the turn stays in flight across several
-      // attempts — which is the window under test.
-      ...Array.from({ length: 6 }, () => ({
-        path: CHAT_COMPLETIONS_PATH,
-        reply: { kind: "abort" as const, errorCode: "failed" },
-      })),
+      { reply: { kind: "sse", turn: chatTextTurn("Die Konfiguration habe ich nicht gelesen.") } },
     ]);
     await openConfiguredApp(app);
     await sendPrompt(app, PROMPT);
 
     const card = app.locator(`[data-testid="${TEST_IDS.approvalCard}"]`);
     await expect(card).toBeVisible();
-    // Parked: nothing is running, and the card is what waits.
+    // Parked: nothing is running, and the card is what waits. The contrast with
+    // what follows is the point of the test — same badge, one click apart.
     await expect(app.locator(`[data-testid="${TEST_IDS.turnStatus}"][data-baah-status="idle"]`)).toBeVisible();
 
+    // Armed **before** the click, so the stream the click causes is the gated one.
+    await pacer.command({ op: "gate" });
     await card.locator(`[data-testid="${TEST_IDS.approvalAllow}"]`).click();
 
-    // The continuation's first request went out. A poll, not a sleep: the assertion
-    // cannot pass before the request exists.
-    await expect.poll(() => provider.countFor(CHAT_COMPLETIONS_PATH), { timeout: 10_000 }).toBeGreaterThan(1);
-    // And the badge says the turn is running. **This is the mutation "publish `idle`
-    // on the resume".**
+    // The continuation's request went out — a poll, not a sleep: the assertion
+    // below cannot pass before the request exists.
+    await expect.poll(() => provider.countFor(CHAT_COMPLETIONS_PATH)).toBe(2);
+    /**
+     * …and the pacer is holding that response open. This is the load-bearing
+     * wait, and it is what the abort version lacked: `gated` is a fact about the
+     * stream, not a hope about how long a turn lasts, so the two assertions
+     * after it are made against a window that is open by construction.
+     */
+    await expect.poll(async () => (await pacer.state()).gated).toBe(true);
+
+    // And the badge says the turn is running. **This is the mutation "publish
+    // `idle` on the resume".** A runtime that published `idle` for one tick and
+    // `running` afterwards would still satisfy the unit test, and would leave the
+    // status bar lying for the whole continuation — the part a user is looking at.
     await expect(
       app.locator(`[data-testid="${TEST_IDS.turnStatus}"][data-baah-status="running"]`),
     ).toBeVisible();
-    // The turn is still in flight, not finished-with-an-error: the classification of
-    // an aborted request is retryable, and `Plan.md` §5.4's own rule is that a turn
-    // which has not run out of attempts is still running.
+    // The turn is in flight, not finished-with-an-error. The badge renders one
+    // span for one status, so "no `idle` element" is the same fact as
+    // "`running` is on screen" — stated separately so the failure names which of
+    // the two the runtime lost.
     await expect(app.locator(`[data-testid="${TEST_IDS.turnStatus}"][data-baah-status="idle"]`)).toHaveCount(0);
+
+    // Open the gate. The turn is finished with the part under test, and the
+    // continuation is left able to complete rather than hanging on a stream the
+    // test will never look at again.
+    await pacer.command({ op: "releaseAll" });
   });
 
   test("a read of a non-secret path never asks", async ({ app, provider }) => {

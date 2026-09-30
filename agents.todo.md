@@ -1190,6 +1190,63 @@ nicht**, und Layout-Überlagerung war hier der teurere Defekt.
       streichen und die Aussage auf drei reduzieren. Ein Prüfziel, das es nicht gibt,
       wäre ein **grüner K2 über eine Lücke**.
 
+### Der Absturz, jagdbar gemacht — und was **nicht** die Ursache ist
+
+Der Jäger-Report. Reproduktion **nicht** gelungen: **0 von 440** Testausführungen in
+10 Suite-Läufen, `oom_kill` über alle Läufe **unbewegt bei 3**. Also: selten, und nicht
+erzwungen — mit Recht, denn ein absichtliches OOM trifft hier `mariadbd`.
+
+**Der Absturz ist derzeit eine Hypothese mit gutem Bogen, kein Befund.** Der fehlende
+Link ist genau einer, und er ist markiert: `oom_kill` blieb in allen 440 Läufen stehen.
+
+**Die Diskriminator-Zeile, die ich selbst benutzen kann:**
+
+```bash
+cat /sys/fs/cgroup/memory.events   # VOR und NACH dem Lauf
+```
+
+Bewegt sich `oom_kill` → Kernel, also Host. Bleibt es stehen → der Renderer ist von
+allein gestorben, dann ist es ein Chromium-Bug und der nächste Schritt wäre
+`channel: "chromium"` statt der alten, eingefrorenen `chrome-headless-shell` 153.0.8010.12.
+
+**Und die Korrektur an meiner Lücke:** „beide Abstürze beim DB-Boot" war **nur für Test
+18** richtig. Für Test 32 zeigt der Seitenzustand **keinen** Boot-Screen, sondern eine
+laufende Workbench im **dritten** Provider-Versuch. **Das ist ein zweiter Codepfad**, und
+er schwächt jede rein boot-spezifische Erklärung. Ich habe die Prämisse zu früh
+verallgemeinert.
+
+#### Die drei Ausschlüsse — eine Landkarte dessen, was es **nicht** ist
+
+Jeder gemessen, keiner behauptet. Das ist der wertvollste Teil des Reports, weil eine
+Ausschlussliste billiger ist als eine Wiederholung:
+
+- **OPFS-VFS-Eigentum — nicht der Pfad.** Der Fehlerfall wäre **sichtbar**
+  (`database_owned_by_another_context` → `baah-boot-failure`, und `waitForApp` prüft
+  das auf 0). Kein Report zeigt einen. Strukturell kann er bei `workers: 1` nicht feuern.
+- **WASM/Speicher — nicht der Pfad.** Footprint nach vollem Boot, **30 frische Contexts,
+  jedes Mal identisch**: `6 Dateien, 450560 Bytes = 1× 430080 (SQLite) + 5× 4096 (leere
+  Pool-Slots)`. `initialCapacity: 6`, die App nutzt **1** Slot. Kein Wachstum, kein
+  `journal_mode=WAL`. **Es gibt nichts, das wachsen und den Renderer töten könnte.**
+- **Worker-Lebenszyklus — nicht der Pfad.** Chromium-Prozesse über einen 44-Test-Lauf:
+  `6 → 11/12 während eines Tests → 6 am Ende`. RSS oszilliert **ohne Trend**.
+- **`/dev/shm` ist 64 MB — aber irrelevant**, weil Playwright 1.63
+  `--disable-dev-shm-usage` **selbst** setzt (an der Launch-Zeile gemessen), `shmem` = 0.
+  Diese Hypothese ist **tot**, und zwar nachweislich.
+
+#### Und die libc-Hypothese ist **ausgeschlossen**, mit Beleg
+
+`/var/log/dpkg.log` ist lesbar. `install-deps` lief 14:02:52–14:05:57. `libc-bin` wurde
+**neu entpackt, nicht angehoben** (`trigproc`, kein `upgrade`-Eintrag) — und `libc-bin`
+enthält **nur Werkzeuge** (`ldd`, `getent`, `locale`), **nicht `libc.so.6`**. `libc6` hat
+ctime 2026-09-19, ist heute unberührt. Von den 14 heutigen `upgrade`-Zeilen (`libssl3`,
+`openssl`, 12× `php8.5-*`) ist **keine** in Chromiums Link-Set.
+
+**Was wirklich neu ist:** 24 der 53 Libraries, die `chrome-headless-shell` lädt, wurden
+heute **neu angelegt** — die waren weg. **Was nicht trennbar ist:** Browser-Binary **und**
+24 seiner Bibliotheken wurden im selben Fenster ersetzt, und `dpkg.log` protokolliert nur
+den heutigen Tag. Für den 44/44-Lauf davor gibt es **keinen Zustandsnachweis**. Also:
+libc ausgeschlossen, der Rest **nicht** — und das ist eine ehrliche Grenze, keine Ausrede.
+
 ### ENV4 — der zweite Fehlermodus, und der **maskiert sich**
 
 Nach `playwright install chromium` war die Binary da (197 MB) — und der Lauf **immer
@@ -1284,12 +1341,50 @@ dieser Maschine**" abgeleitet war und der in CI an einem **schnelleren** Runner 
 wurde. Beide sind **Tests, die den Host messen.** Und die Warnung gilt für **beide**
 Richtungen: der `grep`-Test wurde nicht langsamer, er wurde schneller.
 
-- [ ] **PP1 — `workers` in `e2e/playwright.config.ts` bleibt `1`, bis kein E2E-Test mehr
-      vom CPU-Anteil abhängt.** Nicht `2` als Kompromiss: **ein intermittierend rotes CI
-      ist schlimmer als ein langsames.** Ein ungeschütztes `main`, dessen CI ab und zu
-      rot ist, lehrt alle, rot zu ignorieren. Das ist der Grund, und er ist der ganze
-      Grund.
-      **Hochgesetzt wird gemeinsam mit der Behebung**, nicht vorher.
+- [ ] ~~**PP1 — `workers` bleibt `1`**~~ **ZURÜCKGENOMMEN am selben Tag.**
+      Beide Gründe sind gemessen, keiner ist eine Vermutung.
+
+      **Grund 1 — es ist Speicher, nicht CPU.** `/sys/fs/cgroup/` ist **ohne sudo**
+      lesbar, und dort steht, was `dmesg` nicht hergab:
+
+      ```text
+      memory.max     5368709120   (5120 MB)
+      memory.peak    5369569280   <- ÜBER memory.max
+      memory.events  max 67752  oom 3  oom_kill 3
+      ```
+
+      **Der OOM-Killer hat in diesem Container 3× gefeuert**, und ein voller Lauf
+      bringt `memory.current` auf **5118 von 5120 MB** — **2 MB unter der Decke**.
+      Nach `oom_score` sortiert ist `chrome:renderer` mit `adj+300` der **höchste Kill-
+      Kandidat des ganzen Hosts** (Chromium setzt `oom_score_adj` absichtlich hoch, um
+      geopfert zu werden), `chrome:browser` überlebt mit `adj 0`.
+      → **Renderer stirbt, Browserprozess lebt = genau Playwrights `Page crashed`.**
+      Und **deshalb kann `workers: 1` nichts ändern**: Speicher ist kein CPU-Kontention-
+      Phänomen. Meine Flake-Tabelle ist damit als Begründung **wertlos**, auch wenn die
+      Zahlen echt sind.
+
+      **Grund 2 — der eine Flake, den man *kann*, wird auf langsameren Maschinen
+      ZUVERLÄSSIGER.** `scenarios.e2e.ts:385`, 4 von 8 Läufen, vollständig diagnostiziert
+      und von **mir nachgelesen**, nicht übernommen:
+      - `loop.ts:2559`: `case "no-response": return false;`
+      - Der Testkommentar (`scenarios.e2e.ts:418`) sagt: *„the classification of an
+        aborted request **is retryable**"*.
+      **Das ist falsch.** `route.abort("failed")` ⇒ Fetch lehnt **ohne Antwort** ab ⇒
+      `no-response` ⇒ `isRetryable` = `false` ⇒ der Turn endet nach **Versuch 1 von 3**.
+      Das Artefakt zeigt genau das („bereit", „Versuch 1 von 3").
+      Die Assertion `data-baah-status="idle"` hat `toHaveCount(0)` — sie prüft also, dass
+      der Turn **noch läuft**. Das Fenster dafür sind **Millisekunden** zwischen dem Klick
+      und der Klassifizierung des Abbruchs.
+      → **Für diesen Test ist „Last reduzieren" die falsche Richtung: langsamer macht
+      ihn grüner.** Ein Test, der dafür sorgt, dass eine Behauptung wahr aussieht, ist
+      kein Test, der sie prüft.
+      ⚠️ Das ist ein **Testentwurfsfehler, kein Hostproblem** — und er ist der
+      **billigere Hebel** als der Absturz.
+
+      **Was aus `PP1` wird:** `workers: 1` bleibt vorerst stehen, aber **nicht aus dem
+      genannten Grund**. Sobald der Speicher unter der Decke liegt und `scenarios.e2e.ts:385`
+      ehrlich ist, entscheiden wir neu — und **nicht** nach dem Gesicht des `workers`-Werts,
+      sondern nach `memory.current`.
 
 - [ ] **PP2 — die Parallele kommt dorthin, wo die Arbeit reihenfolgeunabhängig ist:**
       die **Screenshot-Suite** nimmt `process.env.CI ? 4 : 2`. Sie fotografiert Pixel und
@@ -1405,6 +1500,164 @@ Suite **sieht aus wie ein Produktdefekt**. Dritte Instanz derselben Klasse wie H
 - [ ] **ENV3 — und dieselbe Prüfung für die Screenshot-Suite**, sonst gilt dasselbe:
       118 PNGs aus einer Suite, deren Browser fehlt, wären **118 leere oder
       halb gerenderte Bilder** — und der Harness meldet „passed".
+
+---
+
+## Der vorgeschlagene Speicherhebel ist **widerlegt** — von mir selbst gemessen
+
+Der Crash-Jäger hatte aus einer **richtigen** Messung eine **falsche** Schlussfolgerung
+gezogen: Chromium-Peak-RSS **1189 MB** mit `trace`+`video` gegen **657 MB** ohne, also
+„schalte die Aufzeichnung ab". Die Zahlen stimmen. Die Kette stimmt **an der Stelle
+nicht, an der es zählt.**
+
+**Mein Paar-Lauf, gleiche Suite, nur die Aufzeichnung verschieden:**
+
+| Lauf | Ergebnis | `memory.current` Peak | Anteil an 5120 MB |
+|---|---|---|---|
+| A: `--trace=off` | **44 passed**, rc=0 | 5368655872 | **99,999 %** |
+| B: wie konfiguriert | **44 passed**, rc=0 | 5364957184 | 99,93 % |
+| `oom_kill` vorher → nachher | — | **3 → 3** | **kein Kill** |
+
+Der Unterschied ist **3,7 MB = 0,07 %.** **Trace-Aufzeichnung abzuschalten kauft auf
+diesem Host keinen einzigen KB Luft.** Die Empfehlung ist **nicht** umgesetzt worden und
+**darf nicht** umgesetzt werden.
+
+### Warum die Schlussfolgerung kippte — die Regel ist das eigentliche Ergebnis
+
+> **Ein Komponenten-Peak sagt nichts darüber, ob eine Grenze überschritten wird.**
+
+Die Grenze ist nicht „wie viel braucht Chromium", sondern **wie viel ist insgesamt da** —
+und das sind laut Messung **3,1–3,5 GB Page-Cache**, 0,9–1,6 GB `anon`, 0,4 GB Kernel,
+plus `opencode`, `codegraph` und die `node`-Prozesse. **532 MB aus einem 5120-MB-Budget
+zu streichen, während der Rest bereits ~4,5 GB belegt, ist eine Rundung.**
+
+Das ist verzeihbar, weil die Komponentenmessung die *greifbare* ist — sie hat eine Zahl
+für das Ding, das man ändern wollte. **Die Gesamtmessung hat eine Zahl für das Ding, das
+tatsächlich begrenzt.** Und sie ist genauso billig: `cat /sys/fs/cgroup/memory.current` in
+einer Schleife.
+
+- [ ] **ENV6 — bei jedem Speicherproblem **beides** messen, nie nur eines:**
+      ```bash
+      sort -n /tmp/opencode/p.txt | tail -1   # Peak von memory.current
+      cat /sys/fs/cgroup/memory.events         # oom_kill, VOR und NACH
+      ```
+      **Und die Reihenfolge ist Teil der Regel:** erst der **Gesamtpeak** gegen
+      `memory.max`, dann die Aufteilung. Wer mit der Aufteilung beginnt,optimiert das
+      Falsche — und zwar mit einer Zahl, die **stimmt**.
+
+- [ ] **ENV7 — `trace: "retain-on-failure"` bleibt, unverändert.** Zur Klarstellung, weil
+      es leicht für einen Fehler gehalten wird: `retain-on-failure` **zahlt die
+      Aufzeichnungskosten auf jedem Test** und verwirft erst danach. Der Preis ist also
+      **immer** da, nicht nur bei Fehlschlägen. Das ist der Grund, warum der Hebel
+      überhaupt nahelag — und der Grund, warum er trotzdem **nichts** bringt.
+
+- [ ] **ENV8 — und der Zustand, in dem wir gerade sind, ist besser als er klingt:**
+      **zwei Läufe in Folge 44/44, `oom_kill` unbewegt.** Der Absturz ist selten. Die
+      Erklärung „Kernel opfert den Renderer" bleibt die beste, ist aber **unbeobachtet** —
+      in **440** Testausführungen hat sich `oom_kill` **kein einziges Mal** bewegt. Also:
+      **plausibel, nicht bewiesen**, und die Diskriminator-Zeile ist weiterhin
+      `oom_kill` vor und nach dem Lauf.
+
+- [ ] **ENV9 — Zwei Zahlen, die nur dieser Host trägt, und die deshalb NICHT in
+      `AGENTS.md` gehören** (`Agents.headless.md` §Grundsätze: „Zahlen und Messungen nie
+      hierher übernehmen"): `memory.max` 5120 MB, 3× `oom_kill` in dieser Sitzung.
+      Was **allgemein** ist und deshalb in `AGENTS.md` darf, steht als **Regel** dort:
+      *Ein projektweises Speicherlimit macht eine grüne Suite zur Zufallsaussage über
+      den Host.* Keine Zahl, nur die Aussage, die die Zahl trägt.
+
+---
+
+## `scenarios.e2e.ts:385` — behoben, und meine Diagnose war **unvollständig**
+
+Der Flake (4 von 8 Läufen) hatte eine falsche **Prämisse im Kommentar**. Erster Befund von
+mir: der Test behauptete „retryable", der Code sage `false`. **Das war unvollständig, und
+der Build-Agent hat mich korrigiert** — nachgelesen, nicht übernommen:
+
+```ts
+case "success":
+case "no-response":
+// A local configuration error. Repeating a request that was never
+// configured produces the identical error; §5.4's rule for `invalid_api_key`
+// — "Key ist falsch, nicht kaputt" — applies verbatim.
+case "config-error":
+  return false;
+```
+
+Der Kommentar steht **zwischen** `no-response` und `config-error` und sagt *„A local
+configuration error"* — er gehört zu `config-error`. **Es gibt keine §5.4-Regel über
+`no-response`.**
+
+> **Mein Brief stellte es dar, als widerspreche der Code einer vorhandenen Regel. Es
+> widersprach keiner — die Regel war nie da.** Der Test war gegen ein **erfundenes**
+> Verhalten geschrieben.
+>
+> Das ist die **stärkere** Diagnose, und ich hatte die schwächere: „der Test ist falsch"
+> hätte man mit einer Codeänderung beantworten können. „der Test prüft eine Regel, die es
+> nicht gibt" heißt: **der Test prüft nichts**, und es gibt keinen Fix am Code.
+
+### Die Behebung: das Fenster wird **hergestellt**, nicht **erwartet**
+
+- `e2e/support/pacer.ts`: ein neues Op `{ op: "gate" }` — armt ein einmaliges Budget von
+  0 für den **nächsten** Stream. Nötig, weil `release` sein Budget aus `last().emitted`
+  bildet und deshalb nur einen **bereits existierenden** Stream gaten kann.
+  ⚠️ **Und damit ist eine Behauptung aus meinem Auftrag widerlegt:** ich hatte geschrieben,
+  „der Pacer kann die zweite Anfrage nicht allein gaten". Für `release` war das **wahr**,
+  für den Pacer **falsch**.
+- `e2e/scenarios.e2e.ts:369-462`: die Fortsetzung wird mit `gate` **offengehalten**, und
+  `await expect.poll(async () => (await pacer.state()).gated).toBe(true)` ist die
+  **Tatsache**, mit der das Fenster entsteht — **bevor** die Status-Assertions laufen.
+
+**Warum das die richtige Richtung war und nicht „langsamer machen":** Das Fenster war
+Millisekunden groß und hing an der Maschinengeschwindigkeit. Jetzt ist es ein **Zustand**,
+den der Test **selbst herstellt** und **selbst prüft**, bevor er die eigentliche Behauptung
+prüft. **Ein Test, der sein eigenes Fenster baut, ist auf anderen Rechnern genauso
+zuverlässig wie auf diesem.**
+
+- [ ] **T1 — das Annahmekriterium, und es ist die Mutation.** Der Test muss an
+      *„beim Fortsetzen `idle` publizieren"* sterben. Gemessen, zwei Varianten:
+      | Mutation | Ergebnis |
+      |---|---|
+      | `publish({status:"idle"})` beim Fortsetzen | **rot**, `element(s) not found` (Z. 447) |
+      | `running` **für einen Tick**, dann `idle` | **rot**, dieselbe Assertion |
+
+      **Und das Detail, das die Mutation glaubwürdig macht:** in **beiden** Läufen waren die
+      beiden Vorbedingungs-Waits (`countFor === 2`, `gated === true`) **bereits grün**. Er
+      stirbt also an der **Statusbehauptung** und nicht an einem Timeout. *Ein Test, der an
+      seiner Vorbedingung stirbt, prüft die Vorbedingung.*
+- [ ] **T2 — Läufe: 16× grün, 2× an der Mutation korrekt rot.** 5× isoliert
+      (2,5–3,1 s), 6× volle Suite (44/44). Der alte Test hatte **10 s** Polling-Budget für
+      eine Behauptung über **Millisekunden**; der neue braucht **2,4 s** stabil.
+- [ ] **T3 — `gate` ist additiv.** Die anderen Pacer-Aufrufer nutzen nachweislich nur
+      `delay`/`release`/`releaseAll`/`errorAt` (grep). `harness-self-test.e2e.ts` lag in
+      allen 6 vollen Läufen grün — **gemessen**, nicht argumentiert.
+
+### Und eine **Methode**, die ich übernehme
+
+Der Agent musste einen roten Screenshot-Test einordnen, der **nicht seiner** war
+(`screenshot chat-todo (filled, mobile)`, und `manifest.ts:544` wartet auf ein
+Sidebar-Element im **mobile**-Viewport — also exakt das `viewport.ts`/`sidebarOpen`-Thema
+des **parallelen** U1-Agenten).
+
+Er hat nicht behauptet, dass er nicht schuld ist. Er hat es **bewiesen**:
+
+> **Mit seinen beiden Dateien per `git stash` aus dem Baum reproduziert der Fehler
+> weiterhin.**
+
+→ **FREMDURSACHE-BEWEIS (Methode, ab hier verbindlich):** Wer einen Fehler **nicht**
+verursacht zu haben glaubt, **belegt** es, indem er seine eigenen Änderungen
+**entfernt** und der Fehler **weiterhin** auftritt. „Ich war's nicht" ist eine Behauptung,
+„der Fehler ist ohne meine Änderungen derselbe" ist ein **Experiment**. Beides klingt nach
+Verantwortungsfreiheit, aber nur eines ist eine Aussage.
+
+- [ ] **T4 — und die Umkehrung, die derselbe Report liefert:** `tsc --noEmit` war
+      **zwischenzeitlich rot** (3 → 1 Fehler) — der parallele U1-Agent hat den Baum
+      angefasst. Der Test-Fix-Agent hat **gewartet**, bis `tsc` sauber war, und danach
+      **nochmal** 5× isoliert plus 1× volle Suite gefahren. Das ist `H1` in der Praxis:
+      **ein Lauf, während ein Agent schreibt, ist keine Messung.**
+      ⚠️ **Und die Einschränkung, die er selbst genannt hat und die bleiben muss:** er
+      kann **nicht** sagen, dass jeder seiner Läufe denselben Baumstand hatte. Das ist
+      eine Lücke, die er nicht schließen konnte, und er hat sie **benannt** statt sie zu
+      übergehen.
 
 ---
 
