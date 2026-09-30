@@ -450,22 +450,77 @@ describe("the scanner honours the wall clock", () => {
     expect(result.note).toMatch(/Matching stopped after 1 ms/);
   });
 
-  it("a scan stopped by the budget keeps the matches it really found", async () => {
-    // The partial list is the point. 20 000 lines through `\w+\s*=\s*\w+;?$`
-    // costs ~14 ms on this machine; a 5 ms budget has to cut it somewhere in
-    // the middle. Dropping the partial list would be lossier than the bound
-    // requires, and reporting it as *all* the matches would be the lie.
-    const ctx = context({ "big.ts": "const alpha = 1; const beta = 2;\n".repeat(20_000) });
-    const result = await executeGrep(ctx, { pattern: "\\w+\\s*=\\s*\\w+;?$" }, { timeoutMs: 5 });
+  it("a scan stopped by the budget keeps the matches it really found", () => {
+    // The partial list is the point, and the budget has to expire at a CHOSEN
+    // line rather than at whichever one this machine reaches in 5 ms.
+    //
+    // The first version derived its expectation from wall-clock timing: "20 000
+    // lines cost ~14 ms on this machine, so 5 ms cuts it in the middle". It
+    // passed four local runs and failed in CI. Not because the scanner changed
+    // - because the runner got through all 20 000 lines INSIDE the budget, so
+    // searchTruncated was false and the assertion below broke. The failure mode
+    // is speed, in both directions, and neither one is about the code under
+    // test. Second time in this project that a measurement tool lied instead of
+    // staying silent.
+    // FOUR lines, not five, and the off-by-one is the behaviour rather than a
+    // slip: `startedAt` consumes the clock's first reading, and every line reads
+    // the clock BEFORE it is processed. So a 5 ms budget spent at 1 ms per line
+    // trips on the check that precedes the fifth line, and that fifth line is
+    // never scanned. Processing it anyway would be spending the budget and then
+    // buying work with it. Do not "fix" this to five.
+    const CUT_AFTER_LINES = 4;
+    const content = "const alpha = 1; const beta = 2;\n".repeat(2_000);
+    let tick = 0;
+    const result = searchWithRegExp({
+      files: [{ path: "big.ts", content }],
+      pattern: "\\w+\\s*=\\s*\\w+;?$",
+      caseSensitive: true,
+      timeoutMs: 5,
+      now: () => tick++,
+    });
 
-    expect(result.searchTruncated).toBe(true);
-    expect(result.total).toBeGreaterThan(0);
-    expect(result.total).toBeLessThan(20_000);
+    expect(result.truncated).toBe(true);
+    expect(result.stoppedBy).toBe("timeout");
+    // Exactly the lines before the cut, no more: a prefix, not "all of them".
+    expect(result.matches).toHaveLength(CUT_AFTER_LINES);
     expect(result.matches[0]).toEqual({
       path: "big.ts",
       line: 1,
       text: "const alpha = 1; const beta = 2;",
     });
+  });
+
+  it("the budget expires on a chosen line, whatever the host's speed", () => {
+    // The property the test above used to assume. Same input, clocks with
+    // wildly different step sizes, one answer.
+    const content = "const alpha = 1;\n".repeat(200);
+    const run = (step: number) => {
+      let tick = 0;
+      return searchWithRegExp({
+        files: [{ path: "a.ts", content }],
+        pattern: "const",
+        caseSensitive: true,
+        timeoutMs: 5,
+        now: () => tick++ * step,
+      });
+    };
+
+    // 1 ms per line against a 5 ms budget: the check preceding the fifth line
+    // trips, so four lines are scanned. Same off-by-one as above, and the same
+    // reason - a future reader will try to "fix" this to five.
+    const oneMs = run(1); // 4 lines
+    const tenMs = run(10); // 0 lines - the budget is gone before the first
+    const never = run(0); // the clock does not move, so the budget is never spent
+
+    expect(oneMs.truncated).toBe(true);
+    expect(oneMs.matches).toHaveLength(4);
+    expect(tenMs.truncated).toBe(true);
+    expect(tenMs.matches).toHaveLength(0);
+    // A clock that stands still is a fact about the INPUT, not a bug: the scan
+    // finishes, and it says so instead of claiming a truncation that did not
+    // happen. This is the same lie grep spent a whole block removing.
+    expect(never.truncated).toBe(false);
+    expect(never.matches).toHaveLength(200);
   });
 
   it("a catastrophic pattern on many lines is cut between lines", async () => {

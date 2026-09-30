@@ -212,6 +212,16 @@ export interface RegExpSearchInput {
   signal?: AbortSignal;
   /** Wall-clock bound for the whole scan. Defaults to `SEARCH_TIMEOUT_MS`. */
   timeoutMs?: number;
+  /**
+   * The clock, injected so a test can make the budget expire at a chosen line
+   * instead of hoping the machine is slow enough. Defaults to `Date.now`.
+   *
+   * This is not test-only scaffolding: it is the difference between a test that
+   * pins a behaviour and a test that measures the host. A `timeoutMs: 5` budget
+   * over 20 000 lines whose cost is quoted from one machine passes on a slower
+   * runner and fails on a faster one, and neither failure is about the scanner.
+   */
+  now?: () => number;
 }
 
 export interface RegExpSearchResult {
@@ -242,7 +252,13 @@ export function searchWithRegExp(input: RegExpSearchInput): RegExpSearchResult {
   const regex = buildRegExp(input.pattern, input.caseSensitive);
   const timeoutMs = Math.max(0, input.timeoutMs ?? SEARCH_TIMEOUT_MS);
   const signal = input.signal;
-  const startedAt = Date.now();
+  // Injected, and not optional-only-by-accident: the budget has to be testable
+  // without racing a real clock. The same seam exists twice already in this repo
+  // - the engine injects `now` for DELTA_FLUSH_INTERVAL_MS, the storage adapter
+  // for TurnStoreOptions.now - and the third site is this one, because a test
+  // that derives its expectation from how fast the machine is tests the machine.
+  const clock = input.now ?? Date.now;
+  const startedAt = clock();
   const matches: GrepMatch[] = [];
 
   for (const file of input.files) {
@@ -251,7 +267,7 @@ export function searchWithRegExp(input: RegExpSearchInput): RegExpSearchResult {
       if (signal !== undefined && signal.aborted) {
         return { matches, truncated: true, stoppedBy: "abort" };
       }
-      if (Date.now() - startedAt >= timeoutMs) {
+      if (clock() - startedAt >= timeoutMs) {
         return { matches, truncated: true, stoppedBy: "timeout" };
       }
       const line = lines[index];
