@@ -8,6 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "e2e": "playwright test --config ../../playwright.config.ts",
+    "test:screenshots": "playwright test --config ../../playwright.screenshots.config.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests"
   },

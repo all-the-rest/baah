@@ -857,6 +857,557 @@ grüner Test schließt sie.
 
 ---
 
+## Zwei Defekte in der E2E-Harness, gefunden an einem 404
+
+Aus einem Lauf mit `workers: 2`: **42 passed, 2 failed**, und die zwei Fehler waren
+`GET / is served → Expected 200, Received 404` plus ein folgender Locator-nicht-gefunden.
+Das sah zuerst nach einem Worker-Problem aus (zwei Tests parallel, eins davon
+`the app boots … and logs nothing`). **Es war keins.** Beim Nachmessen:
+
+```
+$ grep '"build"' packages/baah-web/package.json
+  build   tsc --noEmit && vite build        ← die Kopplung
+$ grep -n reuseExistingServer …/playwright.config.ts
+  reuseExistingServer: !process.env.CI      ← und die zweite
+```
+
+- [ ] **H1 — `tsc --noEmit` in der E2E-`build` koppelt fremde Typfehler an den App-Test.**
+      ### BEWIESEN, nicht vermutet — die Kette, gemessen
+      ```      packages/baah-web/package.json
+      "build": "tsc --noEmit && vite build"
+      ```
+      ```      $ pnpm exec tsc --noEmit
+      e2e/screenshots/manifest.ts(267,25): error TS2552: Cannot find name 'window0'. Did you mean 'window'?
+      ```
+      **Ein Tippfehler** — `window0` statt `window` — in einem **Screenshot-Manifest**.
+      Folge: `tsc` ≠ 0 → `&&` bricht ab → `vite build` läuft **nie** → `&& preview` auch
+      nicht → **die gesamte E2E-Suite startet nicht.**
+
+      Und die Datei hat mit der **App** nichts zu tun. Sie gehört zu einem anderen
+      Werkzeug. Trotzdem ist sie die Ursache dafür, dass die App **nicht getestet**
+      werden kann.
+
+      **Das eigentliche Übel ist nicht der Kopplungsfehler, sondern die
+      Umbenennung auf dem Weg nach außen.** Ein Fehler erscheint als **drei verschiedene**
+      Dinge, und keines davon sagt die Wahrheit:
+      1. `TS2552: Cannot find name 'window0'` — echte Ursache, falsche Datei im Blick
+      2. `[WebServer] Command failed with exit code 1` — der Server kam nicht hoch
+      3. im Lauf davor: `GET / → Expected 200, Received 404` plus Locator-nicht-gefunden
+      Das liest sich wie **Produktdefekt**. Es ist **Umgebungsdefekt**.
+      *„Die App ist kaputt" und „dein Testlauf hatte eine kaputte Umgebung" sind zwei
+      verschiedene Befunde, und ein Harness, der den ersten meldet, ist schlimmer als
+      keiner — weil man ihn debuggt.*
+
+      **Kostennachweis, nicht Theorie:** H1 hat mich genau **eine** Messung gekostet. Der
+      gezielte Serienlauf (3×, `the cut is observable`) kam nicht an, weil der
+      Screenshot-Agent in derselben Sekunde `manifest.ts` anfasste. Ohne H1 hätte ich
+      die Frage beantwortet.
+      **Konsequenz für die Orchestrierung:** Solange ein Build-Agent Dateien unter
+      `baah-web/` anfasst, ist **kein** E2E-Lauf dieses Repos eine gültige Messung.
+      Das ist eine Regel, keine Warnung.
+      `build` ist `tsc --noEmit && vite build`, und `tsc` prüft **alles** unter
+      `baah-web` — auch `e2e/screenshots/playwright.config.ts`, also eine Datei, die
+      mit der App **überhaupt nichts** zu tun hat. Ein Tippfehler dort hätte
+      `vite build` **nie** laufen lassen. Ein Tippfehler in einer *Screenshot-Config*
+      darf nicht bewirken, dass die *App* defekt aussieht.
+      **Auftrennung:** der Build der App und der Typcheck der E2E-Harness sind zwei
+      Schritte. Oder, ehrlicher: `vite build` ohne `tsc` (Typecheck ist `quality`-
+      Sache) und die Harness-Configs in ein eigenes `tsconfig`.
+
+- [ ] **H2 — `reuseExistingServer: true` lokal lässt einen *veralteten* Server die ganze
+      Suite bedienen, und die Suite meldet das als *Produktfehler*.**
+      Das ist die Fehlerklasse, die in dieser Sitzung schon sechsmal aufgetaucht ist:
+      **eine Messung, die die falsche Sache meldet.** Ein Server, der eine kaputte
+      `dist/` ausliefert, erzeugt `GET / → 404` — und der Test sagt „die App ist
+      kaputt", während die Wahrheit „dein Testlauf hatte eine veraltete Umgebung"
+      lautet. Ein Testlauf darf nie eine Umgebung als Produktfehler ausgeben.
+      **Entscheidung offen:** gar kein `reuseExistingServer` (jeder Lauf baut selbst,
+      kostet aber die Zeit), oder — besser — **vor** dem Start prüfen, ob der vorhandene
+      Server die *aktuelle* `dist/` ausliefert, und ihn sonst verwerfen.
+
+**Was ich ausdrücklich NICHT behaupte:** welcher der beiden Wege die 404 verursacht
+hat. Beide Kandidaten sind gemessen *vorhanden*, die Verursachung ist es nicht — sie
+wäre in dem Moment zu prüfen gewesen, und ich habe stattdessen die Suite zweimal
+laufen lassen. Aus einem grünen zweiten Lauf folgt **nicht**, dass der erste Lauf
+derselbe Fehler war.
+
+## Kontrastprüfung — neuer Block, vom Nutzer gefordert
+
+„Auch für die Screenshot- und Kontrast-Testläufe." Der Screenshot-Agent baut die
+Aufnahmen; die **Kontrastprüfung ist neu** und liegt als eigener Block daneben.
+
+### Zuerst: das ist zu einem großen Teil **schon entworfen** — ich hatte es erfunden
+
+Ich hatte K1–K5 als Grünanlage notiert. Dann die `ui-review`-Checklist gelesen, §11
+**„Color contrast matrix (automated)"** — und mein Entwurf ist darin, wortgleich in der
+Absicht:
+
+- eigener Lauf: `pnpm test:contrast`, Spec `tests/contrast/contrast.spec.ts`, über
+  `playwright.contrast.config.ts` (**nicht** in der normalen Suite — dieselbe Trennung
+  wie beim Screenshot-Lauf);
+- **WCAG AA** als Schwelle;
+- Farben **über ein Canvas** auflösen, weil daisyUI v5 `oklch` benutzt und
+  `getComputedStyle` genau das liefert — die Palette also **nicht** aus dem Quelltext
+  raten, sondern den Browser fragen;
+- **beide Themes** (hell und dunkel);
+- `alert-{color}` **über der Seitenfläche komponiert** prüfen, weil Alerts transluzent
+  sind und erst der gerenderte Farbwert zählt;
+- `badge-{color}`, Fließtext und `link link-primary` gegen `bg-base-100`;
+- **blockierende** Schwere, gleich `critical`/`high`;
+- neu aufgenommene semantische Farbe, neue Badge-/Alert-Variante oder geändertes
+  Theme-Token → neu laufen lassen, vor dem Merge.
+
+⚠️ **Ehrliche Grenze dieser Vorlage:** sie existiert **als Text**, nicht als Datei. In
+`references/templates/` liegen nur die drei Screenshot-Templates
+(`playwright.screenshots.config.ts.example`, `ui-review-manifest.ts.example`,
+`ui-screenshots.spec.ts.example`) — **keine Kontrast-Vorlage**. Ich habe also einen
+*Entwurf*, kein *Artefakt*. „Portieren" heißt hier **implementieren**, nicht kopieren, und
+wer das als Kopie meldet, meldet es falsch.
+
+- [ ] **K1 — Token-Matrix nach dem Skill-Entwurf.** Das ist die Basis und sie ist
+      gesetzt: `badge-*`, `alert-*` (komponiert über die Seitenfläche), Fließtext und
+      `link link-primary` gegen `bg-base-100`, WCAG AA, beide Themes, Canvas-Auflösung.
+      **Ehrliche Namensgebung:** das prüft die **Palette auf Selbstkonsistenz** — es
+      sagt, ob die Farben zueinander passen. Es sagt **nicht**, ob eine Karte lesbar ist.
+
+- [ ] **K2 — die *gerenderte* Karte. Das ist die Lücke, die der Skill nicht schließt.**
+      Eine Token-Matrix kann vollständig grün sein, während die Tool-Karte in echt
+      `muted` auf `base-200` setzt und bei 3,8:1 landet, weil **niemand diese Kombination
+      je deklariert hat**. Genau dafür braucht es den zweiten Lauf: die Knoten, die
+      **tatsächlich** im Chat stehen, mit `getComputedStyle` gelesen, gegen den
+      **effektiven** Hintergrund gerechnet.
+      **Und die Zustände, in denen das auftritt, sind genau die vier:** Tool-Karte,
+      Approval-Karte, Fehlerbanner, abgeschnittenes Suchergebnis (`searchTruncated`).
+      Eine Prüfung, die die Textur-Karte „4.5:1" sieht und die Fehlerkarte nie ansieht,
+      ist eine Prüfung der Textur-Karte.
+
+- [ ] **K3 — Unentscheidbares wird *gezählt und ausgegeben*, nicht bestanden.**
+      Gradients, Bilder, Text über Text, `mix-blend-mode`. Der Grund ist nicht Sorgfalt,
+      sondern die Fehlerklasse, die in dieser Sitzung sechsmal auftrat: die gekappte
+      `grep`-Suche und die unvollständige Modellliste waren beide grün, **weil nichts
+      beanstandet wurde**. Ein Gate, das `0 unentscheidbar` meldet, ist nur dann
+      glaubwürdig, wenn es auch `7 unentscheidbar` melden *könnte* — also muss der Test
+      das mit beweisen, sonst ist die Zahl Dekoration.
+
+- [ ] **K4 — `workers: process.env.CI ? 4 : 2` auch hier, mit derselben Begründung.**
+      Steht im Auftrag an den Screenshot-Agenten. **Warnung mitgeliefert:** mehrere
+      Worker + `fullPage`-Aufnahmen sind eine bekannte Fehlerquelle. Falls es Flakes gibt,
+      ist die Auflösung **Serialisierung der Aufnahmen**, nicht ein kleinerer Wert — wie
+      beim `grep`-Test: hängt das Ergebnis vom Host ab, ist der Test das Problem.
+
+## Welle 3 — Screenshot-Harness gelandet, und was er gefunden hat
+
+**25 States, 46 Full-Page-, 72 Section-PNGs, 118 Dateien.** Vom Screenshot-Agenten
+gebaut, nicht committet (auftragsgemäß), von mir übernommen.
+
+### Erst die Harness selbst geprüft — sie könnte alles übersprungen haben
+
+Ein Screenshot-Harness, der **alles** überspringt, ist immer grün. Also die Matrix
+gegen die Platte geprüft, statt die „46 passed" zu glauben:
+
+| | desktop | mobile |
+|---|---|---|
+| `empty/` | 20 PNGs | 24 PNGs |
+| `filled/` | 37 PNGs | 37 PNGs |
+| **Summe** | **57** | **61** → **118** |
+
+- **Jede** deklarierte State hat ihren Full-Page-Shot in jedem deklarierten Viewport.
+- **Vier** States sind **nur Desktop**, exakt die vier, die die Manifest-Tabelle mit „—"
+  für mobile führt: `chat-reasoning-open`, `error-missing-key`, `settings-export-optin`,
+  `settings-panel`. Kein State fehlt in beiden Projekten — der Fall, in dem
+  `test.skip` **zweimal** greift und trotzdem grün meldet.
+- Die „46 skipped" sind **kein Defekt**: die States×Viewports-Matrix wird unter zwei
+  Playwright-Projekten expandiert, jeder Test überspringt das fremde Viewport
+  (`ui-screenshots.shot.ts:214`).
+- **Eigener Fehler dabei:** Ich habe die Struktur `filled/desktop/<state>/*.png`
+  angenommen und eine Ebene zu tief gezählt — die PNGs liegen direkt in
+  `filled/desktop/`. Erst der saubere Durchgang hat die Zahlen geliefert.
+
+### Der Fund, der wichtiger ist als der Harness: **die App hat kein benutzbares Mobil-Layout**
+
+Bei **390×844** gemessen, nicht vermutet:
+
+```
+innerWidth                             390
+linke Spalte  (flex min-w-0 flex-1)   x 0 → 0     Breite 0
+rechte Spalte (flex flex-col)          x 0 → 390   Breite 390
+Composer                                Breite 24
+elementFromPoint(Senden-Mitte) → <div class="flex flex-col border-l border-base-300">
+```
+
+`AppShell` ist `flex h-screen`; der **rechten** Spalte fehlt `min-w-0`, also ist ihre
+automatische Mindestbreite ihre **max-content**-Breite, und `WorkspacePanel`s
+`modeExplanation` ist ein langer deutscher Absatz. Bei 390 px übersteigt das die
+Viewport-Breite, die linke Spalte wird auf **exakt null** gequetscht, und
+Header/Transcript/Composer rendern **unter** der Sidebar.
+
+- [ ] **U1 — `min-w-0` fehlt an der rechten Spalte. `critical`. — und die Schilderung war
+      zu MILD.** Ich habe `filled/mobile/chat-approval-sec0.png` selbst angesehen. Der
+      Screenshot-Agent hatte geschrieben, „die Approval-Karte und das Transcript
+      **übereinander geschrieben** in derselben 390-px-Spalte". Das ist eine
+      **Milderung** dessen, was das Bild zeigt:
+
+      - **Jedes Textelement bricht auf ein Wort pro Zeile um.** „Approvals",
+        „Ordner verbinden", „Zusammenfassung", „waiting" — vertikal gestapelt, ein Wort
+        pro Zeile, über die volle Höhe des Bildes.
+      - **Mehrere Textspalten liegen übereinander.** Der Transcript-Text rendert in einer
+        ~20 px breiten Spalte, die Überschriften auf voller Breite, **darüber**.
+      - Die Sidebar („Workspace", „Neu einlesen", „Ordner verbinden") liegt **auf** dem
+        Transcript.
+      - Die **Textarea ist 24 px breit**; sichtbar sind „n", „f", „a" untereinander.
+
+      **Der Zustand ist nicht „Bedienung unmöglich". Er ist „Text unlesbar".** Und
+      **Desktop ist sauber** (`filled/desktop/chat-approval-sec0.png`): zweispaltig,
+      lesbar, Approval-Karte in Warnfarbe, Tool-Karten korrekt, Kontrast gut. Der Defekt
+      ist **ausschließlich** mobil.
+
+      ### Und die Lehre ist nicht der Befund, sondern die Meldung
+      Die **Messung** des Agenten war richtig und gut: `linke Spalte 0 px`, `Composer
+      24 px`, `elementFromPoint` nennt das verdeckende Element. Aber er hat daraus
+      „**jeder Klick ist tot**" gemacht. Das ist die *funktionale* Konsequenz, und sie
+      ist die **milderste** vorstellbare.
+      **Ein Breitenwert von 0 und ein umgebrochenes Wort pro Zeile sind dieselbe
+      Ursache, aber nicht derselbe Schweregrad.** Wer eine Layout-Messung in Prosa
+      übersetzt, verliert die Schwere, weil die Zahl nüchtern aussieht und die
+      Konsequenz nicht.
+      → **Regel für jeden Auftrag, der misst:** die Meldung braucht **beides** — den
+      Messwert *und* die Konsequenz, mit der ein Mensch konfrontiert wird. Am besten,
+      indem der Auftrag ausdrücklich verlangt, **einen Screenshot mit eigenen Augen
+      anzusehen**, bevor der Bericht geschrieben wird. *Ich habe es diesmal getan, und
+      es hat die Schwere verdoppelt.*
+
+- [ ] **U1-KONTRAST — was der Desktop-Blick nebenbei zeigt, als Kandidaten für K2:**
+      `Turn-Ende: idle` und die Metazeile `Versuch 1 von 3 · Schritt 1` sind sehr
+      gedämpft. **Noch kein Befund** — das ist ein Augeneindruck aus einem PNG, und die
+      K-Prüfung rechnet. Steht hier, damit es **nicht** verloren geht und damit niemand
+      „ich sehe doch, es ist grau, das ist ein Befund" schreibt. *Ein Bildeindruck ist
+      kein Messwert.*
+      Ebenfalls unauffällig: der ausgegraute Button „Ordner verbinden" — **disabled**,
+      niedriger Kontrast ist dort **korrekt** und darf nicht als Befund auftauchen.
+
+      Kein Testfehler, sondern ein **Produktdefekt**: bei 390 px ist **jeder Klick in der
+      Chat-Spalte tot.** Das ist der Grund, warum der Screenshot-Agent für den
+      Sendepfad `Enter` nehmen musste (was der Composer-Text ohnehin ankündigt) — er hat
+      sich damit um den Defekt **herumgebaut, statt ihn zu melden**, was richtig war,
+      aber der Defekt bleibt.
+      **Und die mobile Bilder zeigen ihn** — `filled/mobile/chat-approval-sec0.png` ist
+      Approval-Karte und Transcript **übereinander geschrieben** in derselben
+      390-px-Spalte.
+
+- [ ] **U2 — drei States sind nur Desktop, weil sie mobil nicht erreichbar sind.**
+      `settings-panel`, `settings-export-optin`, `error-missing-key` (kein Deep-Link, kein
+      Shortcut — `SettingsPanel` mountet nur per `onClick`) und `chat-reasoning-open`
+      (das `<summary>` ist layoutmäßig da, aber **nicht sichtbar**, also lässt sich der
+      Reasoning-Text am Telefon gar nicht öffnen).
+      **`force: true` hätte Bilder von Zuständen erzeugt, die kein User erreichen kann.**
+      Richtig so — aber die *Ursache* ist U1, und nach U1 sind sie womöglich alle vier
+      mobil. **Nach U1 neu aufnehmen und prüfen, nicht vorher.**
+
+- [ ] **U3 — der Transcript scrollt nicht automatisch.** Kein `scrollTop`, kein
+      `scrollIntoView` in `Transcript.tsx`. Die Approval-Karte ist als „nicht
+      wegzuscrollen" dokumentiert und liegt unterhalb des Folds. Die `-secN`-Aufnahmen
+      machen das sichtbar, statt es zu verdecken — dafür sind sie da.
+
+- [ ] **U4 — `error-storage-boot` (16 KB) ist der leerste Bildschirm im Satz** und hat
+      **keinen** Weg vorwärts. Ein toter Bildschirm braucht eine Handlung.
+
+### Der Umfang von U1 ist **alle 25 States**, nicht ein State
+
+`filled/mobile/chat-tools-sec0.png` ist **nicht** anders, sondern **gleich**:
+dieselbe zerstörte Shell, nur anderer Transcript-Inhalt („disucceeded" / „Abschneiden"
+statt „waiting" / „Kappieren"). Die Kaputtheit hängt **nicht** am State, sondern an der
+**Shell**.
+
+→ **Auf dem Mobil-Viewport sind alle 25 States unbrauchbar.** Es gibt keinen mobilen
+State, der funktioniert. Die vier „nur Desktop"-States sind damit nicht „weniger
+abgedeckt", sie sind die **einzigen**, in denen überhaupt etwas zu sehen ist.
+
+### U1 ist auf die **Workspace-Shell** begrenzt — der Wizard ist in Ordnung
+
+`empty/mobile/onboarding-provider.png` bei 390 px: **einwandfrei.** Einspaltig, Fließtext
+in normaler Zeilenlänge, Karten mit ausreichendem Kontrast, Badges lesbar
+(`CORS unbestätigt` / `CORS bestätigt`), Buttons erreichbar.
+
+→ Der Defekt sitzt **`AppShell`**, nicht daisyUI, nicht das Theme, nicht der Wizard. Das
+grenzt die Suche von vornherein ein und ist **gute Nachricht für die Behebung**: es ist
+**eine** Komponente, nicht ein systematischer Fehler.
+
+(Nebenbefund mit Content-Bezug: das Bild zeigt, dass die CORS-Matrix aus `Plan.md` §9
+**bereits im Wizard steht** — inklusive des Hinweises, dass `/v1/models` einen CORS-Header
+liefert und die Inferenz-Endpunkte nicht. Das ist genau der Befund, auf dem **P3/P4**
+aufsetzen. Block P muss den Wizard also **nicht** erfinden, sondern die vorhandene
+Aussage von „CORS unbestätigt" zu einer **gemessenen** Probe ausbauen.)
+
+### Und was das über die E2E-Suite sagt — das ist der wichtigere Teil
+
+**44 grüne E2E-Tests, und die App ist auf dem halben Viewport unlesbar.** Kein einziger
+der 44 Tests sieht es, und das ist **konstruktiv**, nicht zufällig: die Tests adressieren
+über `data-testid`, `waitForTurnIdle` wartet auf `data-baah-status="idle"`, und der
+Screenshot-Assert prüft `toHaveTitle`. **Kein Test prüft, ob etwas lesbar ist.**
+
+Das ist kein Testfehler, das ist die **Grenze des Ansatzes** — und sie ist ehrlich
+benennbar, also muss sie benannt werden:
+
+- **Funktional grün** heißt: *die Mechanik* stimmt (Turn läuft, Tool liefert, Approval
+  wartet, Retry zählt).
+- **Visuell kaputt** heißt: *das Ergebnis* ist unbrauchbar.
+
+Ein Harness, der nur das Erste prüft, ist **nicht grün** — er ist **halb** geprüft und
+sieht dabei so aus, als wäre alles geprüft. Das ist dieselbe Fehlerklasse wie die
+übersprungene Modellliste: grün, **weil etwas nicht geprüft wurde.**
+
+→ **Deshalb ist die Screenshot-Harness kein Luxus, sondern die einzige Sache, die diesen
+Fehlertyp findet.** Und deshalb ist sie auch das Einzige, was K1–K5 tragen kann: eine
+Kontrastprüfung, die in einem Playwright-Test rechnet, sieht **Layout-Überlagerung
+nicht**, und Layout-Überlagerung war hier der teurere Defekt.
+
+### Zwei States, die es nicht gibt
+
+- [ ] **U5 — `chat-stall` und `chat-streaming` sind BYTE-IDENTISCH** (md5, beide
+      Viewports). Das Pacer-Gate hält bei einem Event, also erscheint der Stall-Hinweis
+      nie: der Watchdog wird bei `attempt-started` scharf und durch den `text-delta`
+      abgeschaltet, den das 6-Event-Gate durchlässt. Der Zustand wird durch
+      **Stille** erreicht, und mein Gate liefert **Text**.
+      → **Entweder** das Gate so bauen, dass es wirklich schweigt (0 Events, dann
+      Stille) **oder** die State streichen. Ein doppelter State, der zwei Namen trägt,
+      ist schlimmer als ein fehlender: er zählt in der Abdeckung mit, ohne etwas
+      abzudecken.
+
+- [ ] **U6 — `error-stream-cut` zeigt „Versuch 1 von 3", nicht 3.** Die Versuche 2–3
+      treffen den 501 des Fakes und die retryable-Einstufung läuft anders aus als die
+      §5.4-Tabelle vorsieht. Entweder die Klassifikation des 501 korrigieren **oder** die
+      Erwartung an das ändern, was tatsächlich klassifiziert wird — **mit der Begründung
+      im Spec**, warum das richtig ist. Sonst repariert der nächste Agent die Zahl und
+      nicht das Verhalten.
+
+### Was die Kontrastprüfung K2 braucht und nicht hat
+
+- [ ] **K2-VORBEDINGUNG — `searchTruncated` fehlt im Satz.** Kein `grep`/`glob`-Aufruf ist
+      skriptet, weil eine Kappung einen Workspace **über der Entry-Cap** braucht und die
+      In-Memory-Sandbox **eine Datei** hat.
+      Also: **einer der vier K2-Zustände existiert nicht.** Entweder einen
+      Workspace mit vielen Dateien im Sandbox-Setup **oder** den vierten Zustand
+      streichen und die Aussage auf drei reduzieren. Ein Prüfziel, das es nicht gibt,
+      wäre ein **grüner K2 über eine Lücke**.
+
+### ENV4 — der zweite Fehlermodus, und der **maskiert sich**
+
+Nach `playwright install chromium` war die Binary da (197 MB) — und der Lauf **immer
+noch** rot, jetzt in **3 ms** statt 7 ms, mit **anderer** Meldung:
+
+```text
+browserType.launch: Target page, context or browser has been closed
+```
+
+Das liest sich wie ein **Test- oder Produktproblem**. Es ist keines: der Container-Reset
+hat die **Systembibliotheken** mitgenommen, diesmal nicht den Browser.
+
+```text
+$ chrome-headless-shell --version
+error while loading shared libraries: libnspr4.so: cannot open shared object file
+$ ld "$BROWSER" | grep -c "not found"
+15
+```
+
+Reparatur: `sudo pnpm exec playwright install-deps chromium`.
+
+→ **Zwei Fehlermodi, zwei Meldungen, zwei Reparaturen, und der zweite tarnt sich:**
+
+| Was fehlt | Meldung | Reparatur |
+|---|---|---|
+| die **Binary** | `Executable doesn't exist at …` | `playwright install chromium` |
+| die **Libraries** | `Target page, context or browser has been closed` | `playwright install-deps chromium` |
+
+**„Browser has been closed" ist die Meldung, die man normalerweise als Produktfehler
+liest.** Sie ist es nie, wenn sie **alle** Tests gleichzeitig und in **einstelligen
+Millisekunden** trifft. Das ist das eigentliche Kriterium, und es gilt für beide Modi:
+**flächendeckend + sofort = Umgebung, nie Code.**
+
+- [ ] **ENV5 — `ENV2` braucht die zweite Probe.** `ls ~/.cache/ms-playwright/` füllt ist
+      **nicht** genug: die Binary kann da sein und trotzdem **15 `.so` nicht**. Die
+      vollständige Probe ist **eine Zeile** und beantwortet beides:
+      ```bash
+      "$HOME/.cache/ms-playwright"/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell --version
+      ```
+      Fehlt die Binary, findet der Glob nichts; fehlen die Libs, antwortet der Aufruf
+      mit `error while loading shared libraries`. **Ein Aufruf, zwei Diagnosen** — billiger
+      als jeder Fehlschlag, den die Suite danach meldet.
+
+---
+
+### Aufnahmetechnik: zwei Stellen, an denen die Sections nichts bringen
+
+- [ ] **U7 — `chat-answer-sec0` und `chat-answer.png` sind dasselbe Bild** (Desktop).
+      Nichts unterhalb des Folds bei 1280×800. Die Sections lohnen sich nur, wo eine
+      Spalte lang ist — bei **20** der 25 States ist es genau ein `-sec0`.
+      Das ist kein Fehler, aber eine Information: **die Section-Logik kostet 72 Dateien,
+      davon tragen ~52 keinen zusätzlichen Blick.** Wer die Suite verkleinern will, hat
+      hier den Hebel.
+
+---
+
+## Parallelität — was gemessen ist, und wo die Grenze wirklich liegt
+
+Vom Nutzer gefordert: **hier headless 2, in der CI 4.** Der Widerspruch löst sich auf,
+sobald man ihn als **zwei Maschinen** liest — lokaler Host (geteilt, `mariadbd` im
+Risiko) gegen GitHub-Runner (eigenes Budget). Die Host-Regel steht jetzt in
+`~/.config/opencode/Agents.headless.md` (war `HEADLESS.md`; der Verweis in `AGENTS.md`
+zeigte bereits auf den neuen Namen und war damit **kaputt**), der Einzeiler in `AGENTS.md`.
+
+**Und die Zahl 2 steht dort, weil jemand sie später hochsetzen will. Genau darum steht
+sie mit Begründung drin, nicht als nackte Ziffer.**
+
+### Der eine echte Stellschrauber, und was die Plattform *nicht* kann
+
+GitHubs Workflow-`concurrency` **kann „höchstens N" nicht ausdrücken** — eine
+Concurrency-Gruppe ist **exklusiv**: `cancel-in-progress: true` heißt *ein laufender plus
+ein abgebrochener wartender*, `false` heißt *einer plus Queue*. Und `strategy.max-parallel`
+braucht eine **Matrix**, die es nicht gibt (zwei Build-Jobs). Beide Zahlen landen deshalb
+in Playwrights `workers`.
+
+### Und dort trennt sich die Sache — an einer **gemessenen**, nicht an einer gewählten Grenze
+
+| Lauf | `workers` | Umfang | Ergebnis |
+|---|---|---|---|
+| 1 | **1** | ganze Suite | **44/44** |
+| 2 | **2** | ganze Suite | **42/44** — zwei `waitForTurnIdle`-Timeouts |
+| 3 | **2** | ganze Suite | **43/44** — der Pacer-Race |
+| 4 | **2** | **nur** die 2 verdächtigen Tests, 3× | **6/6** |
+
+**Der entscheidende Befund ist Zeile 4, nicht Zeile 1.** Die Fehler treten **nur im
+Vollauf** auf und **nicht**, wenn dieselben Tests allein laufen. Das ist also *nicht*
+„`workers: 2` ist kaputt" — es heißt: **diese Suite ist noch nicht unabhängig davon, wie
+viel CPU sie bekommt.**
+
+Dieselbe Fehlerklasse wie der `grep`-Timeout-Test, dessen Erwartung aus „~14 ms **auf
+dieser Maschine**" abgeleitet war und der in CI an einem **schnelleren** Runner rot
+wurde. Beide sind **Tests, die den Host messen.** Und die Warnung gilt für **beide**
+Richtungen: der `grep`-Test wurde nicht langsamer, er wurde schneller.
+
+- [ ] **PP1 — `workers` in `e2e/playwright.config.ts` bleibt `1`, bis kein E2E-Test mehr
+      vom CPU-Anteil abhängt.** Nicht `2` als Kompromiss: **ein intermittierend rotes CI
+      ist schlimmer als ein langsames.** Ein ungeschütztes `main`, dessen CI ab und zu
+      rot ist, lehrt alle, rot zu ignorieren. Das ist der Grund, und er ist der ganze
+      Grund.
+      **Hochgesetzt wird gemeinsam mit der Behebung**, nicht vorher.
+
+- [ ] **PP2 — die Parallele kommt dorthin, wo die Arbeit reihenfolgeunabhängig ist:**
+      die **Screenshot-Suite** nimmt `process.env.CI ? 4 : 2`. Sie fotografiert Pixel und
+      prüft **keine** Zeitverhältnisse. Aufteilung nach *gemessener* Eigenschaft, nicht
+      nach Bequemlichkeit.
+
+- [ ] **PP3 — die zwei lastempfindlichen Stellen sind **benannt**, nicht geraten:**
+      `scenarios.e2e.ts:385` (Approval-Pause, 20 s Budget für eine **Statusanzeige** —
+      daran kann CPU-Konkurrenz nichts ändern) und `scenarios.e2e.ts:480` (Backoff, 2 s + 8 s
+      spezifiziert gegen **20 s** Budget, also 2× Headroom, und `setTimeout` dehnt sich
+      unter Last **nicht**).
+      ⚠️ **Deshalb trägt die Erklärung des Screenshot-Agenten nicht**, die da lautete, den
+      Tests fehle ein „wall-clock budget for a second worker stealing CPU". **20 s für
+      10 s Arbeit sind kein zu knappes Budget**, und der Approval-Test hat gar keine
+      Wartezeit. Die Erklärung ist plausibel, **nicht bestätigt** — ich habe den Fehler
+      nicht reproduziert, nur nicht-in-Isoliert. Genau so steht es im Config-Kommentar.
+
+- [ ] **PP4 — `waitForTurnIdle` ist kein Test-Detail, sondern ein geteilter Ort.** 20 s
+      Default, an 18 Stellen aufgerufen, plus ein eigener `waitForTranscriptRead` mit
+      eigener Begründung. Jeder Test, der eine **spezifizierte Verzögerung** des Produkts
+      abwartet, sollte sein Budget **aus dieser Spezifikation ableiten** statt aus einer
+      Magic-Number — sonst ist „20 s" genauso eine Maschinenannahme wie „14 ms".
+
+### Und die vierte Zahl, die beinahe eine Lüge in die Config geschrieben hätte
+
+```text
+$ CI=1 pnpm --filter @all-the.rest/baah-web test:screenshots
+  Running 92 tests using 2 workers      ← 2, bei workers: 4 in der Datei
+```
+
+**Playwright verteilt *Dateien* auf Worker.** Die Screenshot-Suite ist **eine** Spec-Datei
+(`ui-screenshots.shot.ts`) unter **zwei** Projekten — mit `fullyParallel: false` hat sie
+also genau **zwei Arbeitseinheiten**, und `workers: 4` ist **strukturell unerreichbar**.
+
+Damit wäre `workers: process.env.CI ? 4 : 2` in dieser Config **eine Behauptung über eine
+Parallelität, die die Suite nicht haben kann** — sie *liest* wie parallel und ist es
+nicht. Das ist der **`grep-wasm`-Fehlermodus**: eine Konfiguration, die etwas zu tun
+scheint und nichts tut.
+
+- [ ] **PP5 — `fullyParallel: true` in `e2e/screenshots/playwright.config.ts`, weil `workers`
+      sonst bedeutungslos ist.** Und das ist **hier** sicher, **konstruktiv**: jeder Test
+      präpariert seinen Zustand aus seiner **eigenen** `app`-Fixture (eigene Page, eigener
+      `BrowserContext` — der gefälschte Provider ist `context.route()` auf genau diesem
+      Context, es gibt **nichts** zu teilen) und schreibt auf seinen **eigenen** Pfad.
+      Kein Test beobachtet einen anderen.
+      **Gegenprobe statt Hoffnung:** 118 PNGs vorher gesichert, Lauf mit 4 Workern,
+      danach Dateimenge und Bytegrößen **Bit für Bit** verglichen. Ein halb gerenderter
+      Frame — die vom Screenshot-Agenten befürchtete Flake — fiele als **deutlich
+      kleinere Datei** auf, nicht als „Flake, die man irgendwann bemerkt".
+
+- [ ] **PP6 — REGEL: eine Parallelitätseinstellung gilt erst, wenn sie die gemeldete
+      Worker-Zahl verändert.** `Running N tests using M workers` ist die **einzige**
+      Messung, die zählt, und sie gehört in jeden Commit, der `workers` anfasst.
+      Sonst steht irgendwann `workers: 8` in einer Config, die 2 kann, und niemand
+      merkt es — weil eine Zahl in einer Datei **aussieht** wie eine Einstellung.
+      *Ergänzt zu `no-foreign-error-text` und den fünf Source-Gates: eine Einstellung,
+      die nichts bewirkt, ist ein Gate ohne Wirkung.*
+
+- [ ] **PP7 — und die Umkehrung gilt genauso:** Der **E2E**-Config hat
+      `fullyParallel: false` und **drei** Spec-Dateien, also drei Arbeitseinheiten — dort
+      sind `workers: 2` **und** `workers: 1` **wirksam**, und genau deswegen sind die
+      Messungen der Tabelle oben gültig. **Dieselbe Zeile bedeutet in zwei Configs etwas
+      anderes**, was ein Kommentar in beiden nötig macht.
+
+### Und der Grund, warum das nicht sofort reparierbar war
+
+H1 hat die Messung gekostet: der 3×-Serienlauf kam nicht an, weil der Screenshot-Agent
+in derselben Sekunde `manifest.ts` anfasste. **Regel, die daraus folgt:** solange ein
+Build-Agent `packages/baah-web/` anfasst, ist **kein** E2E-Lauf dieses Repos eine gültige
+Messung. Das ist eine Regel, keine Warnung.
+
+---
+
+## Umgebungsbefund: der Playwright-Cache wird **wieder** gelöscht — zum dritten Mal
+
+`pnpm --filter baah-web e2e` meldete **33 failed** bei `workers: 1`, davon einer in
+**7 ms**. Ursache:
+
+```text
+Error: browserType.launch: Executable doesn't exist at
+/home/dev/.cache/ms-playwright/chromium_headless_shell-1243/.../chrome-headless-shell
+```
+
+```text
+$ ls -1 /home/dev/.cache/ms-playwright/     # LEER
+$ df -h /home/dev                           # 209 G frei
+```
+
+**Drittes Mal in dieser Sitzung**, identische Signatur wie beim ersten Mal (Cache
+verschwunden, danach 20 Systembibliotheken): **kein Platzmangel** (209 GB frei), also
+**kein Eviction**, sondern der in `Agents.headless.md` §2 beschriebene periodische
+Container-Reset, der diesmal nur *Teile* des Dateisystems mitnimmt.
+
+→ **Ausdrücklich *kein* Befund.** Es steht hier, weil die Versuchung groß ist,
+„33 failed bei `workers: 1`" als Ergebnis zu notieren. Es ist **Umgebung**, und die
+Suite **sieht aus wie ein Produktdefekt**. Dritte Instanz derselben Klasse wie H1.
+
+- [ ] **ENV1 — REGEL: ein Playwright-Fehler unter ~100 ms ist ein Fixture- oder
+      Browserproblem, kein Produktproblem.** Ein Test, der in 7 ms fehlschlägt, ist
+      **nie gelaufen** — er ist an der Fixture gescheitert, bevor ein Assert erreicht
+      war. **Die Dauer ist das Signal**, und es steht in der Testausgabe.
+      Bei 33 roten Tests **immer zuerst die Dauer ansehen**, bevor man über Code spricht.
+      Das hat hier einen falschen Alarm und eine falsche Rückschlussnahme verhindert.
+
+- [ ] **ENV2 — vor jedem E2E-Lauf auf diesem Host den Browser prüfen, oder den Lauf
+      als ungültig verwerfen.** Ein Lauf, der erst am Browser scheitert, hat **keine
+      Aussage** über `workers`, über Flakes oder über den Code. Das ist billig:
+      `ls /home/dev/.cache/ms-playwright/` ist leer → der Lauf zählt nicht.
+      *Und die Reparatur ist teuer:* 114 MB Download, während die Unit-Suite in
+      90 Sekunden fertig ist. **Ein Befund, der auf einer fehlenden Datei beruht, ist
+      teurer zu korrigieren als zu verhindern.**
+
+- [ ] **ENV3 — und dieselbe Prüfung für die Screenshot-Suite**, sonst gilt dasselbe:
+      118 PNGs aus einer Suite, deren Browser fehlt, wären **118 leere oder
+      halb gerenderte Bilder** — und der Harness meldet „passed".
+
+---
+
 ## Abgehakt
 
 *(nach unten wandern, mit Commit-Referenz)*

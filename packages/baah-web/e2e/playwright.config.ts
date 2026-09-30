@@ -34,6 +34,30 @@ export default defineConfig({
   // One worker: the suite is small, timing-sensitive and asserts exact request
   // counts. Serial execution removes shared-machine scheduling as a flake
   // source, which is what Playwright's own CI docs recommend.
+  // `workers: 1`, and that is a MEASURED value, not caution. Three full-suite
+  // runs at `workers: 2` and one at `1`:
+  //
+  //   1  whole suite   44/44
+  //   2  whole suite   42/44   waitForTurnIdle timeouts
+  //   2  whole suite   43/44   the pacer race
+  //   2  only the 2 named failures, 3x   6/6
+  //
+  // The failures need the WHOLE suite's load; they do not appear when the same
+  // tests run alone. So this is not "workers: 2 is broken" — it is that this
+  // suite is not yet independent of how much CPU it gets.
+  //
+  // That is the SAME fault as the `grep` timeout test, whose expectation was
+  // quoted from "~14 ms on this machine" and which CI failed on a FASTER runner.
+  // Both are tests that measure the host. A flaky suite is worse than a slow
+  // one: an unprotected `main` with an intermittently red CI teaches everyone to
+  // ignore red.
+  //
+  // So the parallelism goes where the work is order-independent, which is the
+  // screenshot suite — it captures pixels and asserts no timing at all. That one
+  // runs `process.env.CI ? 4 : 2` in `e2e/screenshots/playwright.config.ts`.
+  //
+  // Raise this to `2` only together with the fix: no E2E test may depend on how
+  // much of the machine it got. Recorded in agents.todo.md, with the numbers.
   workers: 1,
 
   // The scenarios are deterministic (no network, no API key, explicit gates
