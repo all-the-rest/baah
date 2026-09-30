@@ -92,6 +92,21 @@ export const TEST_IDS = {
   settingsImportDiff: "baah-settings-import-diff",
   /** Never a key value — the slot name only. Assert on this, not on the input. */
   settingsKeySlot: "baah-settings-key-slot",
+
+  /* ---- sidebar / drawer (below the 1024 px breakpoint) ---------------- */
+  /**
+   * Opens and closes the collapsed sidebar. **Exists only below 1024 px** — on a wide
+   * viewport the sidebar is always open and the control is not rendered at all.
+   *
+   * So a test must never assert on it unconditionally; see the mobile branch of the
+   * screenshot manifest's `chat-todo`, which asks whether the thing it wants to
+   * photograph is visible and only then opens the drawer.
+   */
+  sidebarToggle: "baah-toggle-sidebar",
+  /** Covers the page while the drawer is open, and closes it on click. */
+  sidebarBackdrop: "baah-sidebar-backdrop",
+  /** The drawer's own close control, for reaching it without the backdrop. */
+  sidebarClose: "baah-sidebar-close",
 } as const;
 
 export type TestId = (typeof TEST_IDS)[keyof typeof TEST_IDS];

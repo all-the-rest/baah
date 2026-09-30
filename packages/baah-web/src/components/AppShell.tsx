@@ -33,6 +33,7 @@ import type { AgentEvent, RuntimeState, TranscriptRead } from "../runtime/index.
 import { ChatView } from "./ChatView.tsx";
 import { Onboarding } from "./Onboarding.tsx";
 import { QuestionCard } from "./QuestionCard.tsx";
+import { TEST_IDS } from "../lib/testids.ts";
 import { SettingsPanel } from "./SettingsPanel.tsx";
 import { TodoSidebar } from "./TodoSidebar.tsx";
 import { Transcript } from "./Transcript.tsx";
@@ -399,7 +400,7 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
            */}
           <button
             type="button"
-            data-testid="baah-toggle-sidebar"
+            data-testid={TEST_IDS.sidebarToggle}
             className="btn btn-ghost btn-xs lg:hidden"
             aria-expanded={sidebarOpen}
             aria-controls="baah-sidebar"
@@ -504,7 +505,7 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
       {drawerOpen && !wide && (
         <button
           type="button"
-          data-testid="baah-sidebar-backdrop"
+          data-testid={TEST_IDS.sidebarBackdrop}
           aria-label="Menü schließen"
           className="fixed inset-0 z-30 cursor-default bg-black/50 lg:hidden"
           onClick={() => setDrawerOpen(false)}
@@ -540,7 +541,7 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
             <span className="text-sm font-semibold">Aufgaben &amp; Workspace</span>
             <button
               type="button"
-              data-testid="baah-sidebar-close"
+              data-testid={TEST_IDS.sidebarClose}
               className="btn btn-ghost btn-xs"
               onClick={() => setDrawerOpen(false)}
             >

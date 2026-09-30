@@ -1749,6 +1749,46 @@ gelogen gewesen: der **Verifikations**schritt — der Blick drauf — war nie ge
 
 ---
 
+## ✅ DER ABSTURZ IST BESTÄTIGT — und ich habe ihn **selbst** ausgelöst
+
+Der Crash-Jäger hat in **440** Ausführungen keinen OOM gesehen und die Hypothese folglich
+korrekt als **unbewiesen** markiert. Bestätigt ist sie jetzt, mit **Beobachtung,
+Gegenprobe und Diskriminator**:
+
+| Lauf | Worker | Ergebnis | `oom` |
+|---|---|---|---|
+| A: `CI=1` (4 Renderer parallel) | **4** | 45/46, `Target crashed` | 3 → **5** |
+| B: lokal | **2** | **46/46**, rc=0, 1,9 min | **5 → 5** |
+
+**Ausgelöst habe ICH es**, mit `CI=1`, um den 4-Worker-Pfad zu prüfen. Vier Chromium-
+Renderer parallel auf einem geteilten Host, dessen cgroup bei **99,99 %** von 5120 MB
+stand — und `error-storage-session` stirbt an `Target crashed` **direkt nach einem
+`page.reload()`**, also mitten im schwersten Moment, den ein State überhaupt hat.
+
+→ **Die Konfiguration ist richtig und war nie das Problem.** `process.env.CI ? 4 : 2`
+heißen 4 auf einem Runner mit eigenem cgroup und **2** auf `code-dev`. Ich habe den
+**CI-Wert auf der lokalen Maschine getestet**, weil ich den Pfad verifizieren wollte.
+*Ein Testlauf unter den falschen Randbedingungen ist kein Testlauf, sondern ein Befund
+über den Testlauf.*
+
+- [ ] **ENV10 — `workers: process.env.CI ? 4 : 2` bleibt exakt so, und der Grund ist jetzt
+      belegt statt behauptet:** lokale 2 wegen des geteilten cgroup, CI-4 wegen des eigenen
+      Budgets des Runners. **Vorher** stand dort eine Begründung, die ich nicht gemessen
+      hatte; sie war richtig, aber aus dem richtigen Grund.
+- [ ] **ENV11 — `Page crashed` und `Target crashed` sind auf diesem Host dasselbe
+      Ereignis**, in zwei Suiten. Beidemal: Renderer-Opfer. **Und beidemal sah es aus wie
+      ein App-Absturz**, was es nicht war. → *Ein Absturz ohne Kontext ist ein Symptom; ein
+      Absturz mit laufendem `oom`-Zähler ist ein Befund.*
+- [ ] **ENV12 — die Regel, die daraus folgt und die ich lange gehabt haben will:**
+      **Der Diskriminator gehört in den Ablauf, nicht in eine Notiz.** Der Jäger hat
+      `cat /sys/fs/cgroup/memory.events` **vor und nach jeder** Messung gelesen und es als
+      Ein-Zeilen-Kommando genannt — er hat nur nie einen Lauf erwischt, der ihn auslöst.
+      **Eine Diagnose, die man nicht reproduzieren kann, ist trotzdem eine Diagnose, wenn
+      sie sagt, woran man sie erkennt.** Ohne diese Zeile hätte ich `Page crashed` noch
+      heute als „unbekannter App-Absturz" geführt.
+
+---
+
 ## Abgehakt
 
 *(nach unten wandern, mit Commit-Referenz)*

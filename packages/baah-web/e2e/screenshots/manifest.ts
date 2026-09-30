@@ -541,7 +541,22 @@ export const shots: readonly UiReviewShot[] = [
       await sendViaKeyboard(context.page, PROMPT);
       await waitForTurnIdle(context.page);
       await waitForStoredTranscript(context.page);
-      await context.page.locator("[data-baah-todo-status]").first().waitFor();
+      // Below the 1024 px breakpoint the sidebar is a collapsed drawer, so the rows
+      // are not in the DOM until it is open. On a wide viewport the sidebar is always
+      // open and `sidebarToggle` is not rendered at all — so this is deliberately NOT
+      // a viewport branch: a branch would have to know the viewport, whereas this asks
+      // the question we actually care about, which is "is the thing I want to
+      // photograph there?".
+      //
+      // The failure this replaces was the honest kind: `waitFor` on a row that cannot
+      // appear, so `chat-todo (filled, mobile)` failed and the whole suite reported 45/1.
+      // It is a *regression* in the harness caused by a *fix* in the app, and neither
+      // side mentioned the other. That is what a shared contract is for.
+      const todoRow = context.page.locator("[data-baah-todo-status]").first();
+      if (!(await todoRow.isVisible())) {
+        await context.page.locator(`[data-testid="${TEST_IDS.sidebarToggle}"]`).click();
+      }
+      await todoRow.waitFor();
     },
     note:
       "The sidebar with rows in all three states, including the tool-authored `completed` row and its " +
