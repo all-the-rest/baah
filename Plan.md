@@ -515,6 +515,83 @@ ist `config-error` (endgültig, mit benanntem Code für die UI).
 er wartet, nicht unterbrechen, also kann er keinen Stillstand messen — und
 `no-response` hat damit im Turn keine Erzeugung. Die Messung gehört an den
 
+
+#### Korrektur 2 (datiert): der Terminal-Check war ein Feld, das nicht überall existiert
+
+Die vorige Korrektur in diesem Abschnitt sagt, der Check sei
+`sawTerminalEvent = part.rawFinishReason !== undefined`. **Das war falsch**, und nicht aus
+einem Nebensatzgrund: **`@ai-sdk/openai@4.0.81` setzt `rawFinishReason` auf dem
+Responses-Pfad nie.**
+
+```
+$ grep -rn "rawFinishReason" node_modules/.pnpm/@ai-sdk+openai@4.0.81*/…/dist/
+  (keine Treffer)
+955:  incomplete_details?: { reason: string } | null | undefined
+```
+
+`incomplete_details.reason` ist optional und fehlt bei einem **sauberen** Abschluss. Mit dem
+OpenAI-Provider las sich daher **jeder erfolgreiche Responses-Turn wie ein abgeschnittener
+Stream** — drei Wiederholungen für eine Antwort, die bereits vorlag. Gegen echtes Geld.
+
+**Die Lehre, die ich notiere, weil sie mich selbst betrifft:** ein *besseres* Signal ist
+nicht dasselbe wie ein Signal, das **auf jedem Pfad vorkommt**. Ich habe `rawFinishReason`
+gefeiert, weil es öffentlich, typisiert und trägt die Begründung des Providers wörtlich — und
+nie gefragt, ob es überall existiert.
+
+**Und die Lehre aus dem grünen E2E-Lauf, der nichts bewies:** die Suite war grün, weil der
+Fake über `openai-compatible` fährt — **den einen Pfad, auf dem `raw` immer gesetzt ist.**
+Der Defekt war für den Fake aus demselben Grund unsichtbar wie für jeden Core-Test. Ein
+grüner Lauf, dessen Fake zufällig die richtige Ecke des Fehlers abdeckt, ist **kein** Beweis.
+
+#### Der Check, der jetzt gilt — die **Konjunktion**, und sie ist keine Heuristik
+
+Gemessen am echten `ToolLoopAgent`, nicht am Mock:
+
+| Fall | `finishReason` | `rawFinishReason` |
+|---|---|---|
+| Stream mitten im Text abgeschnitten | `"other"` | `undefined` |
+| Chat-Completions, sauber | `"stop"` | `"stop"` |
+| **Responses, sauber** | `"stop"` | **`undefined`** |
+| Provider meldet absichtlich `"other"` | `"other"` | `"other"` |
+| gar keine Ausgabe | — | — (`NoOutputGeneratedError`) |
+
+```
+sawTerminalEvent = part.rawFinishReason !== undefined
+                 || part.finishReason !== "other"
+```
+
+**Beide Hälften sind tragend**, und das ist der Punkt:
+
+- `raw` allein verfehlt den **sauberen Responses-Turn**.
+- `finishReason !== "other"` allein ist der zurückgenommene Proxy — er feuert bei einem
+  Provider, der **absichtlich** mit `"other"` endet.
+
+Und es ist **keine** Heuristik, weil `ai@7.0.122` die Platzhalter selbst setzt
+(`dist/index.js:11236`):
+
+```js
+let stepFinishReason = "other";
+let stepRawFinishReason = void 0;
+```
+
+`flush()` stellt den schließenden Part **nur dann** aus diesen Werten zusammen, wenn
+`hasReceivedTerminalChunk` false ist. Ein Part, der **beide** Platzhalter noch hält, ist
+der SDK, der einen abgeschnittenen Stream meldet — über den einzigen Kanal, den er hat.
+
+**Meine vermeintlich sicherere Vorgabe war falsch.** „Abwesenheit ist kein Beweis für
+Trunkierung" hätte §5.4s Trunkierungs-Verdikt **ersatzlos gestrichen**: der SDK
+synthetisiert *immer* einen `finish`-Part, also erreicht `"absent"` die Prüfung nie. Die
+sichere Richtung ist hier die **strenge**, und das war nicht vorhergesehen.
+
+`NoOutputGeneratedError` behält seinen eigenen Grund, damit die UI „erzeugte nichts und
+hielt nie" von „mitten im Stream abgebrochen" unterscheiden kann.
+
+**§5.4 hat jetzt eine Implementierung, nicht zwei:** der Loop fragt `classifyResponse` und
+folgt dem Verdikt. Ein zweites Prädikat im Loop war zunächst äquivalent zum
+Klassifikator — der Mutator überlebte, und statt Äquivalenz zu erklären wurde der
+Duplikatcode **entfernt**. Ein Prädikat, das ein anderes dupliziert, ist eine
+Wartungsfalle, auch wenn es gerade korrekt ist.
+
 #### Korrektur (datiert): `no-response` **wird** im Turn erzeugt
 
 Die Zeile oben — *„`no-response` hat damit im Turn keine Erzeugung"* — ist **falsch**, und

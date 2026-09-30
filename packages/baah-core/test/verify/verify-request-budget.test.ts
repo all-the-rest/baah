@@ -9,9 +9,12 @@
  * tells us exactly how many requests left the process.
  *
  * C3: Plan.md §5.4 says "Erfolg = der Stream endet sauber mit einem
- * Terminal-Event", and the loop implements that as
- * `sawTerminalEvent = part.finishReason !== "other"` (loop.ts:911). These
- * tests establish what that bit actually means.
+ * Terminal-Event". The loop implements that as a three-state
+ * `terminalEvent`, read by `readTerminalEvent` in `stream/classify.ts` from
+ * **both** fields of the closing part. These tests establish what that actually
+ * means against a real `ToolLoopAgent`; `test/agent/terminal-event.test.ts`
+ * owns the provider-shape matrix, because that is where the field-by-field
+ * reasoning lives.
  */
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -124,6 +127,8 @@ function recordingStore(): TurnStore & { recorded: Map<string, unknown>; seed(id
     seed(id: string, output: unknown) {
       recorded.set(idOf({ sessionId: "s1", attempt: 1, toolCallId: id, occurrence: 0 }), output);
     },
+    async appendTurn() {},
+    async appendMessage() {},
     async flushDelta() {},
     async closePart() {},
     async closeTurnParts() {},
@@ -150,6 +155,8 @@ const allowAll = { evaluate: () => ({ effect: "allow" as const }), recordAlways:
 
 function store(): TurnStore {
   return {
+    async appendTurn() {},
+    async appendMessage() {},
     async flushDelta() {},
     async closePart() {},
     async closeTurnParts() {},
@@ -700,7 +707,7 @@ describe("C3 · what the terminal-event check actually reads", () => {
 
   it("FIXED: `classifyResponse` — the §5.4 rule engine — is on the turn path", async () => {
     // The decisive structural check. `stream/classify.ts` is documented as the
-    // place that owns §5.4's order of checks and owns the `sawTerminalEvent`
+    // place that owns §5.4's order of checks and owns the `terminalEvent`
     // *observation*. It used to be exercised only by its own unit tests and
     // never by a turn, which made the whole 200-verification pipeline — JSON
     // error bodies, content-type checks, the terminal-event observation — read

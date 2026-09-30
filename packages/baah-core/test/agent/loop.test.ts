@@ -47,6 +47,8 @@ interface RecordedStore extends TurnStore {
   heartbeats: number;
   /** Unfinished turns, for the reload-recovery tests. */
   unfinished: UnfinishedTurn[];
+  /** Every row the engine created, in call order. The F3/F4 contract. */
+  created: { kind: "turn" | "message" | "part" | "closed"; id: string }[];
 }
 
 function createStore(seed?: Record<string, unknown>): RecordedStore {
@@ -57,10 +59,21 @@ function createStore(seed?: Record<string, unknown>): RecordedStore {
     recorded,
     heartbeats: 0,
     unfinished: [],
-    async flushDelta() {},
+    created: [],
+    async appendTurn(input) {
+      store.created.push({ kind: "turn", id: input.id });
+    },
+    async appendMessage(input) {
+      store.created.push({ kind: "message", id: input.id });
+    },
+    async flushDelta(input) {
+      store.created.push({ kind: "part", id: input.partId });
+    },
     // The delta/close protocol has its own measurements in
     // `test/agent/turn-store-seam.test.ts`; these cases are about the loop.
-    async closePart() {},
+    async closePart(input) {
+      store.created.push({ kind: "closed", id: input.partId });
+    },
     async closeTurnParts() {},
     async listTurnOutcomes() {
       return [];
@@ -167,6 +180,284 @@ describe("a successful turn", () => {
     await turn.run("hi");
     expect(kinds(events)).toContain("attempt-started");
     expect(kinds(events)).toContain("turn-finished");
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* The prompt's row: the engine owns it (F3 + F4)                    */
+  /* ---------------------------------------------------------------- */
+
+  it("creates the turn, the prompt's message and its part, in that order", async () => {
+    /**
+     * The three writes, in the order the foreign keys demand:
+     * `parts` → `messages` → `turns`. An app that wrapped `TurnStore` to
+     * manufacture these rows had to get this right by hand, and a
+     * `FOREIGN KEY constraint failed: messages.id = …` is what happens when it
+     * does not.
+     */
+    const { turn, store } = run({ steps: [{ parts: [...text("t1", "Hi"), finish("stop")] }] });
+    await turn.run("hi");
+
+    const promptWrites = store.created.slice(0, 3);
+    expect(promptWrites.map((entry) => entry.kind)).toEqual(["turn", "message", "part"]);
+    expect(promptWrites[0]?.id).toBe("t1");
+  });
+
+  it("closes the prompt's part as completed, so a reload does not render it in flight", async () => {
+    const { turn, store } = run({ steps: [{ parts: [...text("t1", "Hi"), finish("stop")] }] });
+    await turn.run("hi");
+    const promptPart = store.created[2];
+    expect(promptPart?.kind).toBe("part");
+    expect(store.created[3]).toEqual({ kind: "closed", id: promptPart?.id });
+  });
+
+  it("writes the prompt BEFORE the first model call, not at a step boundary", async () => {
+    /**
+     * The ordering is the contract, and a step boundary is the wrong place: a
+     * step boundary is only reached once the model has produced something, so
+     * a turn that fails at the very first request — 401, quota, a connection
+     * that never opened — would leave the user's question in no store at all.
+     * Those are exactly the turns a user comes back to after fixing a key.
+     *
+     * Measured by recording both sides of the boundary: the store's writes and
+     * the model's first `doStream`.
+     */
+    const seen: string[] = [];
+    const store = createStore();
+    const original = store.appendMessage.bind(store);
+    store.appendMessage = async (input) => {
+      seen.push("appendMessage");
+      await original(input);
+    };
+    const originalFlush = store.flushDelta.bind(store);
+    store.flushDelta = async (input) => {
+      // Only the *prompt's* write is interesting; the answer's deltas come later.
+      if (input.contentText === "the question") seen.push("flushDelta:prompt");
+      await originalFlush(input);
+    };
+    const model = createMockModel({
+      steps: [{ parts: [...text("t1", "Hi"), finish("stop")] }],
+      onCall: () => seen.push("model"),
+    });
+    const tools = [echoTool()];
+
+    const turn = new AgentTurn({
+      model,
+      instructions: "test",
+      tools,
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      sessionId: "s1",
+      turnId: "t1",
+      store,
+      approval: approvalFor(allowAll, tools),
+      onEvent: () => {},
+      approve: async () => "allow-once",
+      sleep: noSleep,
+      random: () => 0.5,
+    });
+    await turn.run("the question");
+
+    expect(seen.slice(0, 3)).toEqual(["appendMessage", "flushDelta:prompt", "model"]);
+  });
+
+  it("writes the prompt ONCE for a turn, not once per attempt", async () => {
+    /**
+     * A retry re-sends the same question into the same turn (§5.4). Writing it
+     * per attempt put the same prompt in the log once per attempt — and, worse,
+     * under a *different* message id each time, because the id was minted inside
+     * the attempt rather than once per turn.
+     */
+    const { turn, store } = run({
+      steps: [
+        { throws: apiError(500) },
+        { parts: [...text("t1", "second time lucky"), finish("stop")] },
+      ],
+    });
+    const result = await turn.run("the question");
+
+    expect(result.attempts).toBe(2);
+    expect(store.created.filter((entry) => entry.kind === "message")).toHaveLength(1);
+    // And the transcript carries that one message, not two.
+    expect(result.messages.filter((message) => message.role === "user")).toHaveLength(1);
+  });
+
+  it("reuses the prompt's persisted id in the transcript it hands back", async () => {
+    const { turn, store } = run({ steps: [{ parts: [...text("t1", "Hi"), finish("stop")] }] });
+    const result = await turn.run("hi");
+    const persisted = store.created.find((entry) => entry.kind === "message");
+    const inTranscript = result.messages.find((message) => message.role === "user");
+    // The id a reload reads and the id the model was given are the same string.
+    // Two ids for one question is how a transcript grows a duplicate.
+    expect(inTranscript?.id).toBe(persisted?.id);
+  });
+
+  it("files the prompt as a TEXT part and closes it `completed`", async () => {
+    /**
+     * Both halves are contracts with their own measured defects, and the prompt
+     * write is a third way in.
+     *
+     * - `partType` is not a detail: a delta used to arrive without one and a
+     *   reasoning delta was persisted as a text part, so the model's thinking
+     *   was rendered as something it had said (§5.1).
+     * - `status: "completed"` is not a detail either: a part left `streaming` is
+     *   one a reload cannot tell from "still being written" (§6.1), and the
+     *   user is done typing.
+     */
+    const store = createStore();
+    const flushes: { partType: string; contentText: string; partId: string }[] = [];
+    const closes: { partId: string; status: string }[] = [];
+    const originalFlush = store.flushDelta.bind(store);
+    store.flushDelta = async (input) => {
+      flushes.push({ partType: input.partType, contentText: input.contentText, partId: input.partId });
+      await originalFlush(input);
+    };
+    const originalClose = store.closePart.bind(store);
+    store.closePart = async (input) => {
+      closes.push({ partId: input.partId, status: input.status });
+      await originalClose(input);
+    };
+    const tools = [echoTool()];
+
+    const turn = new AgentTurn({
+      model: createMockModel({ steps: [{ parts: [...text("t1", "Hi"), finish("stop")] }] }),
+      instructions: "test",
+      tools,
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      sessionId: "s1",
+      turnId: "t1",
+      store,
+      approval: approvalFor(allowAll, tools),
+      onEvent: () => {},
+      approve: async () => "allow-once",
+      sleep: noSleep,
+      random: () => 0.5,
+    });
+    await turn.run("the question");
+
+    const promptFlush = flushes.find((entry) => entry.contentText === "the question");
+    expect(promptFlush?.partType).toBe("text");
+    expect(closes).toContainEqual({ partId: promptFlush?.partId, status: "completed" });
+  });
+
+  it("awaits the turn row before writing the message that references it", async () => {
+    /**
+     * The await is the assertion, and it is not the same claim as "the turn row
+     * is created" — `store.appendTurn(...).catch(() => undefined)` creates it
+     * too, just not *before* anything else. `parts` → `messages` → `turns` is a
+     * chain of real foreign keys, so an un-awaited create is a
+     * `FOREIGN KEY constraint failed: messages.id = …` waiting for a slow disk.
+     *
+     * Measured with a deferred create: `appendMessage` must not be called until
+     * the turn's promise settles.
+     */
+    const store = createStore();
+    let releaseTurn: () => void = () => {};
+    const turnRowWritten = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    store.appendTurn = async () => {
+      await turnRowWritten;
+    };
+    const order: string[] = [];
+    const originalMessage = store.appendMessage.bind(store);
+    store.appendMessage = async (input) => {
+      order.push("appendMessage");
+      await originalMessage(input);
+    };
+    const originalFlush = store.flushDelta.bind(store);
+    store.flushDelta = async (input) => {
+      if (input.contentText === "hi") order.push("flushDelta:prompt");
+      await originalFlush(input);
+    };
+    const tools = [echoTool()];
+
+    const turn = new AgentTurn({
+      model: createMockModel({ steps: [{ parts: [...text("t1", "Hi"), finish("stop")] }] }),
+      instructions: "test",
+      tools,
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      sessionId: "s1",
+      turnId: "t1",
+      store,
+      approval: approvalFor(allowAll, tools),
+      onEvent: () => {},
+      approve: async () => "allow-once",
+      sleep: noSleep,
+      random: () => 0.5,
+    });
+
+    const running = turn.run("hi");
+    // Give the engine every chance to run ahead of the pending create.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(order).toEqual([]);
+
+    releaseTurn();
+    await running;
+    expect(order).toEqual(["appendMessage", "flushDelta:prompt"]);
+  });
+
+  it("writes nothing for a resumed approval, which asks no new question", async () => {
+    const tools = [echoTool()];
+    const store = createStore();
+    const turn = new AgentTurn({
+      model: createMockModel({
+        steps: [
+          { parts: [toolCall({ toolCallId: "c1", toolName: "echo", input: { value: "x" } }), finish("tool-calls")] },
+          { parts: [...text("t1", "approved and done"), finish("stop")] },
+        ],
+      }),
+      instructions: "test",
+      tools,
+      workspace: createMemoryWorkspace(),
+      cwd: ".",
+      sessionId: "s1",
+      turnId: "t1",
+      store,
+      approval: approvalFor(askAll, tools),
+      onEvent: () => {},
+      approve: async () => "allow-once",
+      sleep: noSleep,
+      random: () => 0.5,
+    });
+
+    const paused = await turn.run("echo x");
+    expect(paused.outcome).toBe("awaiting-approval");
+    expect(store.created.filter((entry) => entry.kind === "message")).toHaveLength(1);
+
+    const resumed = await turn.respondToApproval({
+      approvalId: paused.openApprovals[0]?.approvalId ?? "",
+      approved: true,
+    });
+    expect(resumed?.outcome).toBe("succeeded");
+    // The resume re-sends the transcript with no new question, so a second
+    // user row would be an empty bubble in the log.
+    expect(store.created.filter((entry) => entry.kind === "message")).toHaveLength(1);
+  });
+
+  it("fails the turn, with a typed event, when the prompt cannot be persisted", async () => {
+    /**
+     * A rejected create is not a thrown `run()`: `AGENTS.md` §5 says what the
+     * user must see becomes an event. And `attempts: 0` is the honest number —
+     * the point of failing here is that no request ever left the tab.
+     */
+    const { turn, events, store } = run({ steps: [{ parts: [...text("t1", "Hi"), finish("stop")] }] });
+    store.appendMessage = async () => {
+      throw new Error("database_closed");
+    };
+    const result = await turn.run("hi");
+
+    expect(result.outcome).toBe("failed");
+    expect(result.attempts).toBe(0);
+    expect(result.classification).toMatchObject({ kind: "protocol-error" });
+    expect(result.classification).toHaveProperty(
+      "reason",
+      expect.stringContaining("database_closed"),
+    );
+    expect(kinds(events)).toContain("error");
+    // And the model was never asked.
+    expect(kinds(events)).not.toContain("attempt-started");
   });
 
   it("records the attempt as succeeded and not interrupted", async () => {

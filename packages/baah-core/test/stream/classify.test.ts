@@ -18,12 +18,13 @@ import {
   normalizeErrorType,
   NON_RETRYABLE_ERROR_TYPES,
   parseRetryAfter,
+  readTerminalEvent,
   RETRYABLE_ERROR_TYPES,
   type Classification,
 } from "../../src/stream/classify.ts";
 
-/** A stream that ran to completion. */
-const cleanStream = { partCount: 12, sawTerminalEvent: true, sawErrorEvent: false };
+/** A stream that ran to completion, with a provider reason behind the `finish`. */
+const cleanStream = { partCount: 12, terminalEvent: "provider", sawErrorEvent: false } as const;
 
 describe("step 1 — no response at all", () => {
   it("is no-response, and never retried", () => {
@@ -110,17 +111,62 @@ describe("step 4 — a 200 is a claim, not a fact", () => {
     ).toEqual({ kind: "success" });
   });
 
-  it("a stream that ended without a terminal event is a protocol error", () => {
+  it("a closing part the SDK synthesised is a protocol error", () => {
     // The case Plan.md §5.4 lists as "abgeschnitten": chunks arrived, the
-    // connection closed, no `finish`.
+    // connection closed, and the `finish` part is the SDK's own — built from its
+    // initial `("other", undefined)` because no provider terminal chunk came.
+    // Measured part sequences are in `test/agent/terminal-event.test.ts`.
     expect(
       classifyResponse({
         responded: true,
         status: 200,
         headers: { "content-type": "text/event-stream" },
-        stream: { partCount: 7, sawTerminalEvent: false, sawErrorEvent: false },
+        stream: { partCount: 7, terminalEvent: "synthesized", sawErrorEvent: false },
       }),
     ).toEqual({ kind: "protocol-error", reason: "stream ended without a terminal event (7 parts)" });
+  });
+
+  it("a closing part with a provider reason is a SUCCESS even when raw is absent", () => {
+    /**
+     * The F1 regression, at the unit that owns the rule.
+     *
+     * `@ai-sdk/openai`'s Responses path fills the finish part's `raw` reason
+     * from `response.incomplete_details?.reason`, and a **clean**
+     * `response.completed` has no `incomplete_details` — so `rawFinishReason`
+     * is `undefined` on every successful Responses turn. The check used to be
+     * `rawFinishReason !== undefined`, which made all of them read as truncated
+     * and burned three requests each.
+     *
+     * Measured in `@ai-sdk/openai@4.0.81/dist/index.js`:
+     * `raw: value.response.incomplete_details?.reason ?? void 0`.
+     *
+     * `readTerminalEvent` is what turns that `("stop", undefined)` part into
+     * `"provider"` rather than `"synthesized"`; this asserts the consequence
+     * at the classification, and `terminal-event.test.ts` asserts the read.
+     */
+    expect(
+      classifyResponse({
+        responded: true,
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+        stream: { partCount: 9, terminalEvent: "provider", sawErrorEvent: false },
+      }),
+    ).toEqual({ kind: "success" });
+  });
+
+  it("a stream with no finish part at all is a protocol error too", () => {
+    // Defensive: `ai`'s `flush()` synthesises one, so this is unreachable
+    // through `ToolLoopAgent` today. It is classified as a failure rather than a
+    // success so a future SDK that stops synthesising cannot turn a truncation
+    // into a silently accepted answer.
+    expect(
+      classifyResponse({
+        responded: true,
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+        stream: { partCount: 4, terminalEvent: "absent", sawErrorEvent: false },
+      }),
+    ).toEqual({ kind: "protocol-error", reason: "stream ended without a terminal event (4 parts)" });
   });
 
   it("an error event inside a 200 stream is a protocol error", () => {
@@ -129,7 +175,7 @@ describe("step 4 — a 200 is a claim, not a fact", () => {
         responded: true,
         status: 200,
         headers: { "content-type": "text/event-stream" },
-        stream: { partCount: 4, sawTerminalEvent: true, sawErrorEvent: true },
+        stream: { partCount: 4, terminalEvent: "provider", sawErrorEvent: true },
       }),
     ).toEqual({ kind: "protocol-error", reason: "error event inside a 4-part stream" });
   });
@@ -141,7 +187,7 @@ describe("step 4 — a 200 is a claim, not a fact", () => {
       responded: true,
       status: 200,
       headers: { "content-type": "text/event-stream" },
-      stream: { partCount: 9, sawTerminalEvent: true, sawErrorEvent: true },
+      stream: { partCount: 9, terminalEvent: "provider", sawErrorEvent: true },
     });
     expect(result.kind).toBe("protocol-error");
   });
@@ -152,9 +198,77 @@ describe("step 4 — a 200 is a claim, not a fact", () => {
         responded: true,
         status: 200,
         headers: { "content-type": "text/event-stream" },
-        stream: { partCount: 0, sawTerminalEvent: false, sawErrorEvent: false },
+        stream: { partCount: 0, terminalEvent: "synthesized", sawErrorEvent: false },
       }),
     ).toEqual({ kind: "protocol-error", reason: "stream ended without a terminal event (0 parts)" });
+  });
+
+  it("composes with `readTerminalEvent` — the rule, applied to the real part pairs", () => {
+    /**
+     * The second path for the terminal-event rule, and deliberately a
+     * **composition** rather than a second copy of the table.
+     *
+     * Every other case in this file hand-writes a `TerminalEvent`, which means
+     * none of them can see the rule that produces it — a check that is wrong
+     * about a *part* is invisible to a test that never reads a part. The
+     * five pairs below are the five a provider stream can close with; the
+     * measurement of where they come from is in
+     * `test/agent/terminal-event.test.ts`, which drives the real
+     * `ToolLoopAgent`.
+     *
+     * This file is the *classifier's* test, so the claim it makes is the one
+     * that matters for a reader of `classifyResponse`: a read followed by a
+     * classification. That is exactly the sequence the loop performs, and a
+     * mutation of either half is caught here.
+     */
+    const through = (finishReason: unknown, rawFinishReason: unknown) =>
+      classifyResponse({
+        responded: true,
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+        stream: {
+          partCount: 6,
+          terminalEvent: readTerminalEvent({ finishReason, rawFinishReason }),
+          sawErrorEvent: false,
+        },
+      });
+
+    // A stream the SDK closed itself.
+    expect(through("other", undefined).kind).toBe("protocol-error");
+    // Chat completions, clean.
+    expect(through("stop", "stop")).toEqual({ kind: "success" });
+    // The OpenAI Responses clean completion: no `incomplete_details`, so no raw
+    // reason — and NOT a truncation. This is the F1 line.
+    expect(through("stop", undefined)).toEqual({ kind: "success" });
+    // …and the same, for a turn that called a tool.
+    expect(through("tool-calls", undefined)).toEqual({ kind: "success" });
+    // A provider that terminates on purpose and maps to the SDK's placeholder.
+    expect(through("other", "other")).toEqual({ kind: "success" });
+  });
+
+  it("names the SDK's own empty-stream signal, so the UI can tell it from a mid-stream error", () => {
+    /**
+     * `NoOutputGeneratedError` is the one truncation this layer can state as a
+     * fact rather than an inference: `ai` raises it from the step transform's
+     * `flush()` when the stream closed with neither a terminal chunk **nor any
+     * output**. It gets its own wording so a UI showing the reason can separate
+     * "the provider produced nothing and never finished" from "the provider
+     * reported an error mid-stream" — different defects, same retry class.
+     */
+    const noOutput = Object.assign(new Error("No output generated. The model stream ended without a finish chunk."), {
+      name: "AI_NoOutputGeneratedError",
+    });
+    expect(
+      classifyResponse({
+        responded: true,
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+        stream: { partCount: 2, terminalEvent: "synthesized", sawErrorEvent: true, errorEvent: noOutput },
+      }),
+    ).toEqual({
+      kind: "protocol-error",
+      reason: "stream ended without a finish chunk and produced no output (2 parts)",
+    });
   });
 });
 

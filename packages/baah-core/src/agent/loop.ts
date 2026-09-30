@@ -32,21 +32,27 @@
  *
  * Retry is driven by `stream/classify.ts` — `classifyResponse` is called for
  * every failed turn, with the facts that turn observed, so the JSON-error-body
- * check, the content-type check and the `sawTerminalEvent` observation are
+ * check, the content-type check and the `terminalEvent` observation are
  * exercised by real turns and not only by their own unit tests. Two rules that
  * are easy to get wrong and are therefore load-bearing below:
  *
- * - a stream that ends **without a provider finish chunk** is a failure, and
+ * - a stream whose closing part is the **SDK's own** — synthesised from its
+ *   initial `("other", undefined)` because no provider terminal chunk arrived —
+ *   is a failure, and
  * - a **retry never continues the failed attempt**: the partial text stays in
  *   the transcript marked `interrupted`, and the next attempt starts from the
  *   original prompt. Copying partial text forward would show the user text the
  *   model never finished and would make the failure undiagnosable.
  *
- * The terminal-event check reads `rawFinishReason`, the provider's own value.
- * What is *not* reachable at this layer — the raw SSE chunk stream — is stated
- * where the check is used rather than approximated, because approximating it is
- * exactly what made the previous check fire on correct answers.
- *
+ * The terminal-event check is a **three-state** observation, not a boolean, and
+ * that shape is the whole fix. It used to read
+ * `rawFinishReason !== undefined`, which is populated on four of the five
+ * installed provider paths and structurally absent on the fifth — so every
+ * successful OpenAI Responses turn was read as a truncated stream and retried
+ * three times. What is *not* reachable at this layer — the raw SSE chunk
+ * stream — is stated where the check is used rather than approximated, because
+ * approximating it is exactly what made the previous check fire on correct
+ * answers. See the `finish` case below and `TerminalEvent` in `classify.ts`. *
  * ## Nothing here writes to the console, and no promise is discarded bare
  *
  * AGENTS.md §5: everything the user must see becomes a typed event. A provider
@@ -68,7 +74,7 @@
  *
  * `@all-the.rest/baah-storage` is a sibling, not a dependency of this package,
  * and AGENTS.md §4 forbids a pointer back. The engine talks to a narrow
- * {@link TurnStore} — ten methods, all of which `StorageDatabase` already
+ * {@link TurnStore} — twelve methods, all of which `StorageDatabase` already
  * implements (Plan.md §16.1).
  *
  * ## The seam is this wide for a reason
@@ -80,8 +86,10 @@
  * reload cannot tell "still writing" from "died mid-sentence"), a heartbeat
  * that was the one write on the interface not scoped to a session, and a
  * recovery that appended a second `interrupted` outcome to a turn it had already
- * closed. Widening an interface is cheap; a hole in it is measured by somebody
- * else, later, in a browser.
+ * closed. A fifth, later: the seam could not **create** the rows its parts
+ * attach to, so the first write of a turn failed a foreign key and an app
+ * wrapped the store to work around it. Widening an interface is cheap; a hole in
+ * it is measured by somebody else, later, in a browser.
  */
 
 import {
@@ -94,7 +102,14 @@ import {
   type UIMessageChunk,
 } from "ai";
 
-import { classifyResponse, isKnownErrorType, type Classification } from "../stream/classify.ts";
+import {
+  classifyResponse,
+  isKnownErrorType,
+  mergeTerminalEvent,
+  readTerminalEvent,
+  type Classification,
+  type TerminalEvent,
+} from "../stream/classify.ts";
 import { MAX_ATTEMPTS, nextDelayMs, remainingAttempts } from "../stream/backoff.ts";
 import type { ApprovalResolver } from "./approval.ts";
 import {
@@ -138,8 +153,26 @@ export type AgentEvent =
    * neither: it surfaces the gap, and the model is told to verify rather than
    * repeat. See the residual-risk note where the short-circuit lives.
    */
-  | { type: "tool-outcome-unknown"; toolCallId: string; toolName: string; input: unknown }
-  | { type: "approval-requested"; approvalId: string; toolCallId: string; toolName: string; reason: string | undefined }
+  | { type: "tool-outcome-unknown" } & UnknownToolOutcome
+  /**
+   * An approval card is waiting for the user.
+   *
+   * **The payload is `OpenApproval`, intersected rather than re-listed.** It
+   * used to be four hand-written fields — `approvalId`, `toolCallId`,
+   * `toolName`, `reason` — while the constructor spread all five members of
+   * `OpenApproval`, `input` included. TypeScript did not catch it because
+   * excess-property checking does not apply to a spread of a typed value, so
+   * the union silently under-described what the engine sends.
+   *
+   * That is not a cosmetic gap: an approval card that has to render *what is
+   * about to be written* — the path, the diff, the shell command — had no
+   * source for the input on the event, and the app reached into the turn
+   * snapshot to get it instead, documenting the SDK's behaviour as if it were
+   * ours. Intersecting the two types makes the drift impossible rather than
+   * merely tested for: a field added to {@link OpenApproval} now *cannot* be
+   * missing here.
+   */
+  | { type: "approval-requested" } & OpenApproval
   | { type: "approval-answered"; approvalId: string; approved: boolean }
   /** A step finished — the checkpoint point (AGENTS.md §3.1, `onStepEnd`). */
   | { type: "step-end"; stepNumber: number; text: string; toolCallCount: number; finishReason: string }
@@ -193,6 +226,16 @@ export type AgentEvent =
 
 export type TurnOutcome = "succeeded" | "failed" | "interrupted" | "waiting" | "awaiting-approval";
 
+/**
+ * An approval the turn is parked on, and the payload of the
+ * `approval-requested` event.
+ *
+ * `input` is the tool's **already-validated arguments** — the same object the
+ * tool will receive, taken from the SDK's `toolCall`, not re-derived. It is the
+ * only thing on this interface that tells an approval card *what* it is
+ * approving, and §7.5's copy ("`write` auf `src/app.ts`") cannot be written
+ * without it.
+ */
 export interface OpenApproval {
   approvalId: string;
   toolCallId: string;
@@ -284,9 +327,61 @@ export interface TurnOutcomeEntry {
  * **Every write on this seam is session-scoped, and one of them used not to
  * be.** `heartbeat` carried only a `turnId`, so it was the single write on the
  * interface that could renew an arbitrary turn's anchor from any session. It
- * now carries the session like the other nine.
+ * now carries the session like the other eleven.
+ *
+ * **Two of them create rather than update**, and that is the seam's third
+ * measured gap: the engine mints the ids it writes under, so a store with no
+ * `appendTurn` / `appendMessage` cannot accept the first write of a turn at
+ * all. `Plan.md` §6.1 wanted `appendTurn` in storage and it is there; the
+ * engine's side of the contract was missing, so an app had to wrap the seam to
+ * manufacture the rows. Each of the twelve is named at its declaration.
  */
 export interface TurnStore {
+  /**
+   * Create the turn row, if it does not exist.
+   *
+   * ## Why this is here and was not
+   *
+   * `flushDelta` writes a **part**, and `parts.message_id` references
+   * `messages.id` and `messages.turn_id` references `turns.id` — both enforced
+   * as real foreign keys. The engine mints `turnId` and `messageId` itself and
+   * then writes parts under them, so without a create the very first write of a
+   * turn fails with `FOREIGN KEY constraint failed: messages.id = …`. That is
+   * not hypothetical: the app hit it, and papered over it with a decorator
+   * (`withTranscriptRows`) that manufactured the two rows before delegating.
+   *
+   * The decorator is the wrong shape for a reason beyond the extra file: the
+   * engine has to *learn* the turn id from the first call that carries one,
+   * because the interface never told it when the turn began. It guesses, and a
+   * guess about which row a message belongs to is exactly the class of bug this
+   * seam is for.
+   *
+   * **Idempotent by `id`.** Called once per turn by the engine, but a
+   * `regenerate` re-sends into a fresh turn and a resumed approval re-enters the
+   * same one, so "already there" is a normal state and not an error.
+   */
+  appendTurn(input: { id: string; sessionId: string; startedAt: string }): Promise<void>;
+  /**
+   * Create a message row, if it does not exist.
+   *
+   * `role: "user"` is the engine's **own** prompt, written before the first
+   * model call — see `AgentTurn.run` for why that ordering is the contract and
+   * not an implementation detail. `turnId` is `string | null` rather than
+   * optional because a message written with no turn is a real state (a turn that
+   * was never created) and it must be *said*, not omitted: with
+   * `exactOptionalPropertyTypes` an omitted key is a different type from an
+   * explicit `null`.
+   *
+   * Idempotent by `id` for the same reason {@link TurnStore.appendTurn} is.
+   */
+  appendMessage(input: {
+    id: string;
+    sessionId: string;
+    role: "user" | "assistant" | "system";
+    turnId: string | null;
+    createdAt: string;
+    updatedAt: string;
+  }): Promise<void>;
   /**
    * One buffered streaming flush (Plan.md §6.2), idempotent over `deltaId`.
    *
@@ -777,12 +872,80 @@ export class AgentTurn {
     this.#controller.abort();
   }
 
+  /**
+   * Send a prompt, stream, run tools, retry — and **own the prompt's row**.
+   *
+   * ## Why the engine persists the user's prompt, and not the app
+   *
+   * The app wrote it (`lib/runtime.ts`'s `recordUserMessage`) and the engine's
+   * contract had nowhere to put it. That is work at the wrong layer, and the
+   * argument is not "the engine is lower down" — it is four things, each of
+   * which the app cannot do:
+   *
+   * 1. **The engine receives it.** `run(prompt)` is the only place the text
+   *    enters the system, and `baseMessages` is the transcript the retries are
+   *    computed from. An app that also holds the prompt holds a *second* copy
+   *    that nothing reconciles, and the two drift the first time a retry,
+   *    an approval resume or a `regenerate` happens.
+   * 2. **§6.1 wants it in `seq` order with the rest of the transcript, and
+   *    `seq` is allocated by whoever writes first.** The engine writes the
+   *    assistant message and the `idle` outcome; the app wrote the prompt. A
+   *    turn whose prompt is written by the other party has its ordering decided
+   *    by a race, and `UNIQUE (session_id, seq)` turns that race into a
+   *    constraint failure — which is the failure the UI actually hit.
+   * 3. **The retry rule is an engine rule.** §5.4: a retry re-sends the
+   *    original prompt and the failed attempt's text is never copied forward.
+   *    For the prompt to be written once per turn while the *attempts* are
+   *    separate, the party that decides "this is a retry" has to be the party
+   *    that wrote it. Otherwise a UI that misses one `attempt-started` event
+   *    produces a transcript with two questions in one turn, or none.
+   * 4. **The crash window.** A turn that dies before its first delta has
+   *    produced nothing yet; the prompt is the only thing the user is
+   *    guaranteed to have sent, and it is the one thing that has to survive.
+   *
+   * ## Why the flush is here and not at a step boundary
+   *
+   * **Before the first model call, awaited**, and that is the contract:
+   *
+   * - A step boundary is only reached *after* the model produced something. A
+   *   turn that fails at the first request — 401, quota, a connection that never
+   *   opened — would never reach one, and those are exactly the turns a user
+   *   comes back to after fixing a key. The question would be in no store.
+   * - `seq` has to be deterministic. If the flush waits for the first delta, a
+   *   fast provider can emit the assistant message before the prompt row lands,
+   *   and the transcript reads assistant-then-user.
+   * - §6.2's checkpointing exists for work already done (`onStepEnd`); the prompt
+   *   is the first thing that exists, so it belongs at the first possible
+   *   moment rather than the first *interesting* one.
+   *
+   * ## Once per turn, not once per attempt
+   *
+   * A retry re-sends the *same* prompt into the *same* turn, so the row is
+   * written once and the attempts differ in the assistant message. The prompt
+   * message id is minted here and threaded into every attempt for the same
+   * reason: it used to be minted per attempt, so a retried turn put the same
+   * question in the log under a different id each time.
+   */
   async run(prompt: string): Promise<TurnResult> {
     const { stallTimeoutMs = DEFAULT_STALL_TIMEOUT_MS } = this.#options;
     const attemptLog: AttemptRecord[] = [];
     const baseMessages = [...(this.#options.messages ?? [])];
     /** Retries already spent on an *unrecognised* error type (§5.4: only one). */
     let unknownErrorRetries = 0;
+
+    /**
+     * The prompt's message id, or `undefined` when there is no prompt.
+     *
+     * `undefined` is the resumed-approval case: `#continue` re-sends the
+     * transcript with no new question, and writing an empty user message there
+     * would put a blank bubble in the log.
+     */
+    const promptMessageId = prompt === "" ? undefined : newMessageId();
+
+    if (promptMessageId !== undefined) {
+      const failure = await this.#persistPrompt(prompt, promptMessageId);
+      if (failure !== undefined) return failure;
+    }
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       if (this.#controller.signal.aborted) break;
@@ -795,7 +958,7 @@ export class AgentTurn {
       // A retry always starts from the *original* transcript. This is the
       // mechanical guarantee behind "Nie wird der Teiltext eines fehlgeschlagenen
       // Versuchs in den neuen kopiert" (Plan.md §5.4).
-      const observation = await this.#runAttempt(baseMessages, prompt, attempt);
+      const observation = await this.#runAttempt(baseMessages, prompt, attempt, promptMessageId);
 
       if (observation.kind === "success") {
         attemptLog.push({ attempt, text: observation.text, interrupted: false, classification: { kind: "success" } });
@@ -996,7 +1159,9 @@ export class AgentTurn {
     // `lastAssistantMessageIsCompleteWithApprovalResponses` (the
     // `sendAutomaticallyWhen` condition from §7.6) sees that the pending call
     // now has its answer, so this continues the turn instead of starting one.
-    const observation = await this.#runAttempt(messages, "", 1);
+    // `promptMessageId` is `undefined` and nothing is persisted: the question
+    // was asked and written once, by `run`.
+    const observation = await this.#runAttempt(messages, "", 1, undefined);
     if (observation.kind === "success") {
       this.#emit({ type: "turn-finished", outcome: "succeeded", attempts: 1 });
       await this.#finish("succeeded", undefined);
@@ -1076,6 +1241,93 @@ export class AgentTurn {
     };
   }
 
+  /**
+   * Write the turn row, the prompt's message row and its text part.
+   *
+   * **Awaited, in that order, before the first model call** — the ordering is
+   * the foreign keys' (`parts` → `messages` → `turns`) and the argument for
+   * doing it here at all is on {@link AgentTurn.run}.
+   *
+   * The text goes into a **part**, not into `messages`, because §6.1's schema
+   * has no text column on `messages` and the read port renders parts. It is
+   * written through {@link TurnStore.flushDelta} + {@link TurnStore.closePart}
+   * rather than a new method, and that is not a shortcut: those two *are* the
+   * engine's protocol for "a part whose text is now known", the delta id makes
+   * the write idempotent, and reusing them means the prompt's part lands in the
+   * same transaction shape as every other part instead of in a second code path
+   * that has to be kept in step.
+   *
+   * A **rejection is a `failed` turn, not a thrown `run()`** — `AGENTS.md` §5:
+   * what the user must see becomes a typed event. And it does *not* call
+   * `finishTurn`, because there is no turn row to finish in the usual case; the
+   * row that does exist is left for `recoverStaleTurns`, which is the designed
+   * path for "a turn began and did not finish".
+   *
+   * @returns the failed `TurnResult`, or `undefined` when the write succeeded.
+   */
+  async #persistPrompt(
+    text: string,
+    messageId: string,
+  ): Promise<TurnResult | undefined> {
+    const { store, sessionId, turnId, now = Date.now } = this.#options;
+    const at = new Date(now()).toISOString();
+    /** Part id, minted once so a replay of this write lands on the same row. */
+    const partId = newMessageId();
+    try {
+      await store.appendTurn({ id: turnId, sessionId, startedAt: at });
+      await store.appendMessage({
+        id: messageId,
+        sessionId,
+        role: "user",
+        turnId,
+        createdAt: at,
+        updatedAt: at,
+      });
+      await store.flushDelta({
+        deltaId: `${turnId}#prompt#${partId}#0`,
+        partId,
+        messageId,
+        sessionId,
+        partType: "text",
+        contentText: text,
+      });
+      // `completed`, not `streaming`: the user is done typing, and a prompt
+      // marked in flight is a part a reload renders as "still being written".
+      await store.closePart({ sessionId, messageId, partId, status: "completed" });
+      return undefined;
+    } catch (error: unknown) {
+      /**
+       * `protocol-error`, not `no-response` and not a bare throw.
+       *
+       * §5.4's "no response at all" means *the provider* went quiet, and this
+       * is the opposite: the turn never left the tab, so the user's wait was
+       * for a request that was never sent. `protocol-error` is retryable, which
+       * is also right — the next attempt re-runs the same flush against a
+       * database that may have been reopened.
+       */
+      const classification: Classification = {
+        kind: "protocol-error",
+        reason: `the turn could not be persisted: ${describeStorageFailure(error)}`,
+      };
+      this.#emit({ type: "error", error, classification });
+      this.#emit({ type: "turn-finished", outcome: "failed", attempts: 0 });
+      return {
+        outcome: "failed",
+        // Zero: no attempt was ever made. Reporting 1 would claim a request
+        // left the process, and the whole point of failing here is that it did
+        // not — which is the cheaper direction to be wrong in.
+        attempts: 0,
+        text: "",
+        classification,
+        attemptLog: [],
+        openApprovals: [],
+        messages: [...(this.#options.messages ?? [])],
+        hitStepLimit: false,
+        unknownOutcomes: [],
+      };
+    }
+  }
+
   async #finish(outcome: "succeeded" | "failed" | "interrupted", error: string | undefined): Promise<void> {
     const { store, sessionId, turnId } = this.#options;
     // `error` is always sent, as `undefined` when there is none: with
@@ -1088,6 +1340,7 @@ export class AgentTurn {
     messages: readonly UIMessage[],
     prompt: string,
     attempt: number,
+    promptMessageId: string | undefined,
   ): Promise<AttemptObservation> {
     const {
       store,
@@ -1184,14 +1437,22 @@ export class AgentTurn {
     /**
      * Observations for one attempt.
      *
-     * `sawTerminalEvent` is the success signal, not "the stream ended": a stream
-     * that stops without a provider `finish` chunk is a failure whatever the
-     * HTTP status said (Plan.md §5.4, step 5). How it is established — and what
-     * is *not* observable here — is documented at the `finish` case below.
+     * `terminalEvent` is the success signal, and it is a **three-state
+     * observation** rather than a boolean because the fields it is derived from
+     * are not populated on every provider path. How it is established — and what
+     * is *not* observable here — is documented at the `finish` case below and on
+     * `TerminalEvent` in `stream/classify.ts`.
      */
     let text = "";
     let reasoning = "";
-    let sawTerminalEvent = false;
+    /**
+     * Starts `"absent"` and is folded forward by every `finish` part.
+     *
+     * The fold is monotone towards the worse state — a turn whose second step
+     * was cut must not be excused by its first step's clean `finish`. See
+     * `mergeTerminalEvent`.
+     */
+    let terminalEvent: TerminalEvent = "absent";
     /** Parts observed, the evidence §5.4's step 5 is reported with. */
     let partCount = 0;
     let lastFinishReason: string | undefined;
@@ -1404,7 +1665,15 @@ export class AgentTurn {
         ? [...messages]
         : [
             ...messages,
-            { id: newMessageId(), role: "user", parts: [{ type: "text", text: prompt }] },
+            {
+              // The id the prompt was **persisted** under, not a fresh one.
+              // It used to be minted per attempt, so a retried turn carried the
+              // same question under a different id each time and the log grew
+              // one row per attempt for a turn that asked it once.
+              id: promptMessageId ?? newMessageId(),
+              role: "user",
+              parts: [{ type: "text", text: prompt }],
+            },
           ];
     const modelMessages = await convertToModelMessages(uiMessages, { tools: toolSet });
 
@@ -1655,44 +1924,58 @@ export class AgentTurn {
 
           case "finish":
             /**
-             * The terminal-event check — on the provider's own signal, not a
-             * guess about the finish reason.
+             * The terminal-event check — and the reason it reads **two** fields
+             * is written out here, because this is the line that used to be a
+             * bug.
              *
-             * `TextStreamFinishPart.rawFinishReason` is the provider's own finish
-             * reason, verbatim; the SDK leaves it `undefined` on a finish part it
-             * **synthesises** after a stream that ended without one. That is the
-             * discriminator, and it is a public, typed field
-             * (`ai/dist/index.d.ts`, `type TextStreamFinishPart`) rather than an
-             * inference from a normalised value.
+             * It read `sawTerminalEvent = part.rawFinishReason !== undefined`.
+             * That field alone is **not** a discriminator. Measured against the
+             * installed providers:
              *
-             * What it replaces, and why that had to go: `finishReason !== "other"`
-             * cannot work, because `ai@7.0.122` does
-             * `unified: finishReason === "unknown" ? "other" : finishReason`. A
-             * provider that terminates *deliberately* with the spec-legal
-             * `"unknown"` produces a part sequence **byte-identical** to a
-             * truncated one — both report `"other"` — and was therefore read as a
-             * truncation and retried: three requests for an answer that had
-             * already arrived. Guessing a terminal event from a normalised
-             * reason is worse than having no check, because it fires on answers.
+             * | path | `raw` on a **clean** completion | source |
+             * |---|---|---|
+             * | `@ai-sdk/openai` chat | `choice.finish_reason`, always set | `raw: choice.finish_reason` |
+             * | `@ai-sdk/openai` **responses** | `incomplete_details?.reason` — **absent** | `raw: value.response.incomplete_details?.reason ?? void 0` |
+             * | `@ai-sdk/anthropic` | `delta.stop_reason`, always set | |
+             * | `@ai-sdk/google` | `candidate.finishReason`, always set | |
+             * | `@ai-sdk/openai-compatible` | `choice.finish_reason`, always set | |
              *
-             * The second, typed half of the check is
-             * `AI_NoOutputGeneratedError` — the SDK's own "the model stream
-             * ended without a finish chunk", which it raises when a stream closes
-             * with neither a terminal chunk nor any output. That one carries no
-             * guess at all, and it is handled below where the error is
-             * classified.
+             * `incomplete_details` is a field of an *incomplete* response, so a
+             * clean `response.completed` does not carry it — and every
+             * successful OpenAI Responses turn therefore read as a truncated
+             * stream and was retried three times, for an answer that had already
+             * arrived. It was found by a UI agent reading the installed package,
+             * not by a core test, because the mock model always filled the
+             * field: a mock that only knows the populated shape cannot see a
+             * check that is wrong about the *unpopulated* one.
+             *
+             * `readTerminalEvent` (in `stream/classify.ts`, which owns the rule)
+             * reads both fields. The SDK's own initial values for a step are
+             * `("other", undefined)`, and a `finish` part is synthesised from
+             * them **only** when no provider terminal chunk arrived — so a part
+             * still holding both is the SDK reporting a cut stream, and a part
+             * holding **either** a provider reason or a non-placeholder reason
+             * is a provider's. Both halves are load-bearing: `raw` alone misses
+             * the clean Responses turn, and `finishReason !== "other"` alone is
+             * the check this replaced, which fired on a provider that terminates
+             * deliberately and was retried for an answer that had arrived.
+             *
+             * The error direction is why this is worth the care: a false
+             * "truncated" costs three requests and a visibly duplicated answer
+             * **on a correct response**; a missed truncation costs one turn the
+             * user regenerates.
              *
              * **What is still not observable, honestly:** the provider's *raw*
-             * chunk stream. `ToolLoopAgentSettings` has no `onChunk`, no
-             * `includeRawChunks` and no `onError` (verified against the installed
-             * `dist/index.d.ts`), so the SSE-level `data: [DONE]` that Plan.md
-             * §5.4 names cannot be seen from here at all. Reaching it means
-             * wrapping the `LanguageModel` in the provider registry — a separate
-             * decision, not taken here. This is recorded as a limitation in
-             * Plan.md §5.4 rather than papered over, because a check that
-             * pretends to be raw when it is not is how this bug happened.
+             * chunk stream, so §5.4's SSE-level `data: [DONE]` cannot be seen
+             * from here at all. `ToolLoopAgentSettings` has no `onChunk`, no
+             * `includeRawChunks` and no `onError` (verified against the
+             * installed `dist/index.d.ts`). Reaching it means wrapping the
+             * `LanguageModel` in the provider registry — a separate decision,
+             * not taken here. Recorded as a limitation in Plan.md §5.4 rather
+             * than papered over, because a check that pretends to be raw when it
+             * is not is how this bug happened.
              */
-            sawTerminalEvent = part.rawFinishReason !== undefined;
+            terminalEvent = mergeTerminalEvent(terminalEvent, readTerminalEvent(part));
             lastFinishReason = part.finishReason;
             break;
 
@@ -1780,7 +2063,7 @@ export class AgentTurn {
           error: streamError,
           stream: {
             partCount,
-            sawTerminalEvent,
+            terminalEvent,
             sawErrorEvent: sawErrorPart,
             errorEvent: streamError,
           },
@@ -1790,25 +2073,39 @@ export class AgentTurn {
       };
     }
 
-    // Step 5 of the plan's order: a stream that ends without a terminal event
-    // is a failure, whatever the status line said. Same single implementation —
-    // no `error` here only because there is nothing to read a status or a body
-    // from.
-    if (!sawTerminalEvent) {
-      const reason = `stream ended without a terminal event (${partCount} parts, no provider finish chunk)`;
-      return {
-        kind: "failed",
-        text,
-        classification: classifyResponse({
-          responded: true,
-          stream: { partCount, sawTerminalEvent: false, sawErrorEvent: sawErrorPart },
-        }),
-        error: new Error(reason),
-        ...shape,
-      };
+    /**
+     * Step 5 of the plan's order, asked of the **one** implementation.
+     *
+     * This branch used to carry its own predicate — `if (terminalEvent !==
+     * "provider")` — which is the second rule set Plan.md §5.4's correction
+     * block exists to forbid, and it was already drifting: the loop could
+     * disagree with the classifier about the same facts, and nothing would say
+     * so. It also made the code untestable in the only direction that matters:
+     * with the installed SDK, `flush()` always synthesises a closing part, so
+     * `"absent"` never reaches this line and a mutation from `!== "provider"`
+     * to `=== "synthesized"` changed nothing any test could see.
+     *
+     * So the loop no longer decides. It hands the facts to
+     * {@link classifyResponse} and follows the verdict, and its only remaining
+     * job is to attach an `Error` for the failure — a turn that produced output
+     * and was cut has no thrown value to report, and `TurnResult.error` is
+     * typed `unknown`, so the classifier's own reason string is the honest
+     * thing to hand back.
+     */
+    const classification = classifyResponse({
+      responded: true,
+      stream: { partCount, terminalEvent, sawErrorEvent: sawErrorPart },
+    });
+    if (classification.kind === "success") {
+      return { kind: "success", text, ...shape };
     }
-
-    return { kind: "success", text, ...shape };
+    return {
+      kind: "failed",
+      text,
+      classification,
+      error: new Error(describe(classification)),
+      ...shape,
+    };
   }
 }
 

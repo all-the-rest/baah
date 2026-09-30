@@ -12,6 +12,14 @@
  * Therefore: **success = the stream ended cleanly with a terminal event.
  * Everything else is a classified failure.**
  *
+ * "Cleanly" is defined by {@link TerminalEvent}, and the definition is the
+ * load-bearing part of this file. A closing part counts as the provider's if it
+ * carries **either** a provider reason **or** a reason other than the SDK's own
+ * placeholder. Reading the raw reason alone — which is what this did — is not a
+ * discriminator at all: it is populated on four of the five installed provider
+ * paths and structurally absent on the fifth, so a clean OpenAI Responses turn
+ * was classified as a truncated stream and retried three times.
+ *
  * The function is pure and does no I/O. It takes the *observable facts* of one
  * response and returns what they mean. The engine (agent/loop.ts) owns the
  * observation; this file owns the judgement. That split is what makes the
@@ -132,17 +140,136 @@ export function isRetryableErrorType(code: string): boolean {
   return !NON_RETRYABLE_ERROR_TYPES.has(normalizeErrorType(code));
 }
 
+/**
+ * What the turn observed about the end of a step.
+ *
+ * ## Why this is three states and not a boolean
+ *
+ * It was `sawTerminalEvent: boolean`, fed by
+ * `TextStreamFinishPart.rawFinishReason !== undefined`. **Measured against the
+ * installed providers, that field alone is not a discriminator**: it is
+ * populated on some provider paths and structurally absent on others, for
+ * reasons that have nothing to do with truncation.
+ *
+ * | path | `raw` on a **clean** completion | source |
+ * |---|---|---|
+ * | `@ai-sdk/openai`, Chat Completions | `choice.finish_reason` — always set | `dist/index.js`: `raw: choice.finish_reason` |
+ * | `@ai-sdk/openai`, **Responses** | `incomplete_details?.reason` — **absent for a clean completion** | `raw: value.response.incomplete_details?.reason ?? void 0` |
+ * | `@ai-sdk/anthropic` | `delta.stop_reason` — always set | |
+ * | `@ai-sdk/google` | `candidate.finishReason` — always set | |
+ * | `@ai-sdk/openai-compatible` | `choice.finish_reason` — always set | |
+ *
+ * `incomplete_details` describes an **incomplete** response, so a clean
+ * `response.completed` has none. Reading `raw === undefined` as truncation
+ * therefore made **every successful OpenAI Responses turn fail and burn all
+ * three attempts** for an answer that had already arrived.
+ *
+ * ## What the discriminator actually is
+ *
+ * The SDK's **own initial values** for a step are the sentinel. Measured in
+ * `ai@7.0.122/dist/index.js`, in the step transform:
+ *
+ * ```js
+ * let stepFinishReason = "other";
+ * let stepRawFinishReason = void 0;
+ * ```
+ *
+ * and a `finish` part is synthesised from those values **only** when the
+ * provider never sent a terminal chunk — a provider chunk overwrites both
+ * (`case "model-call-end": stepFinishReason = chunk.finishReason;
+ * stepRawFinishReason = chunk.rawFinishReason`). So a `finish` part whose two
+ * fields both still hold the SDK's initial values is not a guess about a
+ * normalised reason: it is the SDK telling us, through the only channel it has,
+ * that no provider terminal chunk arrived.
+ *
+ * Driving `ToolLoopAgent` with a mock provider and reading the parts back
+ * measures all five cases (see `test/agent/terminal-event.test.ts`):
+ *
+ * | case | `finishReason` | `rawFinishReason` | state |
+ * |---|---|---|---|
+ * | stream cut after text | `"other"` | `undefined` | **synthesized** |
+ * | chat completions, clean | `"stop"` | `"stop"` | provider |
+ * | **Responses, clean** | `"stop"` | **`undefined`** | provider |
+ * | provider deliberately reports `"other"` | `"other"` | `"other"` | provider |
+ * | no output at all | — | — | `NoOutputGeneratedError` |
+ *
+ * **Both halves are load-bearing.** `raw` alone misses the clean Responses
+ * turn; `unified !== "other"` alone is the check Plan.md §5.4 already
+ * retracted, because a provider that terminates on purpose maps to `"other"`
+ * and would be retried for an answer that arrived. The conjunction is what
+ * separates them.
+ *
+ * The one input this misreads is a provider that sends a terminal chunk whose
+ * mapped reason is literally `"other"` **and** whose `raw` it leaves
+ * `undefined` — which requires writing `raw: void 0` on the success path. None
+ * of the five installed providers does, and the failure direction is the
+ * recoverable one: one turn the user regenerates, rather than three requests
+ * and a duplicated answer.
+ */
+export type TerminalEvent =
+  /**
+   * A provider terminal chunk arrived.
+   *
+   * At least one of the two fields differs from the SDK's initial values, so
+   * the provider said something. The only *positive* success evidence available
+   * at this layer.
+   */
+  | "provider"
+  /**
+   * The SDK closed the step itself, from its own initial values: **no provider
+   * terminal chunk arrived.** This is the truncation signal.
+   */
+  | "synthesized"
+  /**
+   * No `finish` part arrived at all.
+   *
+   * Defensive rather than observed: `flush()` synthesises one, so this is
+   * unreachable through `ToolLoopAgent` today. It is kept because the cost of a
+   * future SDK that stops synthesising is a silently accepted truncation, and
+   * the cost of keeping the state is one enum member.
+   */
+  | "absent";
+
+/** The two fields of a `finish` part, and the SDK's initial values for them. */
+const SDK_INITIAL_FINISH_REASON = "other";
+
+/**
+ * Read a `finish` part into a {@link TerminalEvent}.
+ *
+ * Exported so the loop does not re-derive the rule, and so the rule has one
+ * testable home: the arithmetic of "was this synthesised?" is the whole of
+ * §5.4's step 5 and it belongs beside the classification that consumes it.
+ */
+export function readTerminalEvent(finish: {
+  finishReason: unknown;
+  rawFinishReason: unknown;
+}): TerminalEvent {
+  if (finish.rawFinishReason !== undefined) return "provider";
+  // A provider that sent a chunk and mapped its reason to something other than
+  // the SDK's placeholder is a provider, whatever it wrote in `raw`.
+  if (finish.finishReason !== SDK_INITIAL_FINISH_REASON) return "provider";
+  return "synthesized";
+}
+
+/**
+ * Fold an observation into the running verdict for one attempt.
+ *
+ * **Monotone towards the worse state**, and that direction is the point: a turn
+ * whose step 2 was cut must not be excused by step 1's clean `finish`, so
+ * `synthesized` is sticky and a later `provider` never clears it. `absent` is
+ * simply the starting value.
+ */
+export function mergeTerminalEvent(seen: TerminalEvent, next: TerminalEvent): TerminalEvent {
+  if (seen === "synthesized") return seen;
+  return next;
+}
+
 /** What the caller observed on the wire. Nothing here is interpreted. */
 export interface StreamObservation {
   /** Parts that actually arrived, including `start`/`finish` markers. */
   partCount: number;
-  /**
-   * A terminal event arrived: `finish` for the turn, `finish-step` for a step.
-   *
-   * This is the *only* positive success signal. Missing `data: [DONE]` in the
-   * SSE sense and missing `finish` in the SDK sense are the same defect.
-   */
-  sawTerminalEvent: boolean;
+  /** What arrived at the end of the stream. See {@link TerminalEvent}. */
+  terminalEvent: TerminalEvent;
   /** An `error` part arrived inside an otherwise `200` response. */
   sawErrorEvent: boolean;
   /** Payload carried by that error part, when it carried one. */
@@ -274,11 +401,25 @@ const NO_OUTPUT_GENERATED_ERROR_NAMES = new Set([
 /**
  * Did the SDK tell us the stream ended without a terminal event?
  *
- * This is the *typed* half of the terminal-event check. The untyped half lives
- * at the call site: `TextStreamFinishPart.rawFinishReason` is the provider's own
- * finish reason, and the SDK leaves it `undefined` on a finish part it
- * synthesised itself. See `agent/loop.ts` for why the raw chunk level below
- * this is not reachable through `ToolLoopAgent`.
+ * This is the **second, independent** terminal-event signal, and the only one
+ * that survives a provider that never sends a terminal chunk at all. `ai` raises
+ * `NoOutputGeneratedError` in the step transform's `flush()` when the stream
+ * closed with **neither** a terminal chunk **nor any output** (`dist/index.js`:
+ * `if (!hasReceivedTerminalChunk && !hasReceivedOutputChunk)`), so the condition
+ * it reports — "the model stream ended without a finish chunk" — is a fact
+ * about the stream rather than an inference from a field a provider may not
+ * fill.
+ *
+ * It covers the **empty-stream** half of §5.4, and it is the signal the E2E's
+ * truncation verdict rests on. A stream cut *after* producing output does not
+ * raise it; that case is caught by {@link TerminalEvent}'s `"synthesized"`.
+ * Between them, every truncation the layer can see is caught, and neither signal
+ * fires on a completion that worked.
+ *
+ * Read **structurally**, by name, for the same reason {@link readErrorFacts}
+ * reads an `APICallError` structurally: `@ai-sdk/provider` is not resolvable
+ * from this package, and a re-bundled copy would not share the class identity
+ * anyway.
  */
 export function isMissingTerminalEventSignal(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
@@ -387,12 +528,43 @@ function classifySuccessPath(facts: ResponseFacts, headers: Record<string, strin
       return { kind: "protocol-error", reason: "event stream announced but no stream was observed" };
     }
     if (stream.sawErrorEvent) {
+      /**
+       * The SDK's own "ended without a finish chunk" gets its own wording.
+       *
+       * `ai` raises `NoOutputGeneratedError` from the step transform's `flush()`
+       * when a stream closed with neither a terminal chunk **nor any output**.
+       * That is the one truncation this layer can state as a fact rather than an
+       * inference, so it is named here instead of being folded into the generic
+       * "error event inside a stream" — a UI that shows the reason can then tell
+       * "the provider produced nothing and never finished" from "the provider
+       * reported an error mid-stream", and they are not the same defect.
+       */
+      if (isMissingTerminalEventSignal(stream.errorEvent)) {
+        return {
+          kind: "protocol-error",
+          reason: `stream ended without a finish chunk and produced no output (${stream.partCount} parts)`,
+        };
+      }
       return {
         kind: "protocol-error",
         reason: `error event inside a ${stream.partCount}-part stream`,
       };
     }
-    if (!stream.sawTerminalEvent) {
+    /**
+     * Truncation is asserted only where the `finish` part is the SDK's own.
+     *
+     * `"synthesized"` means the step closed from the SDK's initial
+     * `("other", undefined)` — no provider terminal chunk arrived, which is
+     * §5.4's "Terminal-Event fehlt". `"absent"` is the defensive variant of the
+     * same verdict.
+     *
+     * A `finish` part that carries **either** a provider reason or a non-
+     * placeholder reason is `"provider"` and passes. That is the half that
+     * keeps a clean OpenAI Responses turn — `("stop", undefined)`, because
+     * `incomplete_details` is absent from a completed response — from being
+     * read as a cut stream and retried three times. See {@link TerminalEvent}.
+     */
+    if (stream.terminalEvent !== "provider") {
       return {
         kind: "protocol-error",
         reason: `stream ended without a terminal event (${stream.partCount} parts)`,
@@ -476,9 +648,11 @@ function classifyThrownErrorBody(error: unknown): Classification | undefined {
  * 2. `429` / `5xx` → `http-error`, retryable,
  * 3. every other `4xx` → `http-error`, final,
  * 4. `2xx` → **verify**, do not believe,
- * 5. inside (4): an error body → `body-error`; a stream without a terminal
- *    event, a truncated stream, an error event, or a content type that fits
- *    neither → `protocol-error`,
+ * 5. inside (4): an error body → `body-error`; a stream whose closing part is
+ *    the SDK's own rather than a provider's, an error event, or a content type
+ *    that fits neither → `protocol-error`. A closing part that carries a
+ *    provider's reason, **or** a non-placeholder one, is not a failure — see
+ *    {@link TerminalEvent},
  * 6. a throwable with no response evidence at all → `protocol-error` carrying
  *    its own message (there is no response to verify),
  * 7. otherwise → `success`.

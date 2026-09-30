@@ -1,6 +1,5 @@
 /**
- * `TurnStore`: the four gaps a storage adapter measured, pinned on the engine
- * side.
+ * `TurnStore`: the gaps a storage adapter measured, pinned on the engine side.
  *
  * ## Why this file exists
  *
@@ -21,6 +20,16 @@
  * 4. the reload recovery closed a turn that **already carried a terminal
  *    outcome**, so a second start-up appended a second `interrupted` outcome
  *    message and the transcript grew a duplicate on every reload.
+ *
+ * A fifth, found later and by a different layer: the seam could not **create**
+ * the rows its parts hang off. `appendTurn` and `appendMessage` were on
+ * `StorageDatabase` (Plan.md §16.1) and not here, so the engine — which mints
+ * both ids — could not accept its own first write, and an app wrapped the store
+ * to manufacture the rows. The `answerParts` / `answerDeltas` / `answerCloses`
+ * accessors exist because of the resulting behaviour: **the user's prompt is
+ * now a part**, written through the very same `flushDelta` / `closePart` pair
+ * these tests measure, so every assertion about the *streaming* protocol has to
+ * scope itself to the assistant's parts.
  *
  * Each test below therefore states the *behaviour* the store has to show, not
  * that a field exists — a field that nothing writes is a field that protects
@@ -82,10 +91,10 @@ interface StoredPart {
 interface FakeStore extends TurnStore {
   readonly parts: Map<string, StoredPart>;
   /** Every flush that *applied*; a replayed `deltaId` is not in here twice. */
-  readonly deltas: { id: string; partId: string; contentText: string }[];
+  readonly deltas: { id: string; partId: string; contentText: string; messageId: string }[];
   /** Every `deltaId` that arrived, applied or not. */
   readonly deltaIds: string[];
-  readonly closes: { partId: string; status: "completed" | "aborted" }[];
+  readonly closes: { partId: string; status: "completed" | "aborted"; messageId: string }[];
   readonly turnPartCloses: string[];
   readonly heartbeats: { turnId: string; sessionId: string; at: string }[];
   readonly outcomes: { turnId: string; outcome: TurnOutcome; error: string | undefined }[];
@@ -95,18 +104,38 @@ interface FakeStore extends TurnStore {
   outcomeReads: number;
   /** The turn a streamed part belongs to; the engine never says. */
   partTurn: Map<string, string>;
+  /**
+   * The parts that belong to an **assistant** message.
+   *
+   * The engine now writes the user's prompt as a part too, and it arrives
+   * through the same `flushDelta`/`closePart` pair — which is the point, and is
+   * also why every test about the *streaming* protocol has to exclude it. A real
+   * store can tell them apart because `appendMessage` told it which rows are
+   * which; the fake does the same.
+   */
+  answerParts(): StoredPart[];
+  /** The ids of those parts, in insertion order. */
+  answerPartIds(): string[];
+  /**
+   * The flushes and closes of an **assistant** message — the same scoping as
+   * {@link FakeStore.answerParts}, for the two arrays a test counts.
+   */
+  answerDeltas(): { id: string; partId: string; contentText: string }[];
+  answerCloses(): { partId: string; status: "completed" | "aborted" }[];
 }
 
 function createFakeStore(options: { partTurn?: string } = {}): FakeStore {
   const parts = new Map<string, StoredPart>();
-  const deltas: { id: string; partId: string; contentText: string }[] = [];
+  const deltas: { id: string; partId: string; contentText: string; messageId: string }[] = [];
   const deltaIds: string[] = [];
-  const closes: { partId: string; status: "completed" | "aborted" }[] = [];
+  const closes: { partId: string; status: "completed" | "aborted"; messageId: string }[] = [];
   const turnPartCloses: string[] = [];
   const heartbeats: { turnId: string; sessionId: string; at: string }[] = [];
   const outcomes: { turnId: string; outcome: TurnOutcome; error: string | undefined }[] = [];
   const calls: string[] = [];
   const seenDeltas = new Set<string>();
+  /** Message ids the engine created for a non-assistant role. */
+  const userMessages = new Set<string>();
   const defaultTurn = options.partTurn ?? "t1";
 
   const store: FakeStore = {
@@ -122,6 +151,35 @@ function createFakeStore(options: { partTurn?: string } = {}): FakeStore {
     outcomeReads: 0,
     partTurn: new Map(),
 
+    answerParts() {
+      return [...parts.values()].filter((part) => !userMessages.has(part.messageId));
+    },
+    answerPartIds() {
+      return [...parts.entries()]
+        .filter(([, part]) => !userMessages.has(part.messageId))
+        .map(([partId]) => partId);
+    },
+    answerDeltas() {
+      return deltas
+        .filter((delta) => !userMessages.has(delta.messageId))
+        .map(({ id, partId, contentText }) => ({ id, partId, contentText }));
+    },
+    answerCloses() {
+      return closes
+        .filter((close) => !userMessages.has(close.messageId))
+        .map(({ partId, status }) => ({ partId, status }));
+    },
+
+    async appendTurn(input) {
+      calls.push(`appendTurn:${input.id}`);
+    },
+    async appendMessage(input) {
+      calls.push(`appendMessage:${input.id}:${input.role}`);
+      // Which rows are the user's, so the streaming tests can scope themselves to
+      // the assistant's parts. The prompt is a real part and arrives through the
+      // real protocol; that it is a *different* part is what makes it separable.
+      if (input.role !== "assistant") userMessages.add(input.id);
+    },
     async flushDelta(input) {
       calls.push(`flushDelta:${input.partId}`);
       deltaIds.push(input.deltaId);
@@ -129,7 +187,7 @@ function createFakeStore(options: { partTurn?: string } = {}): FakeStore {
       // no-op, and nothing about the part changes.
       if (seenDeltas.has(input.deltaId)) return;
       seenDeltas.add(input.deltaId);
-      deltas.push({ id: input.deltaId, partId: input.partId, contentText: input.contentText });
+      deltas.push({ id: input.deltaId, partId: input.partId, contentText: input.contentText, messageId: input.messageId });
       store.partTurn.set(input.partId, defaultTurn);
       parts.set(input.partId, {
         messageId: input.messageId,
@@ -144,7 +202,7 @@ function createFakeStore(options: { partTurn?: string } = {}): FakeStore {
 
     async closePart(input) {
       calls.push(`closePart:${input.partId}:${input.status}`);
-      closes.push({ partId: input.partId, status: input.status });
+      closes.push({ partId: input.partId, status: input.status, messageId: input.messageId });
       const part = parts.get(input.partId);
       if (part !== undefined) part.status = input.status;
     },
@@ -259,7 +317,7 @@ describe("a flushed delta says which kind of part it is", () => {
     const store = createFakeStore();
     await runTurn({ steps: [{ parts: [...text("t1", "Hello"), finish("stop")] }], store });
 
-    expect([...store.parts.values()].map((part) => part.partType)).toEqual(["text"]);
+    expect(store.answerParts().map((part) => part.partType)).toEqual(["text"]);
     expect(store.parts.get("t1")?.contentText).toBe("Hello");
   });
 
@@ -274,7 +332,10 @@ describe("a flushed delta says which kind of part it is", () => {
       store,
     });
 
-    expect([...store.parts.keys()]).toEqual(["r1", "t1"]);
+    // The two streamed parts, by id and by kind. The prompt's part is not in
+    // here: it is a part, but not a *streamed* one, and this test is about the
+    // streaming protocol.
+    expect(store.answerPartIds()).toEqual(["r1", "t1"]);
     expect(store.parts.get("r1")?.partType).toBe("reasoning");
     expect(store.parts.get("t1")?.partType).toBe("text");
     expect(store.parts.get("r1")?.contentText).toBe("thinking");
@@ -299,8 +360,8 @@ describe("a flushed delta says which kind of part it is", () => {
       store,
     });
 
-    expect(store.deltas.map((delta) => delta.partId)).toEqual(["t1"]);
-    expect(store.closes.map((close) => close.partId)).toEqual(["t1"]);
+    expect(store.answerDeltas().map((delta) => delta.partId)).toEqual(["t1"]);
+    expect(store.answerCloses().map((close) => close.partId)).toEqual(["t1"]);
   });
 });
 
@@ -313,7 +374,7 @@ describe("a part is closed where the engine knows it ended", () => {
     const store = createFakeStore();
     await runTurn({ steps: [{ parts: [...text("t1", "Hello"), finish("stop")] }], store });
 
-    expect(store.closes).toEqual([{ partId: "t1", status: "completed" }]);
+    expect(store.answerCloses()).toEqual([{ partId: "t1", status: "completed" }]);
     // The order is the point, and it is a state assertion rather than a log
     // read: a close that arrived first would be overwritten by this part's own
     // closing flush, which writes the status a delta implies.
@@ -332,7 +393,7 @@ describe("a part is closed where the engine knows it ended", () => {
       store,
     });
 
-    expect(store.closes).toEqual([
+    expect(store.answerCloses()).toEqual([
       { partId: "r1", status: "completed" },
       { partId: "t1", status: "completed" },
     ]);
@@ -357,7 +418,7 @@ describe("a part is closed where the engine knows it ended", () => {
       store,
     });
 
-    expect(store.closes).toEqual([{ partId: "t1", status: "aborted" }]);
+    expect(store.answerCloses()).toEqual([{ partId: "t1", status: "aborted" }]);
     expect(statusOf(store, "t1")).toBe("aborted");
     // The text it got is kept, not discarded (§6.2: keep the partial text).
     expect(store.parts.get("t1")?.contentText).toBe("half a sen");
@@ -381,7 +442,7 @@ describe("a part is closed where the engine knows it ended", () => {
       store,
     });
 
-    expect(store.closes).toEqual([
+    expect(store.answerCloses()).toEqual([
       { partId: "t1", status: "aborted" },
       { partId: "t2", status: "completed" },
     ]);
@@ -408,8 +469,8 @@ describe("a part is closed where the engine knows it ended", () => {
       store,
     });
 
-    expect(store.deltas).toHaveLength(1);
-    expect(store.deltas[0]?.contentText).toBe("one two three");
+    expect(store.answerDeltas()).toHaveLength(1);
+    expect(store.answerDeltas()[0]?.contentText).toBe("one two three");
   });
 
   it("a long part is checkpointed while it streams, not only at its end", async () => {
@@ -438,10 +499,10 @@ describe("a part is closed where the engine knows it ended", () => {
       now: () => (clock += 40),
     });
 
-    expect(store.deltas.length).toBeGreaterThan(1);
+    expect(store.answerDeltas().length).toBeGreaterThan(1);
     // And still not one per token: the interval is doing something.
-    expect(store.deltas.length).toBeLessThan(6);
-    expect(store.deltas.at(-1)?.contentText).toBe("012345");
+    expect(store.answerDeltas().length).toBeLessThan(6);
+    expect(store.answerDeltas().at(-1)?.contentText).toBe("012345");
     expect(DELTA_FLUSH_INTERVAL_MS).toBeGreaterThan(0);
   });
 
@@ -459,7 +520,7 @@ describe("a part is closed where the engine knows it ended", () => {
       store,
     });
 
-    expect(store.deltas.map((delta) => delta.contentText)).toEqual(["attempt one", "attempt two"]);
+    expect(store.answerDeltas().map((delta) => delta.contentText)).toEqual(["attempt one", "attempt two"]);
     // Same part id, two attempts, two distinct keys.
     expect(new Set(store.deltaIds).size).toBe(store.deltaIds.length);
     expect(statusOf(store, "t1")).toBe("completed");

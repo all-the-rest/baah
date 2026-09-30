@@ -82,6 +82,8 @@ function crashableStore(): CrashableStore {
     began,
     recorded,
     crasher: undefined,
+    async appendTurn() {},
+    async appendMessage() {},
     async flushDelta() {},
     async closePart() {},
     async closeTurnParts() {},

@@ -104,6 +104,11 @@ function createRejectingStore(): RejectingStore {
     heartbeatCalls: 0,
     recordCalls: 0,
 
+    // The two creates. Recorded rather than ignored, because this file is about
+    // bookkeeping writes and a create that silently stopped happening would be
+    // invisible here.
+    async appendTurn() {},
+    async appendMessage() {},
     async flushDelta(input) {
       parts.set(input.partId, {
         messageId: input.messageId,
