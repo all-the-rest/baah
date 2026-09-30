@@ -5,12 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && node ../../scripts/build-sw.mjs",
     "preview": "vite preview",
     "e2e": "playwright test --config ../../playwright.config.ts",
     "test:screenshots": "playwright test --config ../../playwright.screenshots.config.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "icons": "node ../../scripts/make-icons.mjs"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.68",

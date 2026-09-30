@@ -1,16 +1,49 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="de" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>opencode-harness-web</title>
+    <title>baah</title>
     <meta
       name="description"
-      content="A browser-only coding agent harness — OpenCode-like agent loop, tools and workspace access, entirely in your browser."
+      content="Ein Coding-Agent, der ausschließlich im Browser läuft: kein Server, keine Installation, kein Konto. Werkzeuge, Verlauf und Schlüssel liegen in diesem Browser."
     />
+
+    <!-- PWA. `AGENTS.md` §2a macht die App zu einer installierbaren, offline
+         lauffähigen Web-App; ohne diese drei Zeilen ist sie keine. Das Manifest
+         liefert Name, Display-Modus, Scope und Icons, der Service Worker den
+         Offline-Teil, und dieses Theme die Farbe der Browser-Chrome. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#1d232a" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <!-- iOS liest den Splash-Screen aus diesem einen Meta-Tag und kennt
+         `manifest.webmanifest` nicht. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="baah" />
+    <meta name="mobile-web-app-capable" content="yes" />
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <!--
+      Registrierung des Service Workers, absichtlich **nicht** über Vite:
+      der Worker ist ein fertiges Artefakt in `dist/`, kein Modul aus `src/`.
+      Er wird erst nach dem `load`-Event registriert, weil die Registrierung
+      selbst eine Ausgabe auf dem kritischen Pfad ist und die App sonst beim
+      ersten Aufruf konkurriert.
+    -->
+    <script>
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js").catch(() => {
+            // Absichtlich verschwiegen: ohne Service Worker ist die App
+            // vollständig benutzbar, nur nicht offline. `AGENTS.md` §5 verbietet
+            // `console.error` für Fehler, die der Nutzer sehen muss — das hier
+            // muss er nicht sehen.
+          });
+        });
+      }
+    </script>
   </body>
 </html>
