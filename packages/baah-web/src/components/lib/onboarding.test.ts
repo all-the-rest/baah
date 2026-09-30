@@ -1,0 +1,121 @@
+/**
+ * The wizard's own decisions, with no DOM.
+ *
+ * `Onboarding.tsx` is a component and its rendering is Playwright's job. What lives
+ * here is the set of decisions that are **not** rendering: the step order, the
+ * vendor-id round trip, and the completeness check. Each of them is a place where
+ * the wrong value costs a user their configuration rather than a pixel.
+ */
+import { describe, expect, it } from "vitest";
+
+import { isConfigured, missingSteps, probeView, splitVendor, vendorId, WIZARD_STEPS } from "./onboarding.ts";
+
+describe("WIZARD_STEPS", () => {
+  it("asks for the model before the key, because the probe addresses a model", () => {
+    // `Plan.md` §8.1's letter is provider → key (+ test) → model. Taken literally the
+    // connection test is impossible on a first run: `probe.ts` throws `missing_model`
+    // before any request leaves the browser, so §8.1 step 3 is dead code on exactly
+    // the screen it was written for. The order is the wizard's decision and it is
+    // asserted here so a reorder cannot happen silently.
+    expect(WIZARD_STEPS).toEqual(["provider", "model", "key", "workspace", "done"]);
+    expect(WIZARD_STEPS.indexOf("model")).toBeLessThan(WIZARD_STEPS.indexOf("key"));
+  });
+
+  it("keeps the probe on the key step, where §8.1 puts it", () => {
+    // The probe reads the key out of the store, so it has to be reachable after the
+    // key step and before the wizard ends.
+    expect(WIZARD_STEPS.indexOf("key")).toBeGreaterThan(0);
+    expect(WIZARD_STEPS.indexOf("key")).toBeLessThan(WIZARD_STEPS.length - 1);
+  });
+});
+
+describe("the vendor id", () => {
+  it("appends a label only for `openai-compatible`", () => {
+    // The label exists so a second OpenAI-compatible provider can have its own key
+    // slot; for every other vendor there is exactly one endpoint and a label would be
+    // a second name for the same thing.
+    expect(vendorId("openai-compatible", "e2e")).toBe("openai-compatible:e2e");
+    expect(vendorId("openai-compatible", "  ")).toBe("openai-compatible");
+    expect(vendorId("openai-compatible", undefined)).toBe("openai-compatible");
+    expect(vendorId("openai", "e2e")).toBe("openai");
+    expect(vendorId("anthropic", "e2e")).toBe("anthropic");
+  });
+
+  it("round-trips through `splitVendor`", () => {
+    for (const label of ["e2e", "groq", "ein label mit leerzeichen"]) {
+      expect(splitVendor(vendorId("openai-compatible", label))).toEqual({ id: "openai-compatible", label });
+    }
+    expect(splitVendor("openai")).toEqual({ id: "openai", label: "" });
+  });
+
+  it("splits on the **first** colon, like `apiKeySlot` does", () => {
+    // `ids.ts` documents that the slot name splits on the first colon. A split on the
+    // last one would put `openai-compatible` in the label and the key in the base,
+    // and the round trip would not hold.
+    expect(splitVendor("openai-compatible:a:b")).toEqual({ id: "openai-compatible", label: "a:b" });
+  });
+
+  it("falls back to the `openai` row for a fresh install", () => {
+    // A wizard that opened with no row selected and an empty base URL is a wizard
+    // whose first `Weiter` writes a URL nobody chose.
+    expect(splitVendor(undefined)).toEqual({ id: "openai", label: "" });
+    expect(splitVendor("")).toEqual({ id: "openai", label: "" });
+  });
+});
+
+describe("completeness", () => {
+  const complete = { vendor: "openai-compatible:e2e", baseUrl: "https://x.invalid/v1", model: "m", hasKey: true, workspaceKind: "memory" } as const;
+
+  it("needs all four answers before a turn can run", () => {
+    expect(isConfigured(complete)).toBe(true);
+    expect(isConfigured({ ...complete, vendor: "" })).toBe(false);
+    expect(isConfigured({ ...complete, model: "  " })).toBe(false);
+    expect(isConfigured({ ...complete, hasKey: false })).toBe(false);
+    expect(isConfigured({ ...complete, workspaceKind: "none" })).toBe(false);
+  });
+
+  it("lists what is missing in the order the wizard asks for it", () => {
+    expect(missingSteps({ ...complete, vendor: "", model: "", hasKey: false, workspaceKind: "none" })).toEqual([
+      "provider",
+      "model",
+      "key",
+      "workspace",
+    ]);
+    expect(missingSteps(complete)).toEqual([]);
+  });
+});
+
+describe("probeView", () => {
+  const report = {
+    vendor: "openai",
+    outcome: "cors-blocked",
+    verdict: "unknown",
+    summary: "Der Key funktioniert, der Chat wird aus dem Browser aber scheitern.",
+    endpoints: {
+      models: { url: "https://api.openai.com/v1/models", result: "answered", status: 401, elapsedMs: 40, hasCorsHeader: true },
+      inference: { url: "https://api.openai.com/v1/chat/completions", result: "network-error", status: null, elapsedMs: 40, hasCorsHeader: false },
+    },
+    corsVerifiedInPlan: false,
+  };
+
+  it("reports `cors-blocked` as a warning, not an error", () => {
+    // `Plan.md` §9: a browser gets an opaque `Failed to fetch`, identical to being
+    // offline. Showing "connection failed" trains the user to blame their key for a
+    // provider policy — the one conclusion §9 says is wrong.
+    const view = probeView(report as never);
+    expect(view.tone).toBe("warning");
+    expect(view.outcome).toBe("cors-blocked:unknown");
+    expect(view.warnBeforeContinuing).toBe(true);
+  });
+
+  it("treats a rejected key as an error", () => {
+    const view = probeView({
+      ...report,
+      outcome: "http-error",
+      verdict: "key-rejected",
+      endpoints: { ...report.endpoints, inference: { ...report.endpoints.inference, result: "answered", status: 401, hasCorsHeader: true } },
+    } as never);
+    expect(view.tone).toBe("error");
+    expect(view.warnBeforeContinuing).toBe(false);
+  });
+});

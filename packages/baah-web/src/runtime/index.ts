@@ -94,6 +94,42 @@
  *
  * 1. `recoverOnBoot` — reload recovery at start-up (`recovery.ts`). Still here.
  * 2. `store.flushDelta` — was here, and is **not** any more. See above.
+ *
+ * ## The read port, and the shape of its failure
+ *
+ * `Plan.md` §16.1's second port: `baah-storage` exports a `TranscriptReader`
+ * with one method, and the app takes it *beside* the `TurnStore` rather than
+ * merged into it. It is **optional** here, and that is a deliberate reading of
+ * the dependency rather than laziness:
+ *
+ * - `@all-the.rest/baah-storage` is not in this package's `package.json`, so
+ *   importing the interface would not compile. It is declared **structurally**
+ *   below — identical shape, no import — which is what makes the real
+ *   `createTranscriptReader` assignable to it as soon as the workspace
+ *   dependency exists. When it does, the local declaration goes and the import
+ *   replaces it; nothing else changes. (`pnpm install` was out of scope for this
+ *   block, so this is a gap to report, not a design.)
+ * - it is optional rather than required because every existing caller — including
+ *   `runtime.test.ts`, which this block does not own — would have to grow a
+ *   dependency it does not have. A required field would be a compile error in a
+ *   test suite that is already correct.
+ *
+ * {@link TranscriptRead} is a **union, not a promise that rejects**, and the two
+ * reasons are the two things `Plan.md` §16.1 says will bite the UI:
+ *
+ * 1. A live part comes back with `status: "streaming"` **and its text**, at most
+ *    `DELTA_FLUSH_INTERVAL_MS` behind the buffer. The UI has to render it as in
+ *    flight, not hide it — so the type carries the status rather than dropping
+ *    the part.
+ * 2. **A closed database rejects with `database_closed`; it does not return an
+ *    empty transcript.** That is the load-bearing half. A read that failed and
+ *    an empty read are different facts, and the UI renders them differently — so
+ *    this layer converts the rejection into `kind: "failed"` instead of letting
+ *    it escape, and the empty case stays available for the only thing that
+ *    actually means it: a session that says nothing.
+ *
+ * There is no `catch` in the read path of the storage package, and that is the
+ * property this type preserves: a failure cannot be mistaken for an answer.
  */
 
 import {
@@ -139,12 +175,101 @@ import { recoverOnBoot, type BootReport } from "./recovery.ts";
 import { StallWatchdog, type StallReport } from "./watchdog.ts";
 
 /* ------------------------------------------------------------------ */
+/* The read port (Plan.md §16.1)                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `TranscriptReader` from `@all-the.rest/baah-storage`, declared structurally.
+ *
+ * Byte-for-byte the same one-method shape, so the real `createTranscriptReader`
+ * is assignable to this without a cast. See the module header for why the
+ * import is not there.
+ */
+export interface TranscriptReadPort {
+  /**
+   * Read a session's transcript back, or one turn's slice of it.
+   *
+   * **Rejects** for every way the read could fail to be an answer — a closed
+   * database (`database_closed`), an unknown session, an unknown turn. It never
+   * resolves with an empty transcript for those cases.
+   */
+  read(request: TranscriptReadRequest): Promise<TranscriptReadResult>;
+}
+
+/** What to read. `sessionId` is the required half; `turnId` narrows inside it. */
+export interface TranscriptReadRequest {
+  readonly sessionId: string;
+  readonly turnId?: string | undefined;
+  readonly limit?: number | undefined;
+}
+
+/** `baah-storage`'s `Transcript`. Re-declared with the module header's reason. */
+export interface TranscriptReadResult {
+  readonly sessionId: string;
+  readonly turnId: string | null;
+  /** Oldest first, by `seq` (`Plan.md` §6.2). */
+  readonly messages: readonly TranscriptReadMessage[];
+  /** The store holds at least one message more than was returned. */
+  readonly truncated: boolean;
+  readonly limit: number;
+}
+
+/** One message, as the transcript view needs it. */
+export interface TranscriptReadMessage {
+  readonly id: string;
+  readonly turnId: string | null;
+  readonly seq: number;
+  readonly role: string;
+  readonly status: string | null;
+  /** `succeeded | failed | interrupted`, on the `idle` outcome message. */
+  readonly outcome: string | null;
+  readonly error: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly parts: readonly TranscriptReadPart[];
+}
+
+/** One part. `status` is the load-bearing field; see the module header. */
+export interface TranscriptReadPart {
+  readonly id: string;
+  readonly seq: number;
+  readonly type: string;
+  /** The text as of the most recent flush — the tail while `streaming`. */
+  readonly contentText: string;
+  readonly status: string | null;
+  /** The type-specific JSON, as raw text. Never parsed here. */
+  readonly data: string | null;
+  readonly updatedAt: string;
+}
+
+/**
+ * What a read produced.
+ *
+ * Three cases, and the third is the one the type exists for: `ok` with **zero**
+ * messages is the only thing that means "here there was nothing". `failed` is a
+ * read that did not happen, and a UI that renders it as an empty transcript is
+ * stating a falsehood it has no evidence for.
+ */
+export type TranscriptRead =
+  | { readonly kind: "ok"; readonly transcript: TranscriptReadResult }
+  /** No read port is wired. A wiring gap, not an empty session. */
+  | { readonly kind: "unavailable"; readonly reason: string }
+  /** The read refused — `database_closed` and its siblings. Never an answer. */
+  | { readonly kind: "failed"; readonly reason: string };
+
+
+/* ------------------------------------------------------------------ */
 /* Dependencies                                                        */
 /* ------------------------------------------------------------------ */
 
 export interface RuntimeDependencies extends RuntimeApprovalOptions {
   /** The persistence seam. See `TurnStore` in core. */
   readonly store: TurnStore;
+  /**
+   * The read port (`Plan.md` §16.1). Omit it and {@link BaahRuntime.readTranscript}
+   * answers `kind: "unavailable"` — never an empty transcript.
+   */
+  readonly transcript?: TranscriptReadPort | undefined;
   readonly workspace: Workspace;
   readonly settings: SettingsStore;
   readonly registry: ProviderRegistry;
@@ -215,6 +340,17 @@ export interface BaahRuntime {
    * second call finds nothing unfinished.
    */
   boot(): Promise<BootReport>;
+
+  /**
+   * Read the session's transcript back out of the store.
+   *
+   * **Never rejects.** A rejection is a fact about the database, and a caller
+   * that cannot tell a rejection from an empty transcript will render "hier war
+   * nichts" about a conversation it failed to read. So the two are different
+   * values of a union, and the empty case is reachable only when a read
+   * succeeded and the session genuinely says nothing.
+   */
+  readTranscript(request?: { readonly turnId?: string; readonly limit?: number }): Promise<TranscriptRead>;
 
   /** Resolve the configured provider. **Awaited** — see the module header. */
   resolveModel(): Promise<LanguageModel>;
@@ -295,6 +431,27 @@ const FALLBACK_MESSAGE: Readonly<Record<ErrorOrigin, string>> = {
   recovery: "the interrupted turns could not be closed",
   "settings-transfer": "the settings file could not be imported",
 };
+
+/**
+ * Why a transcript read was refused, in words a user can act on.
+ *
+ * The store's **`code`** is preferred over its message, and the reason is the
+ * same one `toRuntimeError` documents: a `StorageError` message names SQL, a
+ * filename or a driver, and the one thing the user can do anything about is
+ * `database_closed`. An error the class does not recognise falls back to the
+ * class name — never to `error.message`, which is the one shape in this program
+ * that can carry a key into a screenshot.
+ */
+function describeReadFailure(error: unknown): string {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { readonly code: unknown }).code;
+    if (typeof code === "string" && code !== "") {
+      return `${code}: the stored transcript could not be read. Nothing was lost — the read simply did not happen, so this view cannot say what is in it.`;
+    }
+  }
+  const name = error instanceof Error ? error.name : "unknown error";
+  return `${name}: the stored transcript could not be read. This is not an empty conversation.`;
+}
 
 function toRuntimeError(error: unknown, origin: ErrorOrigin): RuntimeError {
   if (error instanceof RuntimeError) return error;
@@ -682,6 +839,54 @@ export function createRuntime(dependencies: RuntimeDependencies): BaahRuntime {
     }
   }
 
+  /* ---- the read port -------------------------------------------- */
+
+  /**
+   * Read the transcript, and keep "could not read" apart from "nothing there".
+   *
+   * Three things are worth reading here rather than in the component:
+   *
+   * 1. **The empty result is passed through untouched.** A successful read of a
+   *    session with nothing in it is the only `kind: "ok"` with zero messages,
+   *    and it is the only state a transcript view may render as "hier war
+   *    nichts".
+   * 2. **A rejection becomes `kind: "failed"`** with the store's own code, and
+   *    the code is what the user can act on. `database_closed` says the tab's
+   *    database went away; "empty transcript" says the opposite, and a user who
+   *    believed it would conclude their work is gone.
+   * 3. **A missing port is `kind: "unavailable"`**, a third state, because
+   *    "not wired" and "wired and empty" are different facts about the program
+   *    and the UI says so in both cases differently.
+   *
+   * `fail(error, …)` is deliberately **not** used: it would publish a
+   * `runtime-error` and set `lastError`, which is right for an action the user
+   * took and wrong for a restore the app performs on its own. A refused restore
+   * belongs in the transcript view, which is where it is rendered.
+   */
+  async function readTranscript(
+    request: { readonly turnId?: string; readonly limit?: number } = {},
+  ): Promise<TranscriptRead> {
+    const reader = dependencies.transcript;
+    if (reader === undefined) {
+      return {
+        kind: "unavailable",
+        reason:
+          "This build has no read port wired, so the transcript cannot be read back. " +
+          "The running turn is unaffected — only the reload view is missing.",
+      };
+    }
+    try {
+      const transcript = await reader.read({
+        sessionId,
+        ...(request.turnId === undefined ? {} : { turnId: request.turnId }),
+        ...(request.limit === undefined ? {} : { limit: request.limit }),
+      });
+      return { kind: "ok", transcript };
+    } catch (error) {
+      return { kind: "failed", reason: describeReadFailure(error) };
+    }
+  }
+
   /* ---- settings ------------------------------------------------ */
 
   return {
@@ -694,6 +899,7 @@ export function createRuntime(dependencies: RuntimeDependencies): BaahRuntime {
     resolveModel,
     send,
     answerApproval,
+    readTranscript,
 
     stop: async () => {
       await turn?.stop();
