@@ -100,6 +100,12 @@ export interface IgnoreFilter {
   /**
    * Why the `.gitignore` could not be used. Search continues with the default
    * rules; the reason is reported instead of being swallowed.
+   *
+   * **The reason is a failure's class name, never its own text** — the same
+   * contract as `describeStorageFailure` in `agent/loop.ts`, for the same
+   * reason: this string is interpolated into the `note` of a `glob`/`grep`
+   * result, and a tool result is rendered (the tool card), persisted (the
+   * transcript row) and read by the model. See {@link describeFailure}.
    */
   readonly gitignoreError?: string;
 }
@@ -111,8 +117,70 @@ export function isHiddenPath(path: string): boolean {
     .some((segment) => segment.length > 1 && segment.startsWith("."));
 }
 
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/**
+ * What a `.gitignore` failure is **called**, never what it said.
+ *
+ * ## The shape it replaced, and why it was the same defect
+ *
+ * This used to be
+ *
+ * ```ts
+ * return error instanceof Error ? error.message : String(error);
+ * ```
+ *
+ * byte for byte the shape `describeStorageFailure` in `agent/loop.ts` was fixed
+ * for, in a different module — so it is worth writing down that the two are the
+ * same *kind* of line and **not** the same severity, because the difference is
+ * who threw.
+ *
+ * The store is the component that talks to the provider, so its rejections are
+ * the provider's sentences: a worker that forwards a provider rejection hands
+ * back text that can quote the key, and that text was rendered in the status
+ * bar. The workspace is the component that talks to the *filesystem*, and it
+ * never holds the key — `AGENTS.md` §2 keeps the key in the app's settings and
+ * no `Workspace` method takes one. So no message reachable from here is a
+ * credential today, and saying otherwise would be a bigger claim than the
+ * measurement supports.
+ *
+ * It is still the same defect, for two reasons that are not about keys:
+ *
+ * 1. **The field is rendered.** `gitignoreError` becomes the `note` of the
+ *    `glob`/`grep` result, and a tool result reaches a screen three times over:
+ *    the model's context (the default framing is `JSON.stringify`), the
+ *    transcript row (`recordToolCall` persists the part's output), and the tool
+ *    card's "Ausgabe" block (`asDisplayText` is `JSON.stringify(output, null,
+ *    2)`). A rule that only holds while nobody renders the field is not a rule.
+ * 2. **A foreign text is not this package's text.** The `Workspace` is an
+ *    injected interface, and a third-party implementation's message is a
+ *    sentence this repository did not write and does not control.
+ *
+ * ## Why the class name is the better field *here*, not merely the safer one
+ *
+ * For a read failure the name is the whole diagnosis: a `DOMException` from the
+ * File System Access API is `NotAllowedError`, `NotFoundError` or
+ * `SecurityError`, and `workspace/errors.ts` in this package already says so
+ * ("a failure as a `DOMException` whose *name* carries the meaning"). The class
+ * name keeps all three and drops only the browser's prose.
+ *
+ * The one loss is `WorkspaceError`, whose four `code`s (`not_found`,
+ * `not_a_file`, `exists`, `unsupported`) collapse into the name — the same
+ * mislocated diagnosis as the store's nine `StorageErrorCode`s, and affordable
+ * for the same reason: the prefix above the call site already names the
+ * operation (".gitignore"), which is the half a user can act on.
+ *
+ * ## The `ignore().add()` catch
+ *
+ * Unreachable with the installed `ignore@7.0.10`: measured over thirteen hostile
+ * rule sets (lone trailing backslash, unterminated character class, `\0`, a lone
+ * surrogate, an overflowing `{n}` quantifier), neither `add()` nor `ignores()`
+ * throws — `add()` filters through `checkPattern` and the per-rule `RegExp` is
+ * compiled lazily, on the first `ignores()`. It stays as the guard against a
+ * future regression that the `loadGitignore` doc names, and it obeys the same
+ * rule so that a regression cannot open a second channel silently.
+ */
+function describeFailure(error: unknown): string {
+  if (error instanceof Error) return error.name === "" ? "Error" : error.name;
+  return "non-Error value";
 }
 
 /**
@@ -144,12 +212,12 @@ async function loadGitignore(workspace: Workspace): Promise<LoadedGitignore> {
     if (!(await workspace.exists(GITIGNORE_PATH))) return {};
     raw = await workspace.readText(GITIGNORE_PATH);
   } catch (error) {
-    return { error: `could not read ${GITIGNORE_PATH}: ${describe(error)}` };
+    return { error: `could not read ${GITIGNORE_PATH}: ${describeFailure(error)}` };
   }
   try {
     return { filter: ignore().add(raw) };
   } catch (error) {
-    return { error: `malformed ${GITIGNORE_PATH}: ${describe(error)}` };
+    return { error: `malformed ${GITIGNORE_PATH}: ${describeFailure(error)}` };
   }
 }
 

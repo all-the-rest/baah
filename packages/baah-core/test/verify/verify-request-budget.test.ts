@@ -129,6 +129,7 @@ function recordingStore(): TurnStore & { recorded: Map<string, unknown>; seed(id
     },
     async appendTurn() {},
     async appendMessage() {},
+    async upsertPart() {},
     async flushDelta() {},
     async closePart() {},
     async closeTurnParts() {},
@@ -157,6 +158,7 @@ function store(): TurnStore {
   return {
     async appendTurn() {},
     async appendMessage() {},
+    async upsertPart() {},
     async flushDelta() {},
     async closePart() {},
     async closeTurnParts() {},

@@ -18,7 +18,14 @@ import {
   type ApprovalResolver,
   type PermissionEngine,
 } from "../../src/agent/approval.ts";
-import { AgentTurn, staticAgentSettings, type AgentEvent, type TurnStore, type UnfinishedTurn } from "../../src/agent/loop.ts";
+import {
+  AgentTurn,
+  staticAgentSettings,
+  toolPartIdOf,
+  type AgentEvent,
+  type TurnStore,
+  type UnfinishedTurn,
+} from "../../src/agent/loop.ts";
 import { createMockModel, errorPart, finish, reasoning, text, toolCall } from "./mock-model.ts";
 
 /* ------------------------------------------------------------------ */
@@ -48,7 +55,7 @@ interface RecordedStore extends TurnStore {
   /** Unfinished turns, for the reload-recovery tests. */
   unfinished: UnfinishedTurn[];
   /** Every row the engine created, in call order. The F3/F4 contract. */
-  created: { kind: "turn" | "message" | "part" | "closed"; id: string }[];
+  created: { kind: "turn" | "message" | "part" | "closed" | "tool-part"; id: string }[];
 }
 
 function createStore(seed?: Record<string, unknown>): RecordedStore {
@@ -65,6 +72,12 @@ function createStore(seed?: Record<string, unknown>): RecordedStore {
     },
     async appendMessage(input) {
       store.created.push({ kind: "message", id: input.id });
+    },
+    // A tool part is a row of its own, not a flushed delta: it is written whole
+    // and carries the state the engine derived. The tool-loop tests below read
+    // these.
+    async upsertPart(input) {
+      store.created.push({ kind: "tool-part", id: toolPartIdOf(input.event.toolCallId) });
     },
     async flushDelta(input) {
       store.created.push({ kind: "part", id: input.partId });
@@ -436,25 +449,47 @@ describe("a successful turn", () => {
     expect(store.created.filter((entry) => entry.kind === "message")).toHaveLength(1);
   });
 
-  it("fails the turn, with a typed event, when the prompt cannot be persisted", async () => {
+  it("fails the turn, with a typed event, when the prompt cannot be persisted — and the reason names the class, not the store's text", async () => {
     /**
      * A rejected create is not a thrown `run()`: `AGENTS.md` §5 says what the
      * user must see becomes an event. And `attempts: 0` is the honest number —
      * the point of failing here is that no request ever left the tab.
+     *
+     * **This assertion used to be the leak.** It read
+     * `expect.stringContaining("database_closed")` — it *required* the store's
+     * own message to be in the reason, and the reason is rendered verbatim by
+     * the app's `failureView` (`protocol-error`). An injected store can throw a
+     * provider's sentence, and Google's 401 quotes the key back inside it, so
+     * the test that pinned "the reason contains the store's text" was pinning
+     * the one path in this package that put a key on a screen. The title
+     * changed with the assertion, because the title is what a reader trusts.
+     *
+     * The class is the replacement, not a deletion: a `not.toContain` alone
+     * would also pass for an empty string. `database_closed` is the store's
+     * `code` and `StorageError` its class — the class is the half the engine
+     * can vouch for. `test/agent/storage-failure-text.test.ts` carries the
+     * formats, the other three call sites and the self-check.
      */
     const { turn, events, store } = run({ steps: [{ parts: [...text("t1", "Hi"), finish("stop")] }] });
     store.appendMessage = async () => {
-      throw new Error("database_closed");
+      const error = new Error("database_closed: the statement arrived after close()") as Error & {
+        code: string;
+      };
+      error.name = "StorageError";
+      error.code = "database_closed";
+      throw error;
     };
     const result = await turn.run("hi");
 
     expect(result.outcome).toBe("failed");
     expect(result.attempts).toBe(0);
-    expect(result.classification).toMatchObject({ kind: "protocol-error" });
-    expect(result.classification).toHaveProperty(
-      "reason",
-      expect.stringContaining("database_closed"),
-    );
+    expect(result.classification).toMatchObject({
+      kind: "protocol-error",
+      reason: "the turn could not be persisted: StorageError",
+    });
+    const reason =
+      result.classification?.kind === "protocol-error" ? result.classification.reason : "";
+    expect(reason).not.toContain("database_closed");
     expect(kinds(events)).toContain("error");
     // And the model was never asked.
     expect(kinds(events)).not.toContain("attempt-started");

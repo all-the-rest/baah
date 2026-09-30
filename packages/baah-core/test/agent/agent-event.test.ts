@@ -80,6 +80,54 @@ export type _ApprovalCarriesTheInput = Expect<
   Equals<PayloadOf<"approval-requested">["input"], unknown>
 >;
 
+/**
+ * A `storage-warning`, all three variants at once.
+ *
+ * `Extract` over the union, so a variant that stops being part of it is a
+ * compile error here rather than a silently narrower assertion.
+ */
+type StorageWarning = Extract<AgentEvent, { type: "storage-warning" }>;
+
+/**
+ * `operation` is **required** on every variant, and its three values are the
+ * three fired-not-awaited writes.
+ *
+ * ## Why this is here and not in `storage-failure-text.test.ts`
+ *
+ * Because the helpers already exist in this file and `AGENTS.md` §4 treats a
+ * duplicated helper as a cost. It is a *type* assertion, so `tsc` is the gate:
+ * making `operation` optional, or giving a variant a fourth value, stops the
+ * package compiling — which is the first line of defence and beats every
+ * behavioural test.
+ *
+ * ## And why it is needed at all
+ *
+ * The `DECLARED_KEYS` audit below lists `"storage-warning"` as
+ * `["attempt", "message", "operation"]`, which is **wrong for two of the three
+ * variants** — `record-tool-call` and `upsert-part` also carry `toolCallId` and
+ * `toolName`. The audit does not notice, because the turn it runs has no failing
+ * write, so the list is never consulted. That is the `AGENTS.md` §6a lesson
+ * again: an assertion that cannot be reached is not coverage. The runtime half
+ * of this claim is carried where the events actually happen, in
+ * `test/agent/storage-failure-text.test.ts`, which observes all three operations
+ * from one real turn.
+ */
+export type _EveryStorageWarningNamesItsWrite = Expect<
+  Equals<StorageWarning["operation"], "heartbeat" | "record-tool-call" | "upsert-part">
+>;
+
+/**
+ * `message` is required on every variant and is a plain `string`.
+ *
+ * Its *value* is the failure's class name and never the store's text — the rule
+ * is behavioural and lives in `storage-failure-text.test.ts`; what this pins is
+ * that the field exists, so dropping it (and the description with it) is a
+ * compile error rather than a UI that renders `undefined`.
+ */
+export type _EveryStorageWarningCarriesAMessage = Expect<
+  Equals<StorageWarning["message"], string>
+>;
+
 /* ------------------------------------------------------------------ */
 /* The runtime half                                                    */
 /* ------------------------------------------------------------------ */
@@ -107,6 +155,9 @@ function createStore(): TurnStore {
   return {
     async appendTurn() {},
     async appendMessage() {},
+    // Tool parts are written on the four tool events, which this store's turn
+    // never produces — the case is a plain text turn.
+    async upsertPart() {},
     async flushDelta() {},
     async closePart() {},
     async closeTurnParts() {},

@@ -31,7 +31,20 @@
  * 2. a failed `recordToolCall` is reported and the **turn still succeeds**;
  * 3. the event names the operation, the attempt, and — for the tool call — the
  *    call itself, because "storage is unhappy" is not something a user can act on;
- * 4. the message is the store's own, and never a stack trace.
+ * 4. the message is the failure's **class name**, and never the store's own
+ *    text.
+ *
+ * **Point 4 is a correction, and three tests below were what pinned the leak.**
+ * This file used to say "the message is the store's own, and never a stack
+ * trace" and asserted it, with `toEqual` on whole events. The store is
+ * injected, so its message is not this package's text: a worker that forwards a
+ * provider rejection hands back the provider's sentence, and Google's 401 quotes
+ * the key back inside it. Those assertions were *about* the message, so they
+ * were inverted rather than deleted — a deleted assertion leaves nothing to
+ * regress against, and an inverted one records that the value is a decision.
+ * The full argument (why a field choice and not a redaction) is at
+ * `describeStorageFailure`; the formats and the self-check are in
+ * `test/agent/storage-failure-text.test.ts`.
  *
  * ## The store
  *
@@ -109,6 +122,10 @@ function createRejectingStore(): RejectingStore {
     // invisible here.
     async appendTurn() {},
     async appendMessage() {},
+    // Succeeds unless told otherwise, so the file's two subject warnings stay its
+    // two subject warnings. The upsert's own failure path is in
+    // `test/agent/tool-part.test.ts`.
+    async upsertPart() {},
     async flushDelta(input) {
       parts.set(input.partId, {
         messageId: input.messageId,
@@ -274,7 +291,7 @@ function warnings(events: readonly AgentEvent[]) {
 /* ================================================================== */
 
 describe("a heartbeat that cannot be written is a typed event", () => {
-  it("reaches the turn as a storage-warning naming the operation and the attempt", async () => {
+  it("reaches the turn as a storage-warning naming the operation, the attempt and the class", async () => {
     // The measured gap. `void store.heartbeat(…)` discarded the promise, so the
     // rejection left the turn as an unhandled promise rejection and nothing in
     // the event stream said the anchor had stopped being renewed.
@@ -282,6 +299,10 @@ describe("a heartbeat that cannot be written is a typed event", () => {
     // A one-step turn writes **two** heartbeats (one at the attempt start, one
     // at the step end), so the assertion is on the shape of every event rather
     // than on a count — the count has its own test below.
+    //
+    // The title names the class because the `toEqual` below is what pinned the
+    // leak: it listed `message: "This database handle is already closed."`, so
+    // the test *required* the store's own text in a field the app renders.
     const store = createRejectingStore();
     store.failHeartbeat = closedDatabase();
 
@@ -294,13 +315,13 @@ describe("a heartbeat that cannot be written is a typed event", () => {
         type: "storage-warning",
         operation: "heartbeat",
         attempt: 1,
-        message: "This database handle is already closed.",
+        message: "StorageError",
       },
       {
         type: "storage-warning",
         operation: "heartbeat",
         attempt: 1,
-        message: "This database handle is already closed.",
+        message: "StorageError",
       },
     ]);
   });
@@ -351,29 +372,57 @@ describe("a heartbeat that cannot be written is a typed event", () => {
     expect(warnings(events)).toEqual([]);
   });
 
-  it("carries the message, not a stack trace (AGENTS.md §5)", async () => {
-    // The same rule `toToolErrorResult` follows for tool failures: the string
-    // reaches the UI, and a stack trace is engine internals in a rendered field.
+  it("carries the failure's class, never the store's own text (AGENTS.md §5, §2)", async () => {
+    /**
+     * **This title used to say "carries the message, not a stack trace", and
+     * that was a live key leak.** The old body asserted
+     * `toBe("SQLITE_MISUSE: bad parameter or other API misuse")`, i.e. it
+     * *required* the store's text to be forwarded into a field the app renders
+     * (`storageWarningView` in the web runtime interpolates `event.message`).
+     * The store is injected: its message is whatever it was handed, including a
+     * provider rejection, and Google's 401 quotes the key back inside it.
+     *
+     * The stack-trace assertions are **kept**, because they were not wrong, only
+     * insufficient — but they are now the *weaker* channel and are labelled as
+     * such: a class name cannot contain `"at "`, so they cannot fail on their
+     * own any more. The load-bearing assertion is the `toBe` above them, which
+     * pins the value rather than merely ruling a substring out.
+     */
     const store = createRejectingStore();
-    store.failHeartbeat = new Error("SQLITE_MISUSE: bad parameter or other API misuse");
+    const error = new Error("SQLITE_MISUSE: bad parameter or other API misuse") as Error & {
+      code: string;
+    };
+    error.name = "Sqlite3Error";
+    error.code = "sql_error";
+    store.failHeartbeat = error;
 
     const { events } = await runTurn({ steps: [ANSWER], store });
 
     const event = warnings(events)[0];
-    expect(event?.message).toBe("SQLITE_MISUSE: bad parameter or other API misuse");
+    expect(event?.message).toBe("Sqlite3Error");
+    expect(event?.message).not.toContain("SQLITE_MISUSE");
+    // The two the old test had. Subsumed by the class, still asserted.
     expect(event?.message).not.toContain("at ");
     expect(event?.message).not.toContain(".ts:");
   });
 
-  it("describes a thrown non-Error instead of dropping it", async () => {
-    // A store that rejects with a string is a store that rejects; reporting
-    // nothing would be the same silent failure the fix removed.
+  it("describes a thrown non-Error by its shape, never by String(value)", async () => {
+    /**
+     * The other branch of the original `error instanceof Error ? … : String(…)`,
+     * and the second of the tests that pinned the leak: it asserted
+     * `toBe("the worker vanished")`, so `String(thrown)` was pinned as a
+     * feature. A thrown string *is* the foreign text, which is why the
+     * description is now a constant — and a constant is also the diagnosis: a
+     * store that rejects with something that is not an `Error` is broken in a
+     * way worth naming, and the name cannot vary with what it threw.
+     */
     const store = createRejectingStore();
     store.failHeartbeat = "the worker vanished";
 
     const { events } = await runTurn({ steps: [ANSWER], store });
 
-    expect(warnings(events)[0]?.message).toBe("the worker vanished");
+    expect(warnings(events)[0]?.message).toBe("non-Error value");
+    expect(warnings(events)[0]?.message).not.toContain("the worker vanished");
   });
 });
 
@@ -383,6 +432,9 @@ describe("a heartbeat that cannot be written is a typed event", () => {
 
 describe("a tool call that cannot be recorded is the same kind of event", () => {
   it("names the call, because 'storage is unhappy' is not actionable", async () => {
+    // The `toEqual` below was the third assertion pinning the leak: it listed
+    // the store's own sentence in `message`. The call still has to be named —
+    // that is what makes the warning actionable — and the message is the class.
     const store = createRejectingStore();
     store.failRecordToolCall = closedDatabase();
 
@@ -396,7 +448,7 @@ describe("a tool call that cannot be recorded is the same kind of event", () => 
       attempt: 1,
       toolCallId: "c1",
       toolName: "echo",
-      message: "This database handle is already closed.",
+      message: "StorageError",
     });
   });
 

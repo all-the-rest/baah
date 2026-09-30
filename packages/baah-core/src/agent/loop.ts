@@ -70,11 +70,15 @@
  * short version is that both are bookkeeping, and the write that genuinely ends a
  * turn is the delta flush, which is awaited.
  *
+ * A third write, `upsertPart`, is awaited and still only *warns* on a rejection —
+ * and the reason it cannot be fired is stated at its call site: three writes land
+ * on the same row in order, and an overtaken one is a state the database keeps.
+ *
  * ## Storage is injected, not imported
  *
  * `@all-the.rest/baah-storage` is a sibling, not a dependency of this package,
  * and AGENTS.md §4 forbids a pointer back. The engine talks to a narrow
- * {@link TurnStore} — twelve methods, all of which `StorageDatabase` already
+ * {@link TurnStore} — thirteen methods, all of which `StorageDatabase` already
  * implements (Plan.md §16.1).
  *
  * ## The seam is this wide for a reason
@@ -88,8 +92,12 @@
  * recovery that appended a second `interrupted` outcome to a turn it had already
  * closed. A fifth, later: the seam could not **create** the rows its parts
  * attach to, so the first write of a turn failed a foreign key and an app
- * wrapped the store to work around it. Widening an interface is cheap; a hole in
- * it is measured by somebody else, later, in a browser.
+ * wrapped the store to work around it. A sixth, later still: the seam could not
+ * **persist a tool part**, so the whole of §6.1's third part type was written by
+ * the app — along with a second copy of the rule that decides whether a failed
+ * tool is stored as a failure, which is the one rule in this file that decides
+ * something a *reload* would then show. Widening an interface is cheap; a hole
+ * in it is measured by somebody else, later, in a browser.
  */
 
 import {
@@ -207,17 +215,35 @@ export type AgentEvent =
    * version is that a heartbeat is a liveness ping whose only reader is the
    * *next* start-up, and that the write which genuinely ends a turn — the delta
    * flush — is awaited and does fail loudly on its own.
+   *
+   * `operation` is the diagnostic half and it is the half that is *ours*. The
+   * `message` is the store failure's **class name** and never its text — the
+   * field contract is at {@link describeStorageFailure}, and it changed: this
+   * used to be "the store's own message", which is a live key leak whenever the
+   * store's message is a provider's.
    */
   | {
       type: "storage-warning";
       operation: "heartbeat";
       attempt: number;
-      /** The store's own message. Never a stack trace (`AGENTS.md` §5). */
+      /**
+       * The failure's **class name** — `StorageError`, `TypeError`, … Never the
+       * store's own text: a rendered string is a screenshot, and an injected
+       * store's message is a foreign one. See {@link describeStorageFailure}.
+       */
       message: string;
     }
   | {
       type: "storage-warning";
       operation: "record-tool-call";
+      attempt: number;
+      toolCallId: string;
+      toolName: string;
+      message: string;
+    }
+  | {
+      type: "storage-warning";
+      operation: "upsert-part";
       attempt: number;
       toolCallId: string;
       toolName: string;
@@ -399,6 +425,49 @@ export interface TurnStore {
     partType: PartKind;
     contentText: string;
   }): Promise<void>;
+  /**
+   * Persist a tool part, or fold the write into the row that is already there.
+   *
+   * ## Why the engine writes tool parts at all
+   *
+   * §6.1 gives `parts` exactly three types and one of them is `tool`, and a
+   * transcript with no tool parts is not a transcript of a coding agent. The
+   * engine used to emit the four tool events and leave the *row* to whoever
+   * cared — which in practice meant the app, which meant a second implementation
+   * of this mapping on the other side of the seam, with its own copy of the state
+   * rule below. The rule is the engine's, so the engine owns the row.
+   *
+   * ## The state is derived here, and it is derived from the **value**
+   *
+   * `createSdkTool` catches everything `definition.execute` throws and returns
+   * `toToolErrorResult`'s `{ ok: false, error }` as an ordinary **result**
+   * (`src/tool.ts`, `toToolErrorResult`), so the SDK reports
+   * `output-available` for a tool that failed and the `tool-error` branch below
+   * is effectively unreachable. The value is therefore the only evidence, and a
+   * row written from the envelope alone would bake "succeeded" into the
+   * transcript permanently: right until a reload, wrong after it.
+   *
+   * **The one envelope this must not claim** is `outcome: "unknown"` — the
+   * `tool-outcome-unknown` result (`src/agent/tools.ts`), which is *not* a
+   * failure. It carries `ok: false` and an `error` string, so a check that reads
+   * only `ok` files a "the tool failed" badge onto a call whose effect is
+   * genuinely unknown. It is excluded by its own discriminator, first, in
+   * {@link toolResultFailure}.
+   *
+   * ## One method, not one per state
+   *
+   * Four call sites, four states, and a fifth state that is *not* `output-*` and
+   * a sixth that is a failure the envelope does not admit. A method per state
+   * would be six seams to keep in step with a rule that is five lines long, and
+   * the fifth and sixth are exactly the ones a per-state signature would have
+   * nowhere to put. The event carries the fact; {@link toolPartContent} decides
+   * the state.
+   *
+   * Upsert, keyed on a `partId` **derived** from the `toolCallId`: the same call
+   * is reported three times (call, result, and again on a replay), and three
+   * minted ids would be three rows for one call.
+   */
+  upsertPart(input: { sessionId: string; messageId: string; event: ToolPartEvent }): Promise<void>;
   /**
    * Close a part: it will receive no further delta.
    *
@@ -1304,6 +1373,15 @@ export class AgentTurn {
        * for a request that was never sent. `protocol-error` is retryable, which
        * is also right — the next attempt re-runs the same flush against a
        * database that may have been reopened.
+       *
+       * **This is the call site that leaked, and the one that reached the
+       * screen.** A `Classification.reason` is rendered verbatim by the app's
+       * `failureView` (`protocol-error`), so whatever {@link
+       * describeStorageFailure} returns here lands in a sentence on a status
+       * bar — which is why that function returns a class name and not the
+       * store's message. The prefix names the **operation**, and that is the
+       * half of the diagnosis that is ours; see the function for why the text
+       * cannot be.
        */
       const classification: Classification = {
         kind: "protocol-error",
@@ -1623,6 +1701,47 @@ export class AgentTurn {
           });
         });
     };
+
+    /**
+     * Persist one tool part, and report a failure as a typed event.
+     *
+     * **Awaited, and that is the decision here.** `heartbeat` above and
+     * `recordToolCall` below are fire-and-report, and each has a reason that
+     * holds: a lost heartbeat costs an anchor and a lost record costs a proof,
+     * and neither can make the *stored state* wrong. A tool part is different.
+     * The writes arrive in order — call, then result, and possibly a denial
+     * instead — and each one lands on the **same row**. Fired rather than
+     * awaited, a result can be overtaken by the call it follows and overwrite it
+     * back to `input-available`, leaving a card frozen mid-flight in the
+     * database, where no reload will ever correct it.
+     *
+     * Awaiting costs one row write per tool event, and that is not the hot path:
+     * §6.2's buffered-delta rule is about *tokens*, and a tool call is one event
+     * per step. The `tool-call`/`tool-result` pairing is what a tool that both
+     * streams text and calls a tool looks like, and it is why the ordering is
+     * not an optimisation to leave for later.
+     *
+     * Awaited, but a **failure is not fatal**: the model already holds the
+     * tool's real output and the call really did happen, so a store that cannot
+     * take the row costs a card after a reload rather than an answer. `AGENTS.md`
+     * §5 says what the user must see becomes a typed event, so the report is
+     * `storage-warning` and not a `catch {}`.
+     */
+    const upsertToolPart = async (event: ToolPartEvent): Promise<void> => {
+      try {
+        await store.upsertPart({ sessionId, messageId, event });
+      } catch (error: unknown) {
+        emit({
+          type: "storage-warning",
+          operation: "upsert-part",
+          attempt,
+          toolCallId: event.toolCallId,
+          toolName: event.toolName,
+          message: describeStorageFailure(error),
+        });
+      }
+    };
+
     // Written at the start of every attempt, not only per step, so a turn that
     // dies *before* its first `onStepEnd` still has an anchor to be measured
     // against (Plan.md §6.1).
@@ -1780,6 +1899,12 @@ export class AgentTurn {
               toolName: part.toolName,
               input: part.input,
             });
+            await upsertToolPart({
+              type: "tool-call",
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              input: part.input,
+            });
             break;
           }
 
@@ -1789,6 +1914,16 @@ export class AgentTurn {
               Object.assign(entry.part, { state: "output-available", output: part.output });
             }
             emit({
+              type: "tool-result",
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              output: part.output,
+            });
+            // The row, and the point of the whole method: `part.output` is the
+            // *value*, and a value of `{ ok: false, error }` is a failure the
+            // nominal `output-available` does not admit. Persisted raw, that state
+            // would survive every reload.
+            await upsertToolPart({
               type: "tool-result",
               toolCallId: part.toolCallId,
               toolName: part.toolName,
@@ -1844,6 +1979,16 @@ export class AgentTurn {
               toolName: part.toolName,
               error: String(part.error),
             });
+            // Practically unreachable (`createSdkTool` converts every throw into
+            // a result), and written anyway: the SDK's own catch is the one path
+            // that would reach it, and a card that never learned about a failure
+            // is worse than a redundant write.
+            await upsertToolPart({
+              type: "tool-error",
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              error: String(part.error),
+            });
             /**
              * No `recordToolCall` here, and that is a fact about reachability
              * rather than an oversight.
@@ -1871,6 +2016,15 @@ export class AgentTurn {
             // A denial, not an error: the model reads the refusal and routes
             // around it instead of retrying a malfunction (§7.6).
             emit({
+              type: "tool-output-denied",
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              reason: undefined,
+            });
+            // `output-denied` and not `output-error`, and the value here is
+            // `undefined` so the derivation cannot promote it: a refusal is a
+            // legitimate answer the model routes around (§7.6).
+            await upsertToolPart({
               type: "tool-output-denied",
               toolCallId: part.toolCallId,
               toolName: part.toolName,
@@ -2171,6 +2325,226 @@ function isToolPart(part: UIMessage["parts"][number]): part is ToolPart {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* The tool part — the mapping, in the engine's vocabulary             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The four tool events that are a tool part's lifecycle.
+ *
+ * `Extract` on the engine's own event union, so the seam cannot drift from
+ * `AgentEvent` and the members are the *engine's*, not a hand-written
+ * near-copy. **`tool-outcome-unknown` is not in here**, and that is the point:
+ * it has its own node in the transcript (`Plan.md` §5.1) because a card claiming
+ * an outcome is the lie the event exists to prevent, so there is no state to
+ * write and no caller that could ask for one. The *envelope* that event's result
+ * carries is a different thing entirely and is handled below, on the value.
+ */
+export type ToolPartEvent = Extract<
+  AgentEvent,
+  { type: "tool-call" | "tool-result" | "tool-error" | "tool-output-denied" }
+>;
+
+/**
+ * The states a tool part can be in (`Plan.md` §15.5, plus the two the SDK adds
+ * and the plan does not name).
+ *
+ * `output-denied` is the one that is easy to get wrong: a refusal is a
+ * legitimate answer the model reads and routes around (§7.6), so it must not
+ * wear the same state as a failure.
+ */
+export type ToolCardState =
+  | "input-streaming"
+  | "input-available"
+  | "approval-requested"
+  | "approval-responded"
+  | "output-available"
+  | "output-error"
+  | "output-denied";
+
+/**
+ * What a stored tool part's `data` blob carries (`Plan.md` §6.1).
+ *
+ * The shape a reader has to understand, and the reason the **discriminator**
+ * carries the name: `ToolUIPart`'s `type` is `` `tool-${NAME}` `` and there is no
+ * `toolName` field to read back, so a reader looking for one finds nothing.
+ */
+export interface StoredToolPart {
+  readonly type: string;
+  readonly toolCallId: string;
+  readonly state: ToolCardState;
+  readonly input: unknown;
+  readonly errorText?: string;
+  readonly output?: unknown;
+}
+
+/**
+ * The tool part an event asks for, minus the row it is written into.
+ *
+ * Everything here is a fact about the call, and none of it is the storage
+ * layer's business: which part the write belongs to, what the state is, what the
+ * part says, and what it contributes to the searchable projection. What the
+ * `data` blob looks like *on disk* — a JSON string in a `parts` row, with
+ * `status` and the timestamps — is the adapter's, and it is the whole of what
+ * the adapter is left to decide.
+ */
+export interface ToolPartContent {
+  /** Derived from the `toolCallId`, never minted — see {@link TurnStore.upsertPart}. */
+  readonly partId: string;
+  /** The `data` blob, as a **value**. Serialising it is the adapter's job. */
+  readonly data: StoredToolPart;
+  /** §6.1's denormalised, searchable projection. */
+  readonly contentText: string;
+}
+
+/**
+ * The failure message a tool **result** carries, or `undefined`.
+ *
+ * ## Why the value decides and not the state
+ *
+ * `Plan.md` §5 wants a model-visible failure instead of a broken step, so
+ * `createSdkTool` catches everything `definition.execute` throws and returns
+ * `{ ok: false, error }` as an ordinary **result** (`toToolErrorResult`,
+ * `src/tool.ts`). The consequence is concrete: a part written only from the
+ * event's nominal state persists `output-available` for a tool that failed, and
+ * persists it **permanently** — the live card would be right until the reload and
+ * wrong after it, which is the one direction a card must not be able to drift.
+ *
+ * ## The one envelope this must not claim
+ *
+ * `tool-outcome-unknown` also returns `ok: false` **with** an `error` string
+ * (`src/agent/tools.ts`). It is not a failure; it says the call began and never
+ * reported, so its effect is unknowable. Claiming it here would paint
+ * "Fehlgeschlagen" onto a card whose state is a warning, so it is excluded by
+ * its own discriminator, and **first** — before the `ok` is even read.
+ *
+ * The `error` must also be a non-empty string, not merely present: a tool is
+ * free to return `{ ok: false }` as an ordinary value, and a row that claims a
+ * failure without saying why renders an empty red card.
+ */
+export function toolResultFailure(output: unknown): string | undefined {
+  if (typeof output !== "object" || output === null) return undefined;
+  const record = output as Record<string, unknown>;
+  if (record["outcome"] === "unknown") return undefined;
+  if (record["ok"] !== false) return undefined;
+  const error = record["error"];
+  return typeof error === "string" && error !== "" ? error : undefined;
+}
+
+/**
+ * The state a **result** turns its nominal state into.
+ *
+ * Only `output-available` is reconsidered. Every other state is a fact the engine
+ * reported on purpose — `output-denied` is a refusal and `output-error` is an
+ * SDK-caught rejection — and re-deciding one of those from a value would let a
+ * tool's own payload overrule the engine.
+ */
+export function toolStateForResult(state: ToolCardState, output: unknown): ToolCardState {
+  if (state !== "output-available") return state;
+  return toolResultFailure(output) === undefined ? "output-available" : "output-error";
+}
+
+/**
+ * The part id for a tool call: `part-${toolCallId}`.
+ *
+ * Derived rather than minted, because the same call is reported up to three
+ * times (call, result, and again on a replay) and three minted ids would be
+ * three rows for one call. The prefix keeps it recognisable in a row dump.
+ */
+export function toolPartIdOf(toolCallId: string): string {
+  return `part-${toolCallId}`;
+}
+
+/**
+ * The value a tool event carries, which is what the state is derived from.
+ *
+ * `undefined` for a denial, and that is a fact: a refusal has no output, and a
+ * row claiming one would render an empty result on a card that correctly says
+ * "Abgelehnt".
+ */
+function toolEventValue(event: ToolPartEvent): unknown {
+  switch (event.type) {
+    case "tool-call":
+      return event.input;
+    case "tool-result":
+      return event.output;
+    case "tool-error":
+      return event.error;
+    case "tool-output-denied":
+      return undefined;
+  }
+}
+
+/** The state each event reports, before the value is consulted. */
+function toolEventState(event: ToolPartEvent): ToolCardState {
+  switch (event.type) {
+    case "tool-call":
+      return "input-available";
+    case "tool-result":
+      return "output-available";
+    case "tool-error":
+      return "output-error";
+    case "tool-output-denied":
+      return "output-denied";
+  }
+}
+
+/**
+ * The best text a value can contribute to a searchable projection.
+ *
+ * A tool part's `content_text` is the **rendered input** (§6.1: the column is the
+ * denormalised projection), so a search for a path finds the call that made it.
+ * `JSON.stringify` returns `undefined` for a function or `undefined`, which is
+ * why the fallback exists, and which is why a value that cannot be serialised
+ * falls back to `String` rather than to nothing.
+ */
+function textProjection(value: unknown): string {
+  if (value === undefined) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * The part one tool event asks for.
+ *
+ * **The one place this decision is made.** Four events, four nominal states, and
+ * one correction that can turn exactly one of them into a different one — the
+ * value of a `tool-result` that is a failure envelope. Before this lived here it
+ * lived in the app, next to a reader that applied the same rule again, and the
+ * two could disagree; a rule that decides what a reloaded card says belongs on
+ * the side that writes the row, and is stated once.
+ *
+ * `errorText` has a second source on purpose. A `tool-error` event carries its
+ * message as a **string**, and `toolResultFailure` reads the object envelope, so
+ * the string is the fallback — neither path may end up storing `output-error`
+ * with nothing to render, which is how a row ends up claiming a failure and
+ * staying silent about why.
+ */
+export function toolPartContent(event: ToolPartEvent): ToolPartContent {
+  const value = toolEventValue(event);
+  const state = toolStateForResult(toolEventState(event), value);
+  const failure = toolResultFailure(value) ?? (state === "output-error" ? textProjection(value) : undefined);
+  return {
+    partId: toolPartIdOf(event.toolCallId),
+    contentText: textProjection(value),
+    data: {
+      type: `tool-${event.toolName}`,
+      toolCallId: event.toolCallId,
+      state,
+      input: value,
+      ...(failure === undefined ? {} : { errorText: failure }),
+      // Only a result that *is* one carries an output. The failure envelope's
+      // whole content is its `error` string, and storing both would say the same
+      // sentence twice.
+      ...(state === "output-available" ? { output: value } : {}),
+    },
+  };
+}
+
 /** `crypto.randomUUID()` per AGENTS.md §5; falls back only where it is absent. */
 function newMessageId(): string {
   const cryptoRef = globalThis.crypto;
@@ -2238,17 +2612,87 @@ function describe(classification: Classification): string {
 }
 
 /**
- * The one-line description of a store failure, for a `storage-warning`.
+ * The one-line description of a store failure — the text a `storage-warning`
+ * carries, and the tail of the `protocol-error` reason the prompt-persist
+ * failure builds.
  *
- * **The message and nothing else.** `AGENTS.md` §5's rule for the tool-error
- * path applies verbatim here: a stack trace is a leak of engine internals into
- * a string the UI renders, and the store's own `code` (`sql_error`,
- * `database_closed`, …) is the part a user can act on. A thrown value that is
- * not an `Error` is stringified rather than dropped — an unprintable failure is
- * still a failure, and `String(value)` is all a description can honestly be.
+ * ## The class name, and why the message is not an option
+ *
+ * **This function used to return `error.message`, and that was a live key leak.**
+ * The store is injected, so what it throws is not this package's text: a worker
+ * that forwards a provider rejection, or a store that reports the last request
+ * it made, hands back a string that *is* the provider's — and Google's 401
+ * quotes the key back inside it. The measured shape was
+ *
+ * ```text
+ * the turn could not be persisted: 401 from Google: key sk-live-4f9a1c2b7e8d is invalid
+ * ```
+ *
+ * becoming a `Classification.reason`, and a `reason` is rendered (`failureView`,
+ * `protocol-error`, in the app). So the rule is not "be careful with this
+ * string": an arbitrary `Error.message` is the one shape in this program that
+ * can carry a key, and this was the path that reached the screen.
+ *
+ * **The alternative was redaction, and it is not one.** A redactor is a *deny*
+ * list over a field the foreign side chose; a whitelist is a *permit* over a
+ * field we chose. The first is unfalsifiable — the key can be in any format, and
+ * a pattern that misses one is a hole nobody can test their way out of, because
+ * the formats are not enumerable. The second closes by choosing a different
+ * field. `error.name` is a class name by contract: `StorageError` (see
+ * `describeReadFailure` in the web runtime, which already made this exact
+ * trade), `Sqlite3Error`, `TypeError`, `DOMException`. A redactor's coverage is
+ * an argument; a field choice is a fact.
+ *
+ * **What is lost, stated plainly.** For the real store the name is
+ * `StorageError` for all nine `StorageErrorCode`s, so `sql_error` and
+ * `database_owned_by_another_context` become the same eleven characters here.
+ * That is a real loss and it is **mislocated, not destroyed**: the code is a
+ * closed vocabulary owned by `baah-storage`, and the layer that sits next to
+ * that vocabulary is the one that should read it — which is what
+ * `describeReadFailure` does, and the reason this cannot. `TurnStore` is an
+ * injected interface and does not carry a `code`; duck-typing one here would
+ * have the engine vouch for a string an arbitrary implementation wrote, which is
+ * the same mistake one layer down. A warning is not a verdict (the turn
+ * continues), and nothing the engine can do about a code is different from
+ * nothing.
+ *
+ * **What carries the diagnostic value instead** is the `operation` on the
+ * event, and it is a field of ours: `heartbeat`, `record-tool-call`,
+ * `upsert-part`, plus the `protocol-error` reason's own "the turn could not be
+ * persisted". Which write failed was never answered by the text; the text
+ * answered "which SQL", and SQL is the adapter's business, not the engine's and
+ * not the user's.
+ *
+ * ## The empty name
+ *
+ * `error.name === "" ? "Error" : error.name` is a **narrowing** guard, not a
+ * default: the alternative to an empty string here is not a better name, it is
+ * a sentence with a hole in it — and the rendered case is the literal prefix
+ * plus nothing, which reads as "no failure was reported" rather than "the
+ * failure had no name".
+ *
+ * Which case it guards, so the next reader does not have to re-derive it: **not**
+ * `new Error("")`, whose *message* is empty and whose name is `"Error"`; **not** a
+ * subclass with no `name` of its own, which inherits `Error.prototype.name` and
+ * already reads `"Error"`. It is an `Error` whose `name` was *overwritten* with
+ * the empty string. Nothing in this repository does that — the pinned
+ * implementation is the only writer — and it stays because `TurnStore` is an
+ * injected seam: a third-party store's rejection is a value this package has
+ * never seen, and this is the one malformed shape a foreign writer can produce
+ * without producing anything at all.
+ *
+ * ## The non-`Error` case
+ *
+ * A constant, not `String(value)`. `String` is the same leak with one fewer
+ * ceremony — the thrown value *is* the foreign text — and it was the second
+ * branch of the original. `"non-Error value"` is not less information than a
+ * truthy string would be: it says the store broke in a way that is not even an
+ * `Error`, which is itself the diagnosis (a `postMessage`'d raw value, a
+ * `throw "…"`), and it says it in a form that cannot vary.
  */
 function describeStorageFailure(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof Error) return error.name === "" ? "Error" : error.name;
+  return "non-Error value";
 }
 
 export type { ToolSet, AiToolSet, UIMessageChunk };

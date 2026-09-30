@@ -117,6 +117,8 @@ function createStore(): TurnStore {
   return {
     async appendTurn() {},
     async appendMessage() {},
+    // No tool events in these turns, so no tool part is ever written.
+    async upsertPart() {},
     async flushDelta() {},
     async closePart() {},
     async closeTurnParts() {},

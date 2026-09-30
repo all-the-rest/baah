@@ -152,13 +152,34 @@ describe("createIgnoreFilter", () => {
     expect(isIgnored.gitignoreError).toBeUndefined();
   });
 
-  it("survives an unreadable .gitignore and reports why", async () => {
-    // A real failure mode: `.gitignore` is a directory, or the handle is gone.
+  it("survives an unreadable .gitignore and names the failure's class, not its text", async () => {
+    /**
+     * A real failure mode: `.gitignore` is a directory, or the handle is gone.
+     *
+     * **This title used to say "and reports why", and its body asserted
+     * `toContain("permission denied")`** — i.e. it *required* the workspace's
+     * own `Error.message` to be forwarded into `gitignoreError`, which is
+     * interpolated into the `note` of a `glob`/`grep` result and therefore
+     * reaches the model, the transcript row and the tool card. That is the same
+     * assertion shape the storage-failure block inverted, in a different module:
+     * a foreign text pinned as a feature.
+     *
+     * The fixture is a `DOMException`-shaped rejection rather than a bare
+     * `Error` on purpose. A `DOMException`'s *name* is the diagnosis — the File
+     * System Access API says `NotAllowedError`, `NotFoundError` or
+     * `SecurityError` — and `src/workspace/errors.ts` says so in this package.
+     * So the class-name rule loses no diagnosis here; it drops only the
+     * browser's prose. `toBe` rather than `not.toContain`, for the reason every
+     * other assertion in this area uses: a constant passes an absence test, and
+     * a field choice does not.
+     */
     const base = createMemoryWorkspace({ ".gitignore": "*.log\n", "debug.log": "x" });
+    const thrown = new Error("permission denied: /Users/…/.gitignore") as Error & { name: string };
+    thrown.name = "NotAllowedError";
     const workspace = {
       ...base,
       async readText(path: string) {
-        if (path === ".gitignore") throw new Error("permission denied");
+        if (path === ".gitignore") throw thrown;
         return base.readText(path);
       },
     };
@@ -166,9 +187,117 @@ describe("createIgnoreFilter", () => {
 
     expect(isIgnored("debug.log")).toBe(false);
     expect(isIgnored.gitignoreApplied).toBe(false);
-    expect(isIgnored.gitignoreError).toContain("permission denied");
+    expect(isIgnored.gitignoreError).toBe("could not read .gitignore: NotAllowedError");
+    expect(isIgnored.gitignoreError).not.toContain("permission denied");
     // The hard-coded rules keep working.
     expect(isIgnored("node_modules/x.js")).toBe(true);
+  });
+
+  it("the unreadable-.gitignore assertion is not vacuous", async () => {
+    /**
+     * The self-check, and the reason it is not folded into the test above.
+     *
+     * Every assertion in this area is of the form "the foreign text is not
+     * there", and that shape is satisfied by a workspace that throws nothing, by
+     * a filter that stopped reporting, and by a fixture whose message was never
+     * the one in the note. So the planted material is verified here: the thrown
+     * value really does carry the sentence the old implementation composed, and
+     * that composition really would have reached the field.
+     *
+     * `AGENTS.md` §6a: every gate needs a self-test with planted material. This
+     * is not a gate, but the failure mode is the same one the rule is about.
+     */
+    const thrown = new Error("permission denied: /Users/…/.gitignore") as Error & { name: string };
+    thrown.name = "NotAllowedError";
+    const base = createMemoryWorkspace({ ".gitignore": "*.log\n" });
+    const workspace = {
+      ...base,
+      async readText(path: string) {
+        if (path === ".gitignore") throw thrown;
+        return base.readText(path);
+      },
+    };
+    const isIgnored = await createIgnoreFilter(workspace);
+
+    // What the implementation used to return, verbatim.
+    expect(`could not read .gitignore: ${thrown.message}`).toContain("permission denied");
+    // And the field really is populated, so the assertion above had something
+    // to rule out.
+    expect(isIgnored.gitignoreError).toBeDefined();
+    expect(isIgnored.gitignoreError).not.toContain("permission denied");
+  });
+
+  it("a thrown non-Error is described by its shape, never by String(value)", async () => {
+    /**
+     * The second branch of the removed ternary, and the second path rather than
+     * a repeat of the first: `String(value)` is the same leak with one fewer
+     * ceremony, because the thrown value *is* the foreign text.
+     *
+     * A workspace implementation that rejects with a bare string is broken in a
+     * way worth naming, and the name must not vary with what it threw — so this
+     * is the pair the storage-failure block pinned, on a different seam.
+     */
+    const base = createMemoryWorkspace({ ".gitignore": "*.log\n", "debug.log": "x" });
+    const workspace = {
+      ...base,
+      async readText(path: string) {
+        if (path === ".gitignore") throw "the handle vanished mid-read";
+        return base.readText(path);
+      },
+    };
+    const isIgnored = await createIgnoreFilter(workspace);
+
+    expect(isIgnored.gitignoreApplied).toBe(false);
+    expect(isIgnored.gitignoreError).toBe("could not read .gitignore: non-Error value");
+    expect(isIgnored.gitignoreError).not.toContain("the handle vanished mid-read");
+  });
+
+  it("an Error with an empty name still describes itself", async () => {
+    /**
+     * The degenerate case, and the reason the fallback exists: an empty class
+     * name composes a sentence with a hole in it (`could not read .gitignore: `),
+     * which no reader can tell apart from "no note arrived at all".
+     *
+     * Which case this is, stated so the next reader does not have to guess: a
+     * subclass with **no** `name` of its own is *not* this case — it inherits
+     * `Error.prototype.name`, so it already reads `"Error"`. `new Error("")` is
+     * not this case either; its *message* is empty, its name is `"Error"`. The
+     * case is an `Error` whose `name` was overwritten with the empty string,
+     * which nothing in this repository does and a foreign `Workspace` might.
+     */
+    const base = createMemoryWorkspace({ ".gitignore": "*.log\n" });
+    const nameless = new Error("permission denied");
+    nameless.name = "";
+    const workspace = {
+      ...base,
+      async readText(path: string) {
+        if (path === ".gitignore") throw nameless;
+        return base.readText(path);
+      },
+    };
+    const isIgnored = await createIgnoreFilter(workspace);
+
+    expect(isIgnored.gitignoreError).toBe("could not read .gitignore: Error");
+  });
+
+  it("a subclass with no name of its own keeps the name it inherits", async () => {
+    // The case the test above says it is *not*, pinned as a fact rather than
+    // left as a claim in a comment. Every `class X extends Error {}` in this
+    // program is this shape, and it is what a second implementation of the
+    // `Workspace` seam would most likely throw.
+    class HandleGone extends Error {}
+    const base = createMemoryWorkspace({ ".gitignore": "*.log\n" });
+    const workspace = {
+      ...base,
+      async readText(path: string) {
+        if (path === ".gitignore") throw new HandleGone("permission denied");
+        return base.readText(path);
+      },
+    };
+    const isIgnored = await createIgnoreFilter(workspace);
+
+    expect(new HandleGone("x").name).toBe("Error");
+    expect(isIgnored.gitignoreError).toBe("could not read .gitignore: Error");
   });
 
   it("applies a weird but parseable .gitignore without throwing", async () => {

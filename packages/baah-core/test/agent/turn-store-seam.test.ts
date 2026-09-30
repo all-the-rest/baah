@@ -67,7 +67,11 @@ import {
   isRecoverableTurn,
   recoverStaleTurns,
   STALE_HEARTBEAT_MS,
+  toolPartContent,
+  type AgentEvent,
   type PartKind,
+  type ToolCardState,
+  type ToolPartContent,
   type TurnOutcome,
   type TurnOutcomeEntry,
   type TurnStore,
@@ -86,6 +90,21 @@ interface StoredPart {
   partType: PartKind;
   contentText: string;
   status: "streaming" | "completed" | "aborted";
+  /**
+   * `MAX(seq) + 1` per session, allocated the way the store allocates it.
+   *
+   * `undefined` when the test did not ask for it: allocating on every flush would
+   * be noise for the streaming tests, which have no ordering to measure.
+   */
+  seq?: number;
+}
+
+interface StoredMessage {
+  id: string;
+  sessionId: string;
+  role: "user" | "assistant" | "system";
+  turnId: string | null;
+  seq: number;
 }
 
 interface FakeStore extends TurnStore {
@@ -98,6 +117,29 @@ interface FakeStore extends TurnStore {
   readonly turnPartCloses: string[];
   readonly heartbeats: { turnId: string; sessionId: string; at: string }[];
   readonly outcomes: { turnId: string; outcome: TurnOutcome; error: string | undefined }[];
+  /** The states a tool part was written with, in the order they were written. */
+  readonly toolPartStates: { partId: string; state: ToolCardState }[];
+  /** The last write of each tool part, so the folded row can be inspected. */
+  readonly toolPartRows: Map<string, ToolPartContent>;
+  /**
+   * The message rows, in the order they were created.
+   *
+   * A fake that only logged calls could not measure the *ordering* property,
+   * because `seq` is what the transcript is read in and `seq` is allocated by the
+   * store. So the fake allocates it: `MAX(seq) + 1` per session, and a duplicate
+   * id resolves without moving the counter — the two rules from `Plan.md` §6.2
+   * and the engine's declared idempotency.
+   */
+  readonly messages: StoredMessage[];
+  /**
+   * Which create refuses, and whether the fake allocates `seq` at all.
+   *
+   * `undefined` (the default) is the healthy case. `"appendMessage"` models the
+   * engine's failure path: the turn landed, the message did not.
+   */
+  refuse: "appendMessage" | undefined;
+  /** Cleared after the first refusal, so a retry is observable. */
+  seqByMessage: Map<string, number> | undefined;
   /** Every call, in order — so "the flush came before the close" is measured. */
   readonly calls: string[];
   unfinished: UnfinishedTurn[];
@@ -132,11 +174,39 @@ function createFakeStore(options: { partTurn?: string } = {}): FakeStore {
   const turnPartCloses: string[] = [];
   const heartbeats: { turnId: string; sessionId: string; at: string }[] = [];
   const outcomes: { turnId: string; outcome: TurnOutcome; error: string | undefined }[] = [];
+  const toolPartStates: { partId: string; state: ToolCardState }[] = [];
+  const toolPartRows = new Map<string, ToolPartContent>();
+  const messages: StoredMessage[] = [];
   const calls: string[] = [];
   const seenDeltas = new Set<string>();
   /** Message ids the engine created for a non-assistant role. */
   const userMessages = new Set<string>();
   const defaultTurn = options.partTurn ?? "t1";
+
+  /**
+   * `MAX(seq) + 1`, per session **and per table** — which is the rule, and the
+   * detail that makes the ordering test meaningful: `messages` and `parts` each
+   * count from their own table, so the prompt's message row and the prompt's
+   * part are both position 0 of their own kind. A single shared counter would put
+   * the answer's part at 2 and the test would pass for the wrong reason.
+   */
+  const nextSeq = (table: "messages" | "parts"): number => {
+    let highest = -1;
+    if (table === "messages") {
+      for (const message of messages) {
+        if (message.sessionId === currentSessionId && message.seq > highest) highest = message.seq;
+      }
+      return highest + 1;
+    }
+    for (const part of parts.values()) {
+      // `seq` is `undefined` for the tests that did not ask for it, and a part
+      // with no `seq` must not move the counter — it never had one.
+      const seq = part.seq ?? -1;
+      if (part.sessionId === currentSessionId && seq > highest) highest = seq;
+    }
+    return highest + 1;
+  };
+  let currentSessionId = "s1";
 
   const store: FakeStore = {
     parts,
@@ -146,10 +216,15 @@ function createFakeStore(options: { partTurn?: string } = {}): FakeStore {
     turnPartCloses,
     heartbeats,
     outcomes,
+    toolPartStates,
+    toolPartRows,
+    messages,
     calls,
     unfinished: [],
     outcomeReads: 0,
     partTurn: new Map(),
+    refuse: undefined,
+    seqByMessage: undefined,
 
     answerParts() {
       return [...parts.values()].filter((part) => !userMessages.has(part.messageId));
@@ -175,10 +250,40 @@ function createFakeStore(options: { partTurn?: string } = {}): FakeStore {
     },
     async appendMessage(input) {
       calls.push(`appendMessage:${input.id}:${input.role}`);
+      if (store.refuse === "appendMessage") {
+        store.refuse = undefined;
+        throw new Error("the database handle is closed");
+      }
+      currentSessionId = input.sessionId;
+      // Idempotent by `id`, exactly like the store: a retry resolves to the row
+      // that is there and does **not** move the counter. That is the rule the
+      // ordering tests depend on, so the fake has to have it.
+      if (store.seqByMessage !== undefined) {
+        if (!messages.some((message) => message.id === input.id)) {
+          messages.push({
+            id: input.id,
+            sessionId: input.sessionId,
+            role: input.role,
+            turnId: input.turnId,
+            seq: nextSeq("messages"),
+          });
+        }
+      }
       // Which rows are the user's, so the streaming tests can scope themselves to
       // the assistant's parts. The prompt is a real part and arrives through the
       // real protocol; that it is a *different* part is what makes it separable.
       if (input.role !== "assistant") userMessages.add(input.id);
+    },
+
+    // A tool part is a row of its own, not a flushed delta: written whole, with
+    // the state the engine derived. Kept in `toolParts` by the part id so the
+    // upsert-then-fold order is measurable, which is the property the engine's
+    // `await` on this method buys.
+    async upsertPart(input) {
+      const content = toolPartContent(input.event);
+      calls.push(`upsertPart:${content.partId}:${content.data.state}`);
+      toolPartStates.push({ partId: content.partId, state: content.data.state });
+      toolPartRows.set(content.partId, content);
     },
     async flushDelta(input) {
       calls.push(`flushDelta:${input.partId}`);
@@ -189,6 +294,7 @@ function createFakeStore(options: { partTurn?: string } = {}): FakeStore {
       seenDeltas.add(input.deltaId);
       deltas.push({ id: input.deltaId, partId: input.partId, contentText: input.contentText, messageId: input.messageId });
       store.partTurn.set(input.partId, defaultTurn);
+      currentSessionId = input.sessionId;
       parts.set(input.partId, {
         messageId: input.messageId,
         sessionId: input.sessionId,
@@ -197,6 +303,9 @@ function createFakeStore(options: { partTurn?: string } = {}): FakeStore {
         // A delta is mid-stream by definition. This is the line a close that
         // lands too early gets undone by.
         status: "streaming",
+        // Only allocated when the test asked for `seq`; the streaming tests do
+        // not, and paying for it on every flush would be noise.
+        ...(store.seqByMessage === undefined ? {} : { seq: nextSeq("parts") }),
       });
     },
 
@@ -267,6 +376,7 @@ async function runTurn(options: {
   /** Epoch millis the engine reads; a function to advance it per read. */
   now?: () => number;
   prompt?: string;
+  onEvent?: (event: AgentEvent) => void;
 }): Promise<Awaited<ReturnType<AgentTurn["run"]>>> {
   const resolver: ApprovalResolver = createApprovalResolver({
     engine: allowAll,
@@ -292,7 +402,9 @@ async function runTurn(options: {
     turnId: "t1",
     store: options.store,
     approval: resolver,
-    onEvent: () => {},
+    onEvent: (event) => {
+      options.onEvent?.(event);
+    },
     approve: async () => "allow-once",
     sleep: async () => {},
     random: () => 0.5,
@@ -598,6 +710,140 @@ describe("the reload recovery closes the parts a dead turn left open", () => {
 
     expect(recovered.map((turn) => turn.turnId)).toEqual(["t-a", "t-b", "t-c"]);
     expect(store.outcomeReads).toBe(1);
+  });
+});
+
+/* ================================================================== */
+/* Gap 5 — the prompt's rows come before anything the model produces   */
+/* ================================================================== */
+
+describe("the prompt is written before the answer, and only once", () => {
+  it("the prompt's message row is allocated before the answer's first part", async () => {
+    /**
+     * The ordering, as a `seq` order rather than as a call log.
+     *
+     * `Plan.md` §6.2 allocates `seq` per session and `UNIQUE (session_id, seq)` is
+     * what turned a write race into a rejection, so the order of the *writes* is
+     * what decides the order of the *transcript*. A prompt persisted after the
+     * answer takes a later position than the answer it produced, and the user
+     * reads their own question below the response to it.
+     *
+     * This fake allocates `seq` the way the store does — `MAX(seq) + 1` per
+     * session — so the assertion is about the number the transcript will read,
+     * not about the order of a log nobody renders.
+     */
+    const store = createFakeStore();
+    store.seqByMessage = new Map<string, number>();
+    await runTurn({ steps: [{ parts: [...text("t1", "Hello"), finish("stop")] }], store });
+
+    const prompt = store.messages.find((entry) => entry.role === "user");
+    const answer = store.parts.get("t1");
+    expect(prompt?.seq).toBe(0);
+    expect(answer?.seq).toBe(1);
+  });
+
+  it("a retry does not append a second prompt row, nor consume a seq for it", async () => {
+    // The id is minted **once in `run`** and threaded through, so attempt 2
+    // writes the same id and the store's `ON CONFLICT (id)` resolves it. A
+    // per-attempt id would append a second `user` row and leave a gap in the
+    // sequence — the empty bubble in the transcript, plus a `seq` that no row
+    // explains.
+    const store = createFakeStore();
+    store.seqByMessage = new Map<string, number>();
+    await runTurn({
+      steps: [
+        { throws: apiError(500) },
+        { parts: [...text("t1", "second time lucky"), finish("stop")] },
+      ],
+      store,
+    });
+
+    const prompts = store.messages.filter((entry) => entry.role === "user");
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]?.seq).toBe(0);
+    // No gap: the answer took the next position, not one past a phantom row.
+    expect(store.parts.get("t1")?.seq).toBe(1);
+  });
+
+  it("the prompt's part is closed before the model's first delta is flushed", async () => {
+    // The same ordering one level down, and the part-level half: the prompt's
+    // text is a real part, so it has to be written **and closed** before the
+    // answer's text arrives — or the transcript opens with a part still in
+    // flight, which a reload renders as "still being written".
+    //
+    // All parts, not `answerParts()`: the prompt's part hangs off the **user**
+    // message row, so the streaming-scoping helper would filter it out — and
+    // that is itself worth stating, because it is why a test written against
+    // `answerParts()` would not see the prompt at all.
+    const store = createFakeStore();
+    store.seqByMessage = new Map<string, number>();
+    await runTurn({ steps: [{ parts: [...text("t1", "Hello"), finish("stop")] }], store, prompt: "the question" });
+
+    const all = [...store.parts.values()];
+    expect(all.map((part) => [part.seq, part.contentText])).toEqual([
+      [0, "the question"],
+      [1, "Hello"],
+    ]);
+    // Closed, not streaming: the user is done typing. A prompt marked in flight
+    // is a part a reload renders as "still being written".
+    expect(all[0]?.status).toBe("completed");
+  });
+});
+
+/* ================================================================== */
+/* Gap 6 — a rejected create is a failed turn, not a throw              */
+/* ================================================================== */
+
+describe("a refused create fails the turn and leaves the row for the recovery", () => {
+  it("is a `failed` turn with `attempts: 0` and a typed event, never a throw", async () => {
+    // The engine's side, and `AGENTS.md` §5 in one test: what the user must see
+    // is a typed event, not a `run()` that rejected. `attempts: 0` is the honest
+    // number — the point of failing here is that **no request left the tab**, so
+    // reporting 1 would claim the opposite.
+    const store = createFakeStore();
+    store.refuse = "appendMessage";
+    const events: { type: string }[] = [];
+    await runTurn({ steps: [{ parts: [...text("t1", "Hi"), finish("stop")] }], store, onEvent: (e) => events.push(e) });
+
+    expect(store.calls.filter((call) => call.startsWith("attempt-started"))).toEqual([]);
+    // The model was never asked, so no assistant part exists.
+    expect(store.answerPartIds()).toEqual([]);
+    expect(events.map((event) => event.type)).toContain("turn-finished");
+  });
+
+  it("does NOT call `finishTurn`, and the turn row stays for the recovery", async () => {
+    // The half that is easy to get wrong by symmetry, and the one this whole
+    // block is about. Every *other* failure path in the loop finishes the turn, so
+    // adding a `finishTurn` here "for consistency" would write an outcome message
+    // for a turn whose rows were never created — and `recoverStaleTurns` skips a
+    // turn the log already carries an outcome for, so the turn would then never be
+    // reported at all. The user gets a transcript that claims the turn ended and
+    // says nothing about what it was doing.
+    const store = createFakeStore();
+    store.refuse = "appendMessage";
+    await runTurn({ steps: [{ parts: [...text("t1", "Hi"), finish("stop")] }], store });
+
+    // The create was attempted, and no outcome was written.
+    expect(store.calls).toContain("appendTurn:t1");
+    expect(store.outcomes).toEqual([]);
+    expect(store.calls.some((call) => call.startsWith("finishTurn"))).toBe(false);
+    // And the turn is still on the recovery's list — which is where the state
+    // lands, and is what the storage side measures through the same helper
+    // (`packages/baah-storage/test/turn-store.test.ts`, section 1b).
+    store.unfinished = [
+      {
+        turnId: "t1",
+        heartbeatAt: new Date(Date.parse("2026-09-29T10:00:00.000Z") - 120_000).toISOString(),
+        startedAt: new Date(Date.parse("2026-09-29T10:00:00.000Z") - 180_000).toISOString(),
+      },
+    ];
+    const recovered = await recoverStaleTurns({
+      store,
+      sessionId: "s1",
+      nowMs: Date.parse("2026-09-29T12:00:00.000Z"),
+    });
+    expect(recovered.map((turn) => turn.turnId)).toEqual(["t1"]);
+    expect(store.outcomes.map((entry) => entry.outcome)).toEqual(["interrupted"]);
   });
 });
 
