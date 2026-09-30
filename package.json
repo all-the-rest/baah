@@ -13,8 +13,9 @@
     "preview": "pnpm --filter @all-the.rest/baah-web preview",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
-    "check": "pnpm typecheck && pnpm test",
-    "e2e": "pnpm --filter @all-the.rest/baah-web e2e"
+    "check": "pnpm check:browser-only && pnpm typecheck && pnpm test",
+    "e2e": "pnpm --filter @all-the.rest/baah-web e2e",
+    "check:browser-only": "node --experimental-strip-types scripts/browser-only.ts"
   },
   "devDependencies": {
     "typescript": "^7.0.2"

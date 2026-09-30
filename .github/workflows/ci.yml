@@ -55,6 +55,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Its own step, not folded into `pnpm check`. A failure here must be legible as
+      # "the browser-only rule was broken" and not arrive buried in a test log - and the
+      # gate is a rule about the ARCHITECTURE, so it deserves a name in the run list.
+      - name: Browser-only gate (no server form, required browser capabilities in use)
+        run: pnpm check:browser-only
+
       - name: Typecheck and unit test
         run: pnpm check
 

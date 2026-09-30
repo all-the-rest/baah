@@ -67,6 +67,90 @@ Bedingungen, alle drei:
 3. **Die Ausnahme wird im Bericht des Build-Agenten genannt**, damit sie
    sichtbar bleibt und nicht zur Gewohnheit verkommt.
 
+### 2a. Das Ziel ist eine **PWA**, und Dateizugriff wie Speicherung laufen **ausschließlich** über Browser-APIs
+
+§2 sagt, was verboten ist. Dieser Abschnitt sagt, **was stattdessen wahr sein muss** —
+denn ein Verbot ohne Anforderung wird erfüllt, indem man die Hälfte wegbaut.
+
+**Ziel:** eine statische, **installierbare, offline lauffähige Web-App** (PWA), deren
+**Projektordner** (per File System Access API gewählt) die **Wahrheitsquelle** für
+Sessions und Verlauf ist. Kein Server — zu keinem Zeitpunkt, für nichts.
+
+**Drei Regeln, jede mit einem Befehl:**
+
+1. **Dateizugriff** nur über die File System Access API
+   (`showDirectoryPicker`, `FileSystemFileHandle.createWritable`) oder OPFS
+   (`navigator.storage.getDirectory`).
+2. **Speicherung** nur über Browser-Speicher: Local Storage, Session Storage,
+   IndexedDB, Cache Storage, OPFS.
+3. **Die Session-Datenbank liegt im Browser.** Heute: SQLite-WASM als
+   `opfs-sahpool` in einem Web Worker (`baah-storage`). Das ist eine
+   **Plattformgrenze**, keine Designentscheidung: `opfs-sahpool` braucht einen
+   `FileSystemSyncAccessHandle`, und den gibt es **nur in OPFS**. Ein per
+   `showDirectoryPicker()` gewählter Ordner liefert nur `createWritable()`, also
+   einen Schreibstrom ohne Zufallszugriff. **SQLite lässt sich dort nicht öffnen.**
+   Wer das ändern will, muss die *Wahrheitsquelle* verlagern, nicht die Datei
+   hinschreiben — siehe `Plan.md` zur Zwei-Schichten-Ablage.
+
+**Vollzug, nicht Notiz:**
+
+```bash
+pnpm check:browser-only     # Teil von `pnpm check` und eigenes CI-Step
+```
+
+`scripts/browser-only.ts` prüft **zwei** Hälften, und beide sind nötig:
+
+- **verboten** — keine Node-Builtins, keine Serverform, kein eigener Socket in
+  `src/` (das ist der Teil, der wie eine Regel aussieht);
+- **erforderlich** — die fünf Browser-Fähigkeiten, die das Projekt *definiert*
+  (FSAA, OPFS, Browser-Datenbank, Datenbank neben dem Hauptthread, Web-Storage)
+  müssen **tatsächlich benutzt** werden.
+
+Die zweite Hälfte ist die, die die Anforderung trägt. Eine servergestützte
+Ablage besteht die erste Hälfte **vollkommen** und fällt an der zweiten durch.
+Ein Gate, das nur verbietet, ist **halb** ein Gate: Löscht man die Persistenz,
+läuft es grün durch, weil nichts Verbotenes importiert wurde.
+
+⚠️ **Zwei Fallen, die beim Schreiben dieses Gates real passiert sind** — beide in
+`scripts/browser-only.ts` dokumentiert:
+
+- **Ein Import-Specifier ist immer ein String-Literal.** Ein Gate, das Strings
+  blankt (wie `no-console` es für `console.log` zu Recht tut), ist für `node:fs`
+  **vollständig blind**. Specifier-Regeln lesen darum den **Rohsource**, verankert
+  an einer Import-Position (`from "…"`, `import "…"`, `import(…)`, `require(…)`).
+- **Ein Muster muss der Wirklichkeit entsprechen, wie der Code es schreibt.** Die
+  erste Fassung verlangte `navigator.storage.getDirectory()`, der Code ruft
+  `storage.getDirectory()` auf einer lokalen Variablen auf — das Gate meldete eine
+  Fähigkeit als fehlend, die es gibt. **Ein Gate, das bei *Abwesenheit* lügt, wird
+  genauso ignoriert wie eines, das bei *Verstößen* lügt.**
+
+Selbsttest mit **gepflanztem Material** in
+`packages/baah-web/test/browser-only.test.ts`, beide Hälften: ein Quellensatz ganz
+ohne Browser-Fähigkeit muss **alle fünf** als fehlend melden.
+
+### 2b. Die Einhaltung wird **unabhängig** geprüft, über einen Commit-Range
+
+`pnpm check:browser-only` beweist, dass **kein** Server in `src/` steht. Es beweist
+**nicht**, dass die PWA-Regeln aus 2a eingehalten werden — die meisten davon sind
+Eigenschaften des *ausgelieferten* Artefakts, nicht des Quelltexts.
+
+**Deshalb: nach jeder Implementierungs-Welle und vor jedem Release prüft ein
+Subagent in einer eigenen Session** den Bereich
+
+```bash
+git log --oneline <letzter-prüf-commit>..HEAD
+```
+
+und berichtet mit Schweregrad, Datei:Zeile und **Messwert**. **Regel wie bei Build
+und Verify (§7.2): derselbe Agent darf seine eigene Arbeit nie prüfen.** Der
+Prüf-Commit wird am Bericht genannt, damit der nächste Lauf ihn als `HEAD`
+übernehmen kann. Beim ersten Lauf ist der Range **alles**.
+
+Was ein Quelltext-Gate **nicht** abdeckt und was darum **manuell** bleibt
+(und als offenes Gate zu benennen ist, nicht als Befund): installierte PWA auf
+einem echten Gerät, Reload, überlebt die Verzeichnis-Freigabe, funktioniert
+offline, überlebt „Website-Daten löschen" das, was es überleben soll.
+
 Warum das erlaubt ist: Es ist derselbe SQLite-Compiler, nur anders geladen. Der
 Test prüft damit die **SQL-Semantik**, die auch im Browser gilt — ein Fake hätte
 genau die Properties geprüft, die der Fake selbst definiert. Die
