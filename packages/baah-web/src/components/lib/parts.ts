@@ -22,7 +22,27 @@
  * mutations in the report are killed. A card component that computed them inline
  * would be testable only by rendering it, and "we could not install jsdom" is not
  * an acceptable reason for the dangerous decisions to be untested.
+ *
+ * ## What this file does *not* decide: whether a failed tool is a failure
+ *
+ * `toolStateForResult` and `toolResultFailure` are the **engine's**, imported from
+ * `@all-the.rest/baah-core` and re-used here rather than re-implemented, and
+ * `ToolCardState` is the engine's union imported for the same reason. That is the
+ * whole point of the split: the rule that turns a *result* into a state is applied
+ * in exactly two places in this program — the engine's `toolPartContent`, which
+ * decides what a **stored** row says, and `renderPart` below, which decides what a
+ * **rendered** card says — and both call the one function. A third copy here would
+ * be free to agree with the row until the day it did not, and the symptom would be a
+ * reloaded card that disagrees with a live one, which is the one drift a card must
+ * not be able to have.
+ *
+ * What stays here is the **render-side** half, which the engine has no opinion
+ * about: {@link STATE_COPY} (the German sentence per state), {@link toolStateLabel},
+ * {@link toolCardState} (narrowing an SDK string), the truncation rule, the diffs
+ * and the {@link RenderPart} projection. Those read a `UIMessage` part or a stored
+ * blob — data, not an event — so they are not a second copy of the writer's rule.
  */
+import { toolResultFailure, toolStateForResult, type ToolCardState } from "@all-the.rest/baah-core";
 import type { UIMessage } from "ai";
 
 import { TEST_IDS } from "../../lib/testids.ts";
@@ -84,8 +104,16 @@ export function isOutcomeMessage(message: { readonly role: string }): boolean {
 /* ------------------------------------------------------------------ */
 
 /**
- * The card's state, as the seven states `plan.md` §15.5 asks to be
- * distinguishable — plus the two the SDK adds and the plan does not name.
+ * The card's state, as the **engine** declares it.
+ *
+ * **Imported, not re-declared.** The seven states `plan.md` §15.5 asks to be
+ * distinguishable, plus the two the SDK adds and the plan does not name, are
+ * `ToolCardState` in `@all-the.rest/baah-core` — the same union that types a
+ * **stored** tool part's `state` and that `toolStateForResult` returns. This file
+ * used to carry its own copy of the union, which is how a state the engine grew
+ * would have ended up with a German label on a live card and none on a reloaded
+ * one. {@link STATE_COPY} is a `Record<ToolCardState, string>`, so an eighth state
+ * is now a **compile error here** rather than an `undefined` at runtime.
  *
  * | state | what the user is told |
  * |---|---|
@@ -101,14 +129,7 @@ export function isOutcomeMessage(message: { readonly role: string }): boolean {
  * answer the model reads and routes around (`plan.md` §7.6), so it must not
  * wear the same colour as `output-error`.
  */
-export type ToolCardState =
-  | "input-streaming"
-  | "input-available"
-  | "approval-requested"
-  | "approval-responded"
-  | "output-available"
-  | "output-error"
-  | "output-denied";
+export type { ToolCardState };
 
 /** The states a card can be in, and what the user is told about each. */
 const STATE_COPY: Readonly<Record<ToolCardState, string>> = {
@@ -147,41 +168,25 @@ export function toolStateLabel(state: ToolCardState): string {
 /* ------------------------------------------------------------------ */
 
 /**
- * The failure message a tool **result** carries, or `undefined`.
+ * `toolResultFailure` and `toolStateForResult` are **not** declared here.
  *
- * ## Why the value decides, not the state
+ * They were, and this is the tombstone. Both are the engine's
+ * (`@all-the.rest/baah-core`, `agent/loop.ts` — `toolPartContent` is built on
+ * them), both are **imported** at the top of this file, and the reasons the rule
+ * exists are the engine's to state, in the place that writes the row:
  *
- * `Plan.md` §5 wants a model-visible failure instead of a broken step, so
- * `createSdkTool` catches everything `definition.execute` throws and returns
- * `{ ok: false, error }` — `toToolErrorResult`, `packages/baah-core/src/tool.ts:118`
- * — as an ordinary **result**. Core's own comment on the unreachable `tool-error`
- * branch says so (`packages/baah-core/src/agent/loop.ts:1578-1593`): a
- * `tool-error` part means the *SDK* caught a rejection, which our wrapper has
- * already converted, so the event essentially never fires for a failing tool.
+ * - `createSdkTool` catches everything `definition.execute` throws and returns
+ *   `toToolErrorResult`'s `{ ok: false, error }` as an ordinary **result**, so the
+ *   SDK reports `state: "output-available"` for a tool that failed. Only the
+ *   **value** is the evidence, and a card driven by `part.state` alone renders a
+ *   failed `read` as `Ausgeführt` — the exact lie `Plan.md` §5 was written against.
+ * - `tool-outcome-unknown` also returns `ok: false` **with** an `error` string. It
+ *   is not a failure, and it is excluded by its own discriminator, first.
  *
- * The consequence is concrete: a card driven only by `part.state` renders a failed
- * `read` as `Ausgefuehrt` — the exact lie §5 was written against. So the state is
- * derived from the **value**, in the same spirit as {@link truncationNotice}: a
- * value-based check means a tool that starts failing is shown as failing without
- * this file being edited, and a tool that stops cannot keep a failure badge.
- *
- * ## The one envelope this must not claim
- *
- * `tool-outcome-unknown` also returns `ok: false` **with** an `error` string
- * (`packages/baah-core/src/agent/tools.ts:449-462`). It is not a failure — it is
- * "the tab died mid-call and the effect is unknowable" — and `Plan.md` §5.1 gives
- * it its own node. Claiming it here would paint that warning onto a card that
- * says `Fehlgeschlagen`, which is one of the two lies the scenario exists to
- * prevent. So it is excluded by its own discriminator, explicitly and first.
+ * What this file keeps is the half the engine cannot have: {@link STATE_COPY} and
+ * the projection that decides what a **rendered** card shows. The module header has
+ * why the two halves are two places and the rule is one.
  */
-export function toolResultFailure(output: unknown): string | undefined {
-  if (typeof output !== "object" || output === null) return undefined;
-  const record = output as Record<string, unknown>;
-  if (record["outcome"] === "unknown") return undefined;
-  if (record["ok"] !== false) return undefined;
-  const error = record["error"];
-  return typeof error === "string" && error !== "" ? error : undefined;
-}
 
 /**
  * The card state for a result, promoting a failure envelope to `output-error`.
@@ -191,10 +196,7 @@ export function toolResultFailure(output: unknown): string | undefined {
  * (`Plan.md` §7.6) — and re-deciding one of those from a value would let a tool's
  * own payload overrule the engine.
  */
-export function toolStateForResult(state: ToolCardState, output: unknown): ToolCardState {
-  if (state !== "output-available") return state;
-  return toolResultFailure(output) === undefined ? "output-available" : "output-error";
-}
+
 
 /** `true` while the call has not produced an outcome yet. */
 export function isToolInFlight(state: ToolCardState): boolean {

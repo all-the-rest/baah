@@ -13,7 +13,7 @@
  *
  * ## What the adapter actually has to do
  *
- * Five of the ten methods are already structurally identical
+ * Five of the thirteen methods are already structurally identical
  * (`listUnfinishedTurns`, `listTurnOutcomes`, `getToolCall`, `recordToolCall`,
  * `beginToolCall`) — the `ToolCallKey`/`ToolCallRecord`/`UnfinishedTurn`/
  * `TurnOutcomeEntry` shapes are layout-compatible and `AGENTS.md` §4 forbids
@@ -28,6 +28,24 @@
  * `finishTurn` has to become a transaction that writes the outcome as an `idle`
  * message *and* closes the anchor row, and `heartbeat` has to stop at exactly
  * one column.
+ *
+ * ## The two creates and the tool part are near-pass-throughs, and that is not
+ * ## a shortcut
+ *
+ * `appendTurn` and `appendMessage` are the two methods whose bodies are three
+ * lines of field forwarding each. It is tempting to read that as "nothing to do
+ * here", and the opposite is true: those two bodies are the **only** place the
+ * engine's declared idempotency-by-`id` meets a statement, so they are the place
+ * a `UNIQUE` catch would have been written if it had been written. Each is
+ * documented at its method with the failure that was measured on the way to
+ * `sql.ts`, and both are pinned in `test/turn-store.test.ts` — replay, order and
+ * a duplicate `appendTurn`, on both backends, because "it is only a pass-through"
+ * is a claim about the code, not about the behaviour.
+ *
+ * `upsertPart` forwards for a stronger reason: the state derivation it carries is
+ * the engine's (`toolPartContent`, in `@all-the.rest/baah-core`), so this file's
+ * remaining job is to have **no opinion** — the three decisions that really are
+ * storage's are each named at the method.
  *
  * ## The three gaps this file used to report, and what closed them
  *
@@ -52,6 +70,23 @@
  *    that could renew an arbitrary turn's anchor. The engine supplies the
  *    session now, so it is forwarded and the `WHERE` clause uses it.
  *
+ * Three more, found later and by other layers, and each one is a gap this file
+ * could **not** have closed on its own — which is the whole argument for them:
+ *
+ * 4. The seam could not **create** the rows its parts hang off, so the engine's
+ *    first write of a turn failed a foreign key and an app wrapped the store to
+ *    manufacture them. `appendTurn` and `appendMessage` closed that, and
+ *    `withTranscriptRows` is now a workaround with nothing left to do.
+ * 5. The seam could not **persist a tool part**, so `§6.1`'s third part type was
+ *    written by the app, from a second copy of the rule that decides whether a
+ *    failed tool is stored as a failure. `upsertPart` moved the rule to the
+ *    engine, which is where a rule about what a *reload* shows belongs.
+ * 6. A duplicate `appendTurn` would have been a **rejection**, and the engine
+ *    turns a rejection into a `failed` turn with `attempts: 0` — for a turn that
+ *    is entirely present, because a resumed approval re-enters the same one. That
+ *    is a *statement*-level fix, not an adapter one, and it is why the conflict
+ *    clause is on `INSERT_TURN` and `INSERT_MESSAGE`.
+ *
  * ## Why the two closes are one statement each
  *
  * The engine flushes a part's text **before** closing it, and it keeps flushing
@@ -66,7 +101,7 @@
  * reasoning is repeated at `sql.ts`, because that is where the statements live.
  */
 
-import type { TurnStore } from "@all-the.rest/baah-core";
+import { toolPartContent, type ToolPartEvent, type TurnStore } from "@all-the.rest/baah-core";
 
 import type { PartInput, PartType, StorageDatabase } from "./types.ts";
 
@@ -94,6 +129,41 @@ export interface TurnStoreOptions {
  * as something the engine never asked for.
  */
 type FlushablePartType = Extract<PartType, "text" | "reasoning">;
+
+/** The `appendTurn` input, spelled out for the same reason. */
+interface AppendTurnInput {
+  id: string;
+  sessionId: string;
+  startedAt: string;
+}
+
+/**
+ * The `appendMessage` input, spelled out for the same reason.
+ *
+ * `turnId` is `string | null` and **not** optional, and the adapter forwards the
+ * key as it arrives. That is the engine's declaration and this one, and it is
+ * load-bearing rather than a type detail: a message written with no turn is a
+ * real state — a turn whose create was refused — and with
+ * `exactOptionalPropertyTypes` an omitted key is a different type from an
+ * explicit `null`. Spreading the input and dropping the key would make "the
+ * engine says which turn this belongs to" and "the adapter forgot" the same
+ * value.
+ */
+interface AppendMessageInput {
+  id: string;
+  sessionId: string;
+  role: "user" | "assistant" | "system";
+  turnId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The `upsertPart` input, spelled out for the same reason. */
+interface UpsertPartInput {
+  sessionId: string;
+  messageId: string;
+  event: ToolPartEvent;
+}
 
 /** The `flushDelta` input, spelled out so a drift is a compile error here. */
 interface FlushDeltaInput {
@@ -135,6 +205,27 @@ interface HeartbeatInput {
 }
 
 /**
+ * The `data` blob as a JSON string, or a shape a reader can still render.
+ *
+ * `JSON.stringify` returns `undefined` for a function and throws on a cycle or a
+ * `BigInt`. Neither is worth losing a card over: the column is a projection of
+ * facts the part already carries in its own columns, and a reader that meets
+ * unparsable JSON renders a note rather than dropping the part (the rule is at
+ * `transcript.ts`'s `parseData`). So a value that will not serialise is written
+ * as an empty object, which says "the payload is not there" instead of "this
+ * part does not exist" — and never as `null`, which would erase the
+ * discriminator, the `toolCallId` and the state with it.
+ */
+function serialiseData(data: unknown): string {
+  try {
+    const json = JSON.stringify(data);
+    return json ?? "{}";
+  } catch {
+    return "{}";
+  }
+}
+
+/**
  * Build the engine's `TurnStore` over a `StorageDatabase`.
  *
  * The return type is the engine's interface, so every method has to exist with
@@ -150,6 +241,121 @@ export function createTurnStore(
   const now = options.now ?? ((): string => new Date().toISOString());
 
   return {
+    /**
+     * Create the turn row, if it does not exist.
+     *
+     * **No translation, and that is the point.** The engine mints the turn id
+     * and the timestamp, `TurnInput` asks for the same three scalars, and the
+     * only thing this side owns is the *idempotency*: `INSERT_TURN` resolves a
+     * duplicate id to the row that is already there instead of raising
+     * (`sql.ts`, `ON CONFLICT (id) DO UPDATE SET id = excluded.id`).
+     *
+     * The engine declares it that way for a measured reason — a `regenerate`
+     * re-sends into a fresh turn, and **a resumed approval re-enters the same
+     * one**, so "already there" is a normal state and not an error. A plain
+     * `INSERT` would turn that normal state into a rejection, which on the
+     * engine's side surfaces as a `failed` turn with `attempts: 0` for a turn
+     * that is in fact *entirely present*. The consequence is measured rather
+     * than argued: `INSERT_TURN` carries the clause, and a version without it
+     * is killed by the replay test in `test/turn-store.test.ts`.
+     *
+     * What a duplicate does is therefore decided by the statement, and it is the
+     * conservative direction: `heartbeat_at` is **not** in the `SET` list, so a
+     * second write is not a heartbeat and the 30 s staleness rule (§6.1) keeps
+     * exactly one writer for its anchor. The same asymmetry `Plan.md` §16.1
+     * records for `beginToolCall`'s `DO NOTHING`.
+     *
+     * `seq` is left out on purpose so the store allocates it — §6.2's rule, not
+     * a guess made here.
+     */
+    async appendTurn(input: AppendTurnInput): Promise<void> {
+      await database.appendTurn({
+        id: input.id,
+        sessionId: input.sessionId,
+        startedAt: input.startedAt,
+      });
+    },
+
+    /**
+     * Create the message row, if it does not exist.
+     *
+     * The same shape as {@link TurnStore.appendTurn} and the same reason:
+     * **this is the write whose plain-`INSERT` version was a real defect.** The
+     * engine mints the prompt's id **once in `run`** and threads it through
+     * `AgentTurn.#persistPrompt`, so a retried turn re-sends the *same* message
+     * id — and with a per-attempt id, a retry would append a second prompt row
+     * to the same turn. A second `user` message in a session is an empty bubble
+     * in the transcript, and it is the row that says what the user asked, so a
+     * duplicated one changes what the model is shown on the next read.
+     *
+     * `INSERT_MESSAGE`'s `ON CONFLICT (id)` is the engine's declared
+     * idempotency, not a convenience, and the full argument for why it is on the
+     * *statement* rather than caught here as a `UNIQUE` error lives at `sql.ts`.
+     * The short form: `Plan.md` §16.1 assigns idempotency to this layer ("`seq`-
+     * Vergabe, Upsert-Semantik, Idempotenz und Kaskaden **einmal** implementiert"),
+     * and a string-matched `catch` would be a second, shape-shaped copy of the
+     * same rule.
+     *
+     * `turnId` is forwarded even when it is `null`, and even though a `null`
+     * means "no turn" — see {@link AppendMessageInput}. The foreign key is
+     * still enforced: a message naming a turn that does not exist is refused
+     * with a `sql_error` on both backends, and the adapter does not soften that
+     * into a missing row.
+     */
+    async appendMessage(input: AppendMessageInput): Promise<void> {
+      await database.appendMessage({
+        id: input.id,
+        sessionId: input.sessionId,
+        role: input.role,
+        turnId: input.turnId,
+        createdAt: input.createdAt,
+        updatedAt: input.updatedAt,
+      });
+    },
+
+    /**
+     * Persist a tool part, or fold the write into the row that is already there.
+     *
+     * **The mapping is not here.** `toolPartContent` (`@all-the.rest/baah-core`,
+     * `agent/loop.ts`) decides the state, the part id, the discriminator and the
+     * `data` blob, and this method does the three things that are genuinely
+     * storage's:
+     *
+     * 1. `type: "tool"` — §6.1's third part type, and the one the engine's
+     *    `PartKind` deliberately does not carry, because a tool part is written
+     *    whole and has no mid-stream text.
+     * 2. `JSON.stringify` of the `data` value. The column is a JSON **string**
+     *    (`Plan.md` §16.1 hands it to the reader unparsed on purpose), and a
+     *    serialisation failure must not become a lost card: a `data` blob that is
+     *    not JSON is rendered as a note rather than dropped, so writing a
+     *    projection is strictly better than writing nothing.
+     * 3. `status: "completed"` and the two timestamps, from the injectable clock.
+     *    A tool part is never `streaming` — it is written whole, and a card that
+     *    stayed in flight across a reload would be a lie about a call that
+     *    finished.
+     *
+     * `seq` is again left to the store, which is what makes the upsert fold in
+     * place: `Plan.md` §16.1 has it keep the original `seq` and `created_at`, so
+     * a card that changes state updates where it is instead of jumping down the
+     * transcript.
+     */
+    async upsertPart(input: UpsertPartInput): Promise<void> {
+      const at = now();
+      const content = toolPartContent(input.event);
+      const data = serialiseData(content.data);
+      await database.upsertPart({
+        id: content.partId,
+        messageId: input.messageId,
+        sessionId: input.sessionId,
+        type: "tool",
+        contentText: content.contentText,
+        data,
+        status: "completed",
+        createdAt: at,
+        updatedAt: at,
+      });
+    },
+
     /**
      * One buffered streaming flush (`Plan.md` §6.2), **idempotent over
      * `deltaId`**.

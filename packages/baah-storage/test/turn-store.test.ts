@@ -3,13 +3,13 @@
  *
  * ## What this file is
  *
- * The engine (`@all-the.rest/baah-core`, `agent/loop.ts`) talks to a ten-method
- * `TurnStore`. Five of those methods are already structurally identical to
- * `StorageDatabase`'s; `flushDelta`, `closePart`, `closeTurnParts`, `finishTurn`
- * and `heartbeat` are not, which is what `createTurnStore()` (`src/turn-store.ts`)
- * exists for. This file is the proof that the adapter satisfies the engine's
- * contract **exactly**, and that the properties the engine depends on mean what
- * the engine thinks they mean:
+ * The engine (`@all-the.rest/baah-core`, `agent/loop.ts`) talks to a
+ * **thirteen**-method `TurnStore`. Five of those are already structurally
+ * identical to `StorageDatabase`'s; `flushDelta`, `closePart`, `closeTurnParts`,
+ * `finishTurn` and `heartbeat` are not, which is what `createTurnStore()`
+ * (`src/turn-store.ts`) exists for. This file is the proof that the adapter
+ * satisfies the engine's contract **exactly**, and that the properties the
+ * engine depends on mean what the engine thinks they mean:
  *
  * 1. `flushDelta` is idempotent over `deltaId` — a retry after a network failure
  *    is a no-op, which is the whole reason the engine may re-send one. And it
@@ -29,6 +29,30 @@
  *    read-modify-write close would lose the newer text to the older one. That is
  *    measured here, with the flush deliberately interleaved into the middle of
  *    the close rather than argued about in a comment.
+ * 6. The two **creates** are idempotent by `id`, and that is load-bearing twice
+ *    over: the engine mints the prompt's id **once in `run`** and a retry re-sends
+ *    the *same* id, so a per-attempt id — or a plain `INSERT` in place of
+ *    `ON CONFLICT (id)` — appends a second prompt row to the same turn. And a
+ *    replayed `appendTurn` must **not** renew `heartbeat_at`, or a dead turn looks
+ *    alive to the 30 s rule forever. The duplicate is resolved by the *statement*
+ *    (`Plan.md` §16.1), so both are pinned on the row and on both backends.
+ * 7. `upsertPart` writes the tool part, and the row it writes says what the engine
+ *    decided. A state that is wrong while a turn is live corrects itself on the
+ *    next event; a state that is wrong in the **database** does not — which is why
+ *    every assertion about the failed-tool rule is made on the row after it has
+ *    been through JSON and a real column.
+ *
+ * ## A finding this file pins instead of papering over
+ *
+ * `parts` carries two *independent* foreign keys (`message_id`, `session_id`) and
+ * nothing ties them to each other, so a write naming a message of one session and
+ * a session of another **lands**. The engine cannot reach it — both ids come from
+ * the same closure that wrote the rows — and the memory engine behaves
+ * identically, so this is the schema's shape rather than a divergence between
+ * backends. It is measured in section 3a with that reasoning attached, because the
+ * obvious version of that test ("a cross-session part is refused") is **false**,
+ * and a future reader would write it, find it green against a fake, and ship a
+ * claim the database does not enforce.
  *
  * ## Why it is a parity test and not a unit test
  *
@@ -55,13 +79,15 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 import type { Sqlite3Static } from "@sqlite.org/sqlite-wasm";
-import type { TurnStore } from "@all-the.rest/baah-core";
+import type { ToolPartEvent, TurnStore } from "@all-the.rest/baah-core";
 import { isTurnStale, recoverStaleTurns, STALE_HEARTBEAT_MS } from "@all-the.rest/baah-core";
 
 import { StorageError } from "../src/errors.ts";
 import { createMemoryDatabase, type MemoryDatabase } from "../src/factory.ts";
 import {
   ABORT_TURN_PARTS,
+  INSERT_MESSAGE,
+  INSERT_TURN,
   INSERT_TURN_OUTCOME_MESSAGE,
   UPDATE_PART_STATUS,
   UPDATE_TURN_HEARTBEAT,
@@ -156,12 +182,21 @@ async function sqlBackend(): Promise<SqlBackend> {
   };
 }
 
-/** One fresh database per backend: two sessions, one message, two turns. */
+/**
+ * One fresh database per backend: three sessions, one message, two turns.
+ *
+ * `s-seq` is **empty**, and that is the point rather than an oversight: `seq` is
+ * allocated per session (§6.2), so "the prompt's message took `seq` 0" is only
+ * a statement about the rule if the session it was written to had nothing in
+ * it. The tests that need a clean counter say so by using `s-seq`; the rest keep
+ * using the populated `s1` so cross-session behaviour stays measurable.
+ */
 async function bothBackends(): Promise<{ memory: Backend; sql: Backend }> {
   const backends = { memory: memoryBackend(), sql: await sqlBackend() };
   for (const backend of [backends.memory, backends.sql] as Backend[]) {
     await backend.db.createSession({ id: "s1", title: "First session" });
     await backend.db.createSession({ id: "s2", title: "Other session" });
+    await backend.db.createSession({ id: "s-seq", title: "Empty session" });
     await backend.db.appendMessage({
       id: "m1",
       sessionId: "s1",
@@ -212,6 +247,24 @@ async function same<R>(
   return results;
 }
 
+/**
+ * The message rows of a session, as `[id, seq]`, on either backend.
+ *
+ * Through the **public read** and not a raw `SELECT`, because the memory backend
+ * has no SQL engine at all (`Plan.md` §16.1: `query` is refused with
+ * `unsupported`). `listMessages` orders by `seq ASC` on both sides, so the order
+ * this returns *is* the order the transcript is read in — which is the property
+ * under test, so reading it any other way would be reading a different thing.
+ */
+async function messageSeqs(backend: Backend, sessionId: string) {
+  return (await backend.db.listMessages(sessionId)).map((message) => [message.id, message.seq] as const);
+}
+
+/** The turn ids of a session, in `seq` order, on either backend. */
+async function turnIds(backend: Backend, sessionId: string) {
+  return (await backend.db.listUnfinishedTurns({ sessionId })).map((turn) => turn.turnId);
+}
+
 /** The `part_deltas` log, in order, on either backend. */
 async function deltaLog(backend: Backend): Promise<{ id: string; seq: number; contentText: string }[]> {
   if (backend.name === "memory") {
@@ -231,6 +284,24 @@ async function deltaLog(backend: Backend): Promise<{ id: string; seq: number; co
 async function idleOutcomes(backend: Backend, sessionId: string): Promise<(string | null)[]> {
   const messages = await backend.db.listMessages(sessionId);
   return messages.filter((message) => message.role === "idle").map((message) => message.outcome);
+}
+
+/**
+ * Whether a call resolved, and what it produced.
+ *
+ * The counterpart to {@link failure} for the tests that assert a call **succeeds**
+ * where a reader would expect a refusal — a schema that does not enforce what the
+ * call site's naming makes unreachable. Without it, such a test has to be written
+ * as `await failure(...)`, which asserts the opposite of the finding.
+ */
+async function settled(
+  promise: Promise<unknown>,
+): Promise<{ ok: true; value: unknown } | { ok: false; error: unknown }> {
+  try {
+    return { ok: true, value: await promise };
+  } catch (error: unknown) {
+    return { ok: false, error };
+  }
 }
 
 async function failure(promise: Promise<unknown>): Promise<{ code: string; message: string }> {
@@ -291,7 +362,17 @@ beforeAll(async () => {
  * compile *and* the runtime key comparison fails — so a new method cannot arrive
  * without this file noticing that the adapter has none.
  */
+/**
+ * Every method `TurnStore` declares — **thirteen**, which is the number the
+ * `Exclude` below checks, and the number the `it(...)` title states. Both are
+ * here deliberately: the list is the single source of truth, the title is what a
+ * reader checks first, and a title that drifts from the list is worse than no
+ * title at all.
+ */
 const TURN_STORE_METHODS = [
+  "appendTurn",
+  "appendMessage",
+  "upsertPart",
   "flushDelta",
   "closePart",
   "closeTurnParts",
@@ -325,10 +406,20 @@ describe("the adapter satisfies TurnStore", () => {
     void _exhaustive;
   });
 
-  it("exposes exactly the engine's ten methods, on both backends", async () => {
+  it("exposes exactly the engine's thirteen methods, on both backends", async () => {
     await same([...TURN_STORE_METHODS].sort(), async (backend) =>
       Object.keys(storeOn(backend)).sort(),
     );
+  });
+
+  it("declares thirteen — the count is checked, not asserted in prose", () => {
+    // The `Exclude` in the test above is the real check (it fails to compile if
+    // the engine grows a method the list does not have). This one is the other
+    // direction and the one that actually fails *loudly*: `TURN_STORE_METHODS`
+    // growing without `TurnStore` does compile, so nothing else in this file
+    // would notice a method that the adapter no longer implements — the runtime
+    // comparison would, but only as a diff inside a bigger assertion.
+    expect(TURN_STORE_METHODS).toHaveLength(13);
   });
 
   it("is a factory, not a singleton: two adapters over two databases stay apart", async () => {
@@ -347,7 +438,474 @@ describe("the adapter satisfies TurnStore", () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* 1 — flushDelta is idempotent over deltaId                            */
+/* 1 — the two creates are idempotent by id, and they order             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A turn written through the seam, as the engine writes it.
+ *
+ * The order is the engine's and not this file's: `AgentTurn.#persistPrompt`
+ * awaits `appendTurn`, then `appendMessage`, then the part — the foreign keys'
+ * order, before the first model call. Both creates are then repeated, because
+ * the properties below are about what a **repeat** does and a single call
+ * cannot show any of them.
+ *
+ * A session of its own (`s-seq`), because the shared fixture already holds a
+ * message and a turn in `s1` and `seq` is per session: asserting "the prompt got
+ * seq 0" against a session that starts at 1 would be asserting the fixture, not
+ * the rule.
+ */
+const PROMPT = {
+  turn: { id: "t9", sessionId: "s-seq", startedAt: T0 },
+  message: {
+    id: "m9",
+    sessionId: "s-seq",
+    role: "user" as const,
+    turnId: "t9",
+    createdAt: T0,
+    updatedAt: T0,
+  },
+};
+
+/**
+ * The empty session the ordering tests count from.
+ *
+ * A no-op alias, kept so those tests read as what they are. `s-seq` is created
+ * in {@link bothBackends}, because `onBoth` and `same` are the only two ways a
+ * body gets both backends — and a third entry point that had to remember to
+ * create the session is a third way to forget it.
+ */
+async function backendsWithEmptySession(): Promise<{ memory: Backend; sql: Backend }> {
+  return bothBackends();
+}
+
+describe("appendTurn and appendMessage are idempotent by id", () => {
+  it("a second appendTurn for one turnId writes no second row", async () =>
+    same(
+      ["t9"],
+      async (backend) => {
+        const store = storeOn(backend);
+        await store.appendTurn(PROMPT.turn);
+        // Twice more: a resumed approval re-enters the same turn, and a third
+        // write must not be a different answer than the second.
+        await store.appendTurn(PROMPT.turn);
+        await store.appendTurn(PROMPT.turn);
+
+        return turnIds(backend, "s-seq");
+      },
+    ));
+
+  it("a replayed appendTurn is NOT a heartbeat — the 30 s rule keeps one writer", async () =>
+    // The asymmetry `Plan.md` §16.1 records for `beginToolCall`'s `DO NOTHING`,
+    // and it is load-bearing: `heartbeat_at` is the reload anchor, so a second
+    // turn write that renewed it would keep a dead turn looking alive forever —
+    // `recoverStaleTurns` would then never interrupt it and the transcript keeps
+    // a half-written turn with no outcome, silently, on every reload.
+    //
+    // `heartbeatAt` reads `COALESCE(heartbeat_at, started_at)`, so the fallback
+    // is asserted as the turn's own `startedAt` and **not** as `null` — see
+    // `§16.1` for why an empty string there would read as "infinitely old" and
+    // close a turn that was just created.
+    same(
+      { heartbeat: T0, startedAt: T0, unfinished: 1 },
+      async (backend) => {
+        const store = storeOn(backend);
+        await store.appendTurn(PROMPT.turn);
+        // A later `startedAt` on the replay, so a row that *did* overwrite reads
+        // differently from one that kept the first write.
+        await store.appendTurn({ ...PROMPT.turn, startedAt: T2 });
+
+        const turns = await backend.db.listUnfinishedTurns({ sessionId: "s-seq" });
+        return {
+          heartbeat: turns[0]?.heartbeatAt,
+          startedAt: turns[0]?.startedAt,
+          unfinished: turns.length,
+        };
+      },
+    ));
+
+  it("a retried turn does not create a second prompt row — one question, one bubble", async () =>
+    // The defect the prompt id being minted once in `run` exists to prevent: a
+    // per-attempt id would make every retry append another `user` message to the
+    // same turn. Two `user` rows in a session is an empty bubble in the
+    // transcript, and it is the row that says what the user asked.
+    same(
+      { prompts: [["m9", 0]], userRows: 1 },
+      async (backend) => {
+        const store = storeOn(backend);
+        await store.appendTurn(PROMPT.turn);
+        await store.appendMessage(PROMPT.message);
+        await store.appendMessage(PROMPT.message);
+        await store.appendMessage(PROMPT.message);
+
+        const rows = await messageSeqs(backend, "s-seq");
+        return {
+          prompts: rows.filter(([id]) => id === "m9"),
+          userRows: (await backend.db.listMessages("s-seq")).filter(
+            (message) => message.role === "user",
+          ).length,
+        };
+      },
+    ));
+
+  it("the prompt keeps the FIRST write, not the last one that named it", async () =>
+    // `SET id = excluded.id` is a deliberate no-op, so every other column keeps
+    // the first write. A replay that arrived with different values must not
+    // rewrite the row — the direction is the conservative one, and it is what
+    // `sql.ts` states.
+    same(
+      { seq: 0, updatedAt: T0, role: "user", turnId: "t9" },
+      async (backend) => {
+        const store = storeOn(backend);
+        await store.appendTurn(PROMPT.turn);
+        await store.appendMessage(PROMPT.message);
+        await store.appendMessage({ ...PROMPT.message, updatedAt: T2, role: "assistant" });
+
+        const message = await backend.db.getMessage("m9");
+        return {
+          seq: message?.seq,
+          updatedAt: message?.updatedAt,
+          role: message?.role,
+          turnId: message?.turnId,
+        };
+      },
+    ));
+
+  it("a duplicate id from ANOTHER session resolves to the original row", async () => {
+    /**
+     * Measured, and a property worth naming rather than discovering later: the
+     * arbiter is the **primary key**, so a same-id write naming a different
+     * session short-circuits before the foreign key is ever checked. The call
+     * resolves, and the row it returns is the original.
+     *
+     * The engine cannot reach this — its `sessionId` is a field of
+     * `AgentTurnOptions`, the same closure every other write on the seam uses —
+     * so this is not a hole the product has. It is a fact about the statement,
+     * and the statement is this layer's, so it is pinned here rather than left
+     * to be found by whoever next adds a second writer. The next test is the one
+     * that keeps it from reading like a permission bypass.
+     */
+    const results = await onBoth(async (backend) => {
+      const store = storeOn(backend);
+      await store.appendTurn(PROMPT.turn);
+      await store.appendTurn({ id: "t9", sessionId: "s1", startedAt: T2 });
+
+      return {
+        inOwn: await turnIds(backend, "s-seq"),
+        // Nothing was written into the session the replay named.
+        inOther: await turnIds(backend, "s1"),
+      };
+    });
+
+    expect(results.memory.inOwn).toEqual(["t9"]);
+    expect(results.sql.inOwn).toEqual(["t9"]);
+    // `s1` still holds only the fixture's own turn. The duplicate did not move.
+    expect(results.memory.inOther).toEqual(["t1"]);
+    expect(results.sql.inOther).toEqual(["t1"]);
+  });
+
+  it("a NEW id in a session that does not exist is still refused, on both backends", async () => {
+    // The other side of the same statement: the conflict clause only ever
+    // resolves a duplicate *id*, and a first-time write has to satisfy the
+    // foreign key. Without this test the previous one would look like a hole.
+    const backends = await backendsWithEmptySession();
+
+    for (const backend of [backends.memory, backends.sql] as Backend[]) {
+      const turn = await failure(
+        storeOn(backend).appendTurn({ id: "t-new", sessionId: "no-such-session", startedAt: T0 }),
+      );
+      const message = await failure(
+        storeOn(backend).appendMessage({
+          ...PROMPT.message,
+          id: "m-new",
+          sessionId: "no-such-session",
+          turnId: null,
+        }),
+      );
+
+      expect(turn.code, backend.name).toBe("sql_error");
+      expect(message.code, backend.name).toBe("sql_error");
+      expect(await turnIds(backend, "s-seq"), backend.name).toEqual([]);
+      expect(await messageSeqs(backend, "s-seq"), backend.name).toEqual([]);
+    }
+  });
+
+  it("the message insert names one arbiter, so UNIQUE (session_id, seq) stays loud", async () => {
+    // `ON CONFLICT (id)` names **one** arbiter. A second message with a distinct
+    // id whose computed `seq` collides still raises `UNIQUE (session_id, seq)` —
+    // and that constraint is what turned a race between two writers into a
+    // `FOREIGN KEY constraint failed` a user actually hit. `ON CONFLICT (id)` is
+    // not a way to make that quieter, and the second half of the clause says so.
+    expect(one(INSERT_MESSAGE)).toContain("ON CONFLICT (id) DO UPDATE SET id = excluded.id");
+    expect(one(INSERT_TURN)).toContain("ON CONFLICT (id) DO UPDATE SET id = excluded.id");
+    // Nothing else is in the `SET` list: a replay keeps every other column's
+    // first write, and for the turn that includes *not* renewing the anchor.
+    expect(one(INSERT_TURN)).not.toContain("heartbeat_at = excluded");
+    expect(one(INSERT_MESSAGE)).not.toContain("updated_at = excluded");
+  });
+
+  it("a colliding seq with a different id is refused — the clause does not cover it", async () => {
+    // The behaviour above, as an outcome rather than as a string. `seq` is
+    // explicit here, so two distinct ids compete for position 0 and the second
+    // one has to lose. A `ON CONFLICT` written without an arbiter (`DO NOTHING`
+    // or `DO UPDATE` with none) would swallow this, which is the whole reason
+    // the statement names `id` and not the constraint that is easiest to hit.
+    const backends = await backendsWithEmptySession();
+
+    for (const backend of [backends.memory, backends.sql] as Backend[]) {
+      await backend.db.appendMessage({
+        id: "m-a",
+        sessionId: "s-seq",
+        role: "user",
+        createdAt: T0,
+        updatedAt: T0,
+        seq: 0,
+      });
+      const collision = await failure(
+        backend.db.appendMessage({
+          id: "m-b",
+          sessionId: "s-seq",
+          role: "user",
+          createdAt: T0,
+          updatedAt: T0,
+          seq: 0,
+        }),
+      );
+
+      expect(collision.code, backend.name).toBe("sql_error");
+      expect(collision.message, backend.name).toMatch(/seq/i);
+      // And the row that lost wrote nothing at all.
+      expect(await backend.db.getMessage("m-b"), backend.name).toBeNull();
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 1a — order: the prompt's seq is allocated before the answer's        */
+/* ------------------------------------------------------------------ */
+
+describe("a turn's rows land in a deterministic order", () => {
+  it("prompt, answer and turn outcome take seq 0, 1, 2 — on both backends", async () => {
+    /**
+     * `Plan.md` §6.2 allocates `seq` per session and `UNIQUE (session_id, seq)`
+     * is what turned a write race into a rejection. So the order is not a
+     * rendering nicety: it is what makes the transcript read the way the turn
+     * happened, and it is decided by **the order of the calls**, because
+     * `MAX(seq) + 1` is evaluated inside the statement.
+     *
+     * Measured end to end, through the seam, in the order the engine writes:
+     * `appendTurn` → `appendMessage` (the prompt) → the answer's own message row
+     * → `finishTurn`'s `idle` outcome. All three are read back by `seq`.
+     */
+    const results = await onBoth(async (backend) => {
+      const store = storeOn(backend);
+      await store.appendTurn(PROMPT.turn);
+      await store.appendMessage(PROMPT.message);
+      // The assistant's message. The engine does not currently write one through
+      // this seam — its parts hang off the prompt's row and it mints an
+      // `assistant` message id in the transcript it returns — so this is written
+      // directly, and that is honest: the property under test is the *allocation
+      // order of `seq`*, which is this layer's rule either way.
+      await backend.db.appendMessage({
+        id: "m9-answer",
+        sessionId: "s-seq",
+        role: "assistant",
+        turnId: "t9",
+        createdAt: T1,
+        updatedAt: T1,
+      });
+      await store.finishTurn({
+        turnId: "t9",
+        sessionId: "s-seq",
+        outcome: "succeeded",
+        error: undefined,
+      });
+
+      const messages = await backend.db.listMessages("s-seq");
+      return messages.map((message) => [message.seq, message.role, message.outcome]);
+    });
+
+    expect(results.memory).toEqual([
+      [0, "user", null],
+      [1, "assistant", null],
+      [2, "idle", "succeeded"],
+    ]);
+    expect(results.sql).toEqual(results.memory);
+  });
+
+  it("turns and messages count `seq` independently — both start at 0", async () =>
+    // `seq` is **per session and per table**, not global: `turns` and `messages`
+    // each count from their own table, so a turn and the prompt that belongs to
+    // it both take position 0. A reader that merged the two tables by `seq` would
+    // interleave them wrongly, and the fix for that is to know they are
+    // independent — which is only measurable if a test looks at both.
+    //
+    // The turn is written **first** (that is the engine's order, and the
+    // foreign keys'), so this is also the ordering assertion in the direction
+    // that a shared counter would break: with one counter, the prompt would take
+    // 1.
+    same(
+      { turns: ["t9"], promptSeq: 0 },
+      async (backend) => {
+        const store = storeOn(backend);
+        await store.appendTurn(PROMPT.turn);
+        await store.appendMessage(PROMPT.message);
+
+        const message = (await messageSeqs(backend, "s-seq")).find(([id]) => id === "m9");
+        return { turns: await turnIds(backend, "s-seq"), promptSeq: message?.[1] };
+      },
+    ));
+
+  it("a replay does not consume a seq — the duplicate resolves before the counter moves", async () =>
+    // The consequence of idempotency for the ordering rule: a retried turn must
+    // not push the next message one position down, or the same conversation
+    // rendered differently depending on how many times it was retried.
+    same(
+      { answerSeq: 1, laterSeq: 2 },
+      async (backend) => {
+        const store = storeOn(backend);
+        await store.appendTurn(PROMPT.turn);
+        await store.appendMessage(PROMPT.message);
+        await store.appendMessage(PROMPT.message);
+        await backend.db.appendMessage({
+          id: "m9-answer",
+          sessionId: "s-seq",
+          role: "assistant",
+          turnId: "t9",
+          createdAt: T1,
+          updatedAt: T1,
+        });
+
+        const rows = await messageSeqs(backend, "s-seq");
+        return {
+          answerSeq: rows.find(([id]) => id === "m9-answer")?.[1],
+          laterSeq: (
+            await backend.db.appendMessage({
+              id: "m9-later",
+              sessionId: "s-seq",
+              role: "user",
+              createdAt: T2,
+              updatedAt: T2,
+            })
+          ).seq,
+        };
+      },
+    ));
+});
+
+/* ------------------------------------------------------------------ */
+/* 1b — a rejected create is a failed turn, not a throw                 */
+/* ------------------------------------------------------------------ */
+
+describe("a rejected create is not an exception the engine has to catch twice", () => {
+  it("a store that cannot create the prompt's message row leaves no half-row behind", async () => {
+    /**
+     * The engine's side of this is in core (`test/agent/loop.test.ts`: a
+     * rejected create is a `failed` turn with `attempts: 0`). What is asserted
+     * here is the *storage* half of the same event: when the message write is
+     * refused, the row that did land — the turn — stays a plain unfinished
+     * anchor, and the session's log is unchanged apart from it.
+     *
+     * The turn row surviving is the point, not an oversight: the engine
+     * deliberately does **not** call `finishTurn` on this path, and the row is
+     * what `recoverStaleTurns` finds on the next start-up (§6.1). A store that
+     * rolled the turn back would leave the recovery with nothing to report.
+     */
+    const backends = await backendsWithEmptySession();
+
+    for (const backend of [backends.memory, backends.sql] as Backend[]) {
+      const store = storeOn(backend);
+      // The turn lands; the message does not. That is the shape of the engine's
+      // failure — `#persistPrompt` awaits the turn, then the message, then the
+      // part, and any one of the three can be refused.
+      await store.appendTurn(PROMPT.turn);
+      const before = await idleOutcomes(backend, "s-seq");
+      const outcome = await failure(
+        store.appendMessage({ ...PROMPT.message, id: "m-refused", turnId: "no-such-turn" }),
+      );
+
+      expect(outcome.code, backend.name).toBe("sql_error");
+      // No outcome message: `finishTurn` is not called, so `§6.2`'s "the outcome
+      // is an idle message" has nothing to report, and a transcript claiming the
+      // turn ended would be a claim nobody made.
+      expect(await idleOutcomes(backend, "s-seq"), backend.name).toEqual(before);
+      // The refused row is not there…
+      expect(await backend.db.getMessage("m-refused"), backend.name).toBeNull();
+      // …and the turn row **is**, which is what the next test measures.
+      expect(await turnIds(backend, "s-seq"), backend.name).toEqual(["t9"]);
+    }
+  });
+
+  it("the turn row the refused create left behind is exactly what recovery finds", async () => {
+    // The other half of the same property, through the engine's own recovery
+    // helper so the 30 s rule that ships is the one under test (as
+    // `test/agent/turn-store-seam.test.ts` does on the engine side).
+    //
+    // The turn is written stale on purpose: `#persistPrompt` is the *first* write
+    // of a turn, so a turn whose message row was refused is a turn that was
+    // created and never finished — and on the next start-up that is exactly what
+    // `recoverStaleTurns` has to find. A store that rolled the turn back on the
+    // message's refusal would leave the recovery with nothing to report and the
+    // user with a prompt that is in the log and a turn that says nothing.
+    const backends = await backendsWithEmptySession();
+    const stale = new Date(Date.parse("2026-09-29T12:00:00.000Z") - 120_000).toISOString();
+
+    for (const backend of [backends.memory, backends.sql] as Backend[]) {
+      const store = storeOn(backend);
+      await store.appendTurn({ id: "t-orphan", sessionId: "s-seq", startedAt: stale });
+      // The prompt's own message and part land; the turn then never finishes,
+      // because the engine's failure path deliberately does not call
+      // `finishTurn`. So the tab simply goes away mid-turn — the state
+      // `recoverStaleTurns` exists for, reached the honest way rather than by
+      // faking a refusal.
+      await store.appendMessage({ ...PROMPT.message, id: "m-orphan", turnId: "t-orphan" });
+      await store.flushDelta({
+        deltaId: "d-orphan",
+        partId: "p-orphan",
+        messageId: "m-orphan",
+        sessionId: "s-seq",
+        partType: "text",
+        contentText: "half a sen",
+      });
+    }
+
+    const nowMs = Date.parse("2026-09-29T12:00:00.000Z");
+    const memory = await recoverStaleTurns({
+      store: storeOn(backends.memory),
+      sessionId: "s-seq",
+      nowMs,
+    });
+    const sql = await recoverStaleTurns({ store: storeOn(backends.sql), sessionId: "s-seq", nowMs });
+
+    expect(memory.map((turn) => turn.turnId)).toEqual(["t-orphan"]);
+    expect(sql.map((turn) => turn.turnId)).toEqual(memory.map((turn) => turn.turnId));
+    // Closed as `interrupted` — `§6.1`'s anchor, on both backends.
+    expect(await idleOutcomes(backends.memory, "s-seq")).toEqual(["interrupted"]);
+    expect(await idleOutcomes(backends.sql, "s-seq")).toEqual(["interrupted"]);
+    // The prompt is **kept**, not discarded (§6.2: "Teilttext behalten"), and its
+    // part is closed `aborted` rather than left looking like a live stream. A
+    // recovery that dropped the message would leave the user with a turn that
+    // ended and no record of the question that caused it.
+    const kept = await backends.sql.db.listMessages("s-seq");
+    expect(kept.filter((message) => message.role === "user").map((message) => message.id)).toEqual([
+      "m-orphan",
+    ]);
+    expect((await backends.sql.db.listParts("m-orphan")).map((part) => part.status)).toEqual([
+      "aborted",
+    ]);
+    expect((await backends.sql.db.listParts("m-orphan")).map((part) => part.contentText)).toEqual([
+      "half a sen",
+    ]);
+    // And a second recovery adds nothing: the `listTurnOutcomes` guard, measured
+    // through the same helper.
+    expect(
+      await recoverStaleTurns({ store: storeOn(backends.sql), sessionId: "s-seq", nowMs }),
+    ).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 2 — flushDelta is idempotent over deltaId                            */
 /* ------------------------------------------------------------------ */
 
 describe("flushDelta is idempotent over deltaId", () => {
@@ -910,6 +1468,344 @@ describe("heartbeat renews the reload anchor (Plan.md §6.1)", () => {
         outcomes: await idleOutcomes(backend, "s2"),
       };
     }));
+});
+
+/* ------------------------------------------------------------------ */
+/* 3a — upsertPart: the tool part, on the row and not only in memory  */
+/* ------------------------------------------------------------------ */
+
+/** The `data` blob of a stored part, parsed, or `undefined` if it is not JSON. */
+async function dataOf(part: Part): Promise<Record<string, unknown> | undefined> {
+  if (typeof part.data !== "string") return undefined;
+  try {
+    const parsed: unknown = JSON.parse(part.data);
+    return typeof parsed === "object" && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The four tool events, as the engine emits them. */
+const TOOL_EVENTS = {
+  call: {
+    type: "tool-call",
+    toolCallId: "c1",
+    toolName: "read",
+    input: { path: "src/app.ts" },
+  },
+  failure: {
+    type: "tool-result",
+    toolCallId: "c1",
+    toolName: "read",
+    output: { ok: false, error: "ENOENT: no such file or directory" },
+  },
+  unknown: {
+    type: "tool-result",
+    toolCallId: "c1",
+    toolName: "write",
+    output: {
+      ok: false,
+      outcome: "unknown",
+      toolCallId: "c1",
+      toolName: "write",
+      error: "This call began but never reported a result.",
+    },
+  },
+  denied: {
+    type: "tool-output-denied",
+    toolCallId: "c1",
+    toolName: "write",
+    reason: undefined,
+  },
+} as const satisfies Record<string, ToolPartEvent>;
+
+describe("upsertPart writes the row the app's reader reads", () => {
+  it("a failed tool lands in the DATABASE as output-error — not only in memory", async () => {
+    /**
+     * The rule, measured where it is persisted.
+     *
+     * The engine's own tests (`@all-the.rest/baah-core`,
+     * `test/agent/tool-part.test.ts`) assert what `toolPartContent` *returns*,
+     * because that is the engine's half. This asserts what the **row** says,
+     * after JSON round-trips through a real SQLite column on one side and the
+     * in-memory maps on the other — so a mapping that were right in memory and
+     * lost in the serialisation, or a row the app cannot read back, is caught
+     * here and nowhere else.
+     *
+     * `Plan.md` §3.1 makes `UIMessage[]` the storage truth, and this row is what
+     * a reloaded card is drawn from. Right-while-live and wrong-after-reload is
+     * the direction that hurts, so the assertion is on the row.
+     */
+    const results = await onBoth(async (backend) => {
+      const store = storeOn(backend);
+      await store.upsertPart({ sessionId: "s1", messageId: "m1", event: TOOL_EVENTS.call });
+      await store.upsertPart({ sessionId: "s1", messageId: "m1", event: TOOL_EVENTS.failure });
+
+      const parts = await backend.db.listParts("m1");
+      const part = parts.find((row) => row.id === "part-c1");
+      return {
+        rows: parts.length,
+        type: part?.type,
+        status: part?.status,
+        state: (await dataOf(part as Part))?.["state"],
+        errorText: (await dataOf(part as Part))?.["errorText"],
+        discriminator: (await dataOf(part as Part))?.["type"],
+      };
+    });
+
+    expect(results.memory).toEqual({
+      // One row, not two: the upsert is keyed on the derived part id.
+      rows: 1,
+      type: "tool",
+      // A tool part is never `streaming`. A card that stayed in flight across a
+      // reload would be a lie about a call that finished.
+      status: "completed",
+      // **The whole point of the seam.** Not `output-available`.
+      state: "output-error",
+      errorText: "ENOENT: no such file or directory",
+      // §6.1's discriminator carries the name; there is no `toolName` column.
+      discriminator: "tool-read",
+    });
+    expect(results.sql).toEqual(results.memory);
+  });
+
+  it("the outcome-unknown envelope is NOT stored as a failure", async () => {
+    /**
+     * The second half, and the one with no runtime substitute: the envelope is
+     * excluded by its own discriminator before `ok` is read. Filed as a failure
+     * it would put "Fehlgeschlagen" on the one card whose state is a warning —
+     * and unlike the plain failure case, that one is *wrong about the tool*,
+     * because the tool never reported at all.
+     */
+    const results = await onBoth(async (backend) => {
+      const store = storeOn(backend);
+      await store.upsertPart({ sessionId: "s1", messageId: "m1", event: TOOL_EVENTS.unknown });
+      const part = (await backend.db.listParts("m1")).find((row) => row.id === "part-c1");
+      const data = await dataOf(part as Part);
+      return { state: data?.["state"], errorText: data?.["errorText"] ?? null };
+    });
+
+    expect(results.memory).toEqual({ state: "output-available", errorText: null });
+    expect(results.sql).toEqual(results.memory);
+  });
+
+  it("a denial is stored as a refusal, not a malfunction (§7.6)", async () =>
+    same({ state: "output-denied", errorText: null }, async (backend) => {
+      await storeOn(backend).upsertPart({
+        sessionId: "s1",
+        messageId: "m1",
+        event: TOOL_EVENTS.denied,
+      });
+      const part = (await backend.db.listParts("m1")).find((row) => row.id === "part-c1");
+      const data = await dataOf(part as Part);
+      return { state: data?.["state"], errorText: data?.["errorText"] ?? null };
+    }));
+
+  it("the three events for one call land on ONE row, and the last one wins", async () =>
+    // The ordering the engine's `await` on this method buys, seen from the
+    // database: call, then a result that failed, then a denial for the same
+    // `toolCallId`. Fired rather than awaited, the result could be overtaken and
+    // the row left at `input-available` — persisted, and corrected by no reload.
+    //
+    // The denial is last and it wins, which is the point of the test's shape: it
+    // is the *last* write, so a row reading anything else means the writes are
+    // not landing in order.
+    same({ rows: 1, state: "output-denied" }, async (backend) => {
+      const store = storeOn(backend);
+      for (const event of [TOOL_EVENTS.call, TOOL_EVENTS.failure, TOOL_EVENTS.denied]) {
+        await store.upsertPart({ sessionId: "s1", messageId: "m1", event });
+      }
+
+      const parts = await backend.db.listParts("m1");
+      const part = parts.find((row) => row.id === "part-c1");
+      return { rows: parts.length, state: (await dataOf(part as Part))?.["state"] };
+    }));
+
+  it("the last write for an id wins, and that is the whole contract", async () =>
+    // Stated rather than left implicit, because it is the decision a reader of
+    // `UPSERT_PART` has to be able to predict: `ON CONFLICT (id) DO UPDATE SET
+    // data = excluded.data` overwrites. So a *second* `tool-call` for a
+    // `toolCallId` that already has a result does move the row back to
+    // `input-available`.
+    //
+    // The engine does not emit that order — it emits the events as they arrive,
+    // and a provider that reuses an id mid-turn has already lost the
+    // correspondence between call and result (`Plan.md` §5.1 names `occurrence`
+    // for exactly that, on the *invocation* record). The part row has no such key
+    // and inventing one here would be a second definition of the same rule on a
+    // different table. So the honest thing is to pin the behaviour the statement
+    // has, and leave the correction to the engine that knows the ordering.
+    same({ rows: 1, state: "input-available", errorText: null }, async (backend) => {
+      const store = storeOn(backend);
+      await store.upsertPart({ sessionId: "s1", messageId: "m1", event: TOOL_EVENTS.failure });
+      await store.upsertPart({ sessionId: "s1", messageId: "m1", event: TOOL_EVENTS.call });
+
+      const part = (await backend.db.listParts("m1")).find((row) => row.id === "part-c1");
+      const data = await dataOf(part as Part);
+      return {
+        rows: (await backend.db.listParts("m1")).length,
+        state: data?.["state"],
+        errorText: data?.["errorText"] ?? null,
+      };
+    }));
+
+  it("the upsert keeps the part's position, so a card updates instead of jumping", async () =>
+    // `Plan.md` §16.1: the upsert keeps `seq` and `created_at`. Without that a
+    // card that changes state once would move down the transcript, and the
+    // reader would have to re-sort by something that is not the log order.
+    same({ seqs: [0, 1], sameSeq: 0, createdAt: T1 }, async (backend) => {
+      const store = storeOn(backend);
+      await store.upsertPart({ sessionId: "s1", messageId: "m1", event: TOOL_EVENTS.call });
+      // A text part written after the tool part, so the tool's `seq` is 0 and
+      // this second write has something to *not* move.
+      await store.flushDelta({
+        deltaId: "d1",
+        partId: "p1",
+        messageId: "m1",
+        sessionId: "s1",
+        partType: "text",
+        contentText: "after",
+      });
+      const before = (await backend.db.listParts("m1")).find((row) => row.id === "part-c1");
+      await store.upsertPart({ sessionId: "s1", messageId: "m1", event: TOOL_EVENTS.failure });
+      const after = (await backend.db.listParts("m1")).find((row) => row.id === "part-c1");
+
+      return {
+        seqs: (await backend.db.listParts("m1")).map((row) => row.seq),
+        sameSeq: after?.seq === before?.seq ? 0 : -1,
+        createdAt: after?.createdAt === T1 ? T1 : String(after?.createdAt),
+      };
+    }));
+
+  it("`content_text` is the rendered input, so a search finds the call", async () =>
+    // §6.1's denormalised projection, and the reason the tool part carries one at
+    // all: it is what FTS5 indexes. A tool part with an empty `content_text`
+    // would be invisible to search while its text sat right there in `data`.
+    //
+    // The query is a **bare token** on purpose. FTS5 treats `.` as query syntax
+    // and a dotted term is a syntax error rather than a zero-hit result
+    // (measured: `SQLITE_ERROR … fts5: syntax error near "."`), which is a
+    // property of the engine this layer does not paper over — `§16.1` already
+    // records that a malformed `MATCH` behaves differently from the memory
+    // engine's matcher. So the test searches a token the stored text really
+    // contains, which is what a caller would do.
+    same(
+      { contains: true, searchFinds: 1 },
+      async (backend) => {
+        const store = storeOn(backend);
+        await store.upsertPart({ sessionId: "s1", messageId: "m1", event: TOOL_EVENTS.call });
+        const part = (await backend.db.listParts("m1")).find((row) => row.id === "part-c1");
+        const hits = await backend.db.search({ query: "app" });
+        return {
+          contains: (part?.contentText ?? "").includes("src/app.ts"),
+          searchFinds: hits.filter((hit) => hit.partId === "part-c1").length,
+        };
+      },
+    ));
+
+  it("a message of ANOTHER session is not refused — measured, and named", async () => {
+    /**
+     * **A finding, pinned rather than asserted away.**
+     *
+     * `parts` carries two *independent* foreign keys (`schema.ts`):
+     * `message_id REFERENCES messages(id)` and
+     * `session_id REFERENCES sessions(id)`. Nothing ties them to each other, so a
+     * write naming a message of `s1` and a session of `s2` satisfies both and
+     * lands. Measured on both backends below, and the memory engine behaves the
+     * same way — so this is the schema's shape, not a divergence.
+     *
+     * The engine cannot reach it: `upsertPart`'s `sessionId` and `messageId` come
+     * from the same closure (`AgentTurnOptions.sessionId` and the attempt's
+     * minted `messageId`) that wrote both rows, so there is no call site that
+     * could pair them wrongly. It is recorded because the *obvious* test here —
+     * "a cross-session part is refused" — is **false**, and the next reader would
+     * otherwise write it, find it green on a fake, and ship a claim the database
+     * does not enforce.
+     *
+     * Closing it properly means a constraint the schema does not have — a
+     * composite `messages (id, session_id)` reference, which is a migration and
+     * therefore a rebuild (`§16.1`'s "Parkplatz-Tabelle" trap). Not done here,
+     * named instead.
+     */
+    const results = await onBoth(async (backend) => {
+      const outcome = await settled(
+        storeOn(backend).upsertPart({
+          sessionId: "s2",
+          messageId: "m1",
+          event: TOOL_EVENTS.call,
+        }),
+      );
+      const parts = await backend.db.listParts("m1");
+      return {
+        // It **resolved** — no `sql_error` to catch.
+        resolved: outcome.ok,
+        // …and the row is filed under the message it named, carrying the *other*
+        // session's id. This is the bleed, stated exactly.
+        rows: parts.filter((row) => row.id === "part-c1").length,
+        sessionIds: parts.filter((row) => row.id === "part-c1").map((row) => row.sessionId),
+      };
+    });
+
+    for (const backend of ["memory", "sql"] as const) {
+      expect(results[backend].resolved, backend).toBe(true);
+      expect(results[backend].rows, backend).toBe(1);
+      expect(results[backend].sessionIds, backend).toEqual(["s2"]);
+    }
+  });
+
+  it("a message that exists in NO session is refused, on both backends", async () => {
+    // The constraint that *is* enforced, and the reason the test above is a
+    // finding rather than the rule: `message_id` is a real foreign key, so a
+    // message that is not there at all refuses. Only the *pairing* of a real
+    // message with a different real session is unconstrained.
+    const backends = await bothBackends();
+
+    for (const backend of [backends.memory, backends.sql] as Backend[]) {
+      const refused = await failure(
+        storeOn(backend).upsertPart({
+          sessionId: "s1",
+          messageId: "m-nowhere",
+          event: TOOL_EVENTS.call,
+        }),
+      );
+
+      expect(refused.code, backend.name).toBe("sql_error");
+      expect(await backend.db.listParts("m-nowhere"), backend.name).toEqual([]);
+    }
+  });
+
+  it("writes one statement per call — no read, no transaction", async () => {
+    // The one-statement discipline the two closes hold, and the reason a tool
+    // part may be written per event: there is nothing to read, so nothing can be
+    // overtaken between a read and the write that follows it. The upsert is one
+    // statement and nothing else, on the SQL side and in the memory engine's own
+    // log.
+    const { memory, sql } = await bothBackends();
+    const before = sql.statements().length;
+    const memoryBefore = memory.statements().length;
+
+    await storeOn(sql).upsertPart({
+      sessionId: "s1",
+      messageId: "m1",
+      event: TOOL_EVENTS.failure,
+    });
+    await storeOn(memory).upsertPart({
+      sessionId: "s1",
+      messageId: "m1",
+      event: TOOL_EVENTS.failure,
+    });
+
+    const ran = canonical(sql.statements().slice(before));
+    const ranMemory = canonical(memory.statements().slice(memoryBefore));
+    expect(ran).toHaveLength(1);
+    expect(one(ran[0] ?? "")).toContain("INSERT INTO parts");
+    expect(one(ran[0] ?? "")).toContain("ON CONFLICT (id) DO UPDATE");
+    expect(ran.filter((statement) => statement.startsWith("BEGIN"))).toHaveLength(0);
+    // The memory engine ran the same single statement, recognised by identity.
+    expect(ranMemory).toHaveLength(1);
+  });
 });
 
 /* ------------------------------------------------------------------ */

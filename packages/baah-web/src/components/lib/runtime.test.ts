@@ -22,8 +22,8 @@ import { describe, expect, it } from "vitest";
 import {
   createRuntime,
   type RuntimeDependencies,
-  type TranscriptReadPort,
-  type TranscriptReadResult,
+  type Transcript,
+  type TranscriptReader,
 } from "../../runtime/index.ts";
 import { RecordingTurnStore, fakeRegistry } from "../../runtime/testing.ts";
 import { createSettingsStore } from "../../lib/settings-store.ts";
@@ -39,11 +39,11 @@ function settingsWithKey(): ReturnType<typeof createSettingsStore> {
   return store;
 }
 
-function emptyTranscript(): TranscriptReadResult {
+function emptyTranscript(): Transcript {
   return { sessionId: SESSION, turnId: null, messages: [], truncated: false, limit: 100 };
 }
 
-function runtimeWith(overrides: Partial<RuntimeDependencies> & { readonly transcript?: TranscriptReadPort } = {}) {
+function runtimeWith(overrides: Partial<RuntimeDependencies> & { readonly transcript?: TranscriptReader } = {}) {
   const { registry } = fakeRegistry();
   return createRuntime({
     store: new RecordingTurnStore().store,
@@ -234,7 +234,7 @@ describe("a live part comes back with its text and its status", () => {
     // `Plan.md` §16.1, and the reason the UI renders such a part rather than hiding
     // it: the tail is real, it is at most `DELTA_FLUSH_INTERVAL_MS` behind, and a
     // view that waits for the part to close makes a streaming model look broken.
-    const transcript: TranscriptReadResult = {
+    const transcript: Transcript = {
       sessionId: SESSION,
       turnId: "turn-1",
       truncated: false,

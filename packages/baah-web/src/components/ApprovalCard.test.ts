@@ -70,7 +70,7 @@ const pending: UIMessage[] = [
 
 /** A turn folded up to the pause — no `tool-call` event ever arrived. */
 const paused: LiveTurn = foldAgentEvents([
-  { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", reason: "Secrets?" },
+  { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", input: { path: ".env" }, reason: "Secrets?" },
 ]);
 
 describe("approvalViewFromState", () => {
@@ -126,7 +126,7 @@ describe("approvalViewFromState", () => {
     expect(read?.risk).toBe("read-secret");
 
     const writing = foldAgentEvents([
-      { type: "approval-requested", approvalId: "ap2", toolCallId: "c2", toolName: "write", reason: undefined },
+      { type: "approval-requested", approvalId: "ap2", toolCallId: "c2", toolName: "write", input: { path: "a.txt" }, reason: undefined },
     ]);
     const write = approvalViewFromState(writing, snapshot([]));
     expect(write?.risk).toBe("file-write");
@@ -137,8 +137,8 @@ describe("approvalViewFromState", () => {
     // Two cards at once would need two answers to be correct at the same moment, and
     // §7.5's `reject` sweeps the rest anyway — so the card answers the oldest.
     const two = foldAgentEvents([
-      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", reason: undefined },
-      { type: "approval-requested", approvalId: "ap2", toolCallId: "c2", toolName: "read", reason: undefined },
+      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", input: { path: ".env" }, reason: undefined },
+      { type: "approval-requested", approvalId: "ap2", toolCallId: "c2", toolName: "read", input: { path: ".env.local" }, reason: undefined },
     ]);
     expect(approvalViewFromState(two, snapshot(pending))?.approvalId).toBe("ap1");
   });

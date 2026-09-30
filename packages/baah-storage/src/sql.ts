@@ -89,6 +89,31 @@ export const DELETE_SESSION = `DELETE FROM sessions WHERE id = ?`;
  * `seq` is `MAX(seq) + 1` over the session, evaluated inside the same
  * statement, so two messages created in the same millisecond still get distinct
  * sequence numbers. An explicit `seq` overrides it.
+ *
+ * ## `ON CONFLICT (id) DO UPDATE`, and why a *message* insert carries it
+ *
+ * **A duplicate id resolves to the existing row and writes nothing.** It is the
+ * engine's contract, not a convenience: `TurnStore.appendMessage` is declared
+ * "idempotent by `id` … a resumed approval re-enters the same turn, so 'already
+ * there' is a normal state and not an error", and a plain `INSERT` would turn
+ * that normal state into a rejection — which on the engine's side surfaces as a
+ * `failed` turn with `attempts: 0` for a turn that is in fact entirely present.
+ * `Plan.md` §16.1 assigns idempotency to this layer ("`seq`-Vergabe, Upsert-
+ * Semantik, Idempotenz und Kaskaden **einmal** implementiert"), so it belongs on
+ * the statement; an adapter that caught the `UNIQUE` error and matched on its
+ * text would be a second, string-shaped copy of the same rule.
+ *
+ * `SET id = excluded.id` is the deliberate no-op: the arbiter index is the primary
+ * key, and writing the column back with the value it already holds returns the row
+ * the caller was asking about. Every other column keeps the **first** write — the
+ * conservative direction, and the same principle §16.1 states for migration 4
+ * ("verlustbehaft in die sichere Richtung").
+ *
+ * **`ON CONFLICT (id)` names one arbiter, so the other constraints stay loud.**
+ * A second message id whose computed `seq` collides still raises
+ * `UNIQUE (session_id, seq)` — the defect that turned a race between the engine's
+ * prompt write and the app's into the `FOREIGN KEY constraint failed` a user hit
+ * is not made quieter by this clause.
  */
 export const INSERT_MESSAGE = `
   INSERT INTO messages
@@ -99,6 +124,7 @@ export const INSERT_MESSAGE = `
     COALESCE(?, (SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?)),
     ?, ?, ?, ?, ?, ?, ?, ?
   )
+  ON CONFLICT (id) DO UPDATE SET id = excluded.id
   RETURNING ${MESSAGE_COLUMNS}`;
 
 export const SELECT_MESSAGE = `
@@ -120,6 +146,32 @@ export const INSERT_PART = `
 /**
  * Upsert by `id`. A retry of a streaming part therefore keeps the original
  * `seq` and cannot collide with the `UNIQUE (message_id, seq)` constraint.
+ *
+ * ## Three writes land on one row, in order, and the last one wins
+ *
+ * `data` is overwritten, so the **order** of the writes is the state. A tool
+ * part is reported up to three times for one `toolCallId` — call, then result, then
+ * possibly a denial — and the engine awaits each in turn
+ * (`TurnStore.upsertPart`, `@all-the.rest/baah-core`), because fired rather than
+ * awaited a result can be overtaken by the call it follows and the row is left
+ * saying `input-available`. That is a state the database would keep and no reload
+ * would correct. `seq` and `created_at` are **not** in the `SET` list, so a card
+ * that changes state updates where it is instead of jumping down the transcript.
+ *
+ * ## A cross-session part is *not* refused — measured
+ *
+ * `parts` has two independent foreign keys (`message_id`, `session_id`) and
+ * nothing ties them to each other, so a write naming a message of one session and
+ * a session of another satisfies both. The engine cannot produce that pair — both
+ * ids come from the same closure — and the in-memory engine matches this
+ * behaviour, so it is the schema's shape rather than a divergence between the two
+ * backends. Closing it would need a composite `messages (id, session_id)`
+ * reference, which is a migration and therefore a rebuild: the trap is written out
+ * at `Plan.md` §16.1 ("Parkplatz-Tabelle") and the next migration author reads it
+ * rather than copying this DDL. The measurement, and the reasoning, are in
+ * `test/turn-store.test.ts` section 3a — recorded so the next reader does not
+ * write the plausible test, find it green against a fake, and ship a claim this
+ * database does not enforce.
  */
 export const UPSERT_PART = `
   INSERT INTO parts
@@ -347,6 +399,13 @@ export const SELECT_DELTA_SEQ = `
  * `seq` is `MAX(seq) + 1` over the session, same rule as messages: two turns
  * created in the same millisecond must still have a defined order, and
  * `started_at` is display only (§6.2).
+ *
+ * `ON CONFLICT (id) DO UPDATE SET id = excluded.id`, for the reason
+ * {@link INSERT_MESSAGE} gives at length: `TurnStore.appendTurn` is declared
+ * idempotent by `id`, so a re-send must resolve to the row that is already there
+ * rather than raise. **`heartbeat_at` is not in the `SET` list** — a replay
+ * renews nothing, so "a second turn write is not a heartbeat" survives here too
+ * (the same asymmetry §16.1 records for `beginToolCall`'s `DO NOTHING`).
  */
 export const INSERT_TURN = `
   INSERT INTO turns
@@ -356,6 +415,7 @@ export const INSERT_TURN = `
     COALESCE(?, (SELECT COALESCE(MAX(seq), -1) + 1 FROM turns WHERE session_id = ?)),
     ?, ?, ?, ?, ?, ?
   )
+  ON CONFLICT (id) DO UPDATE SET id = excluded.id
   RETURNING ${TURN_COLUMNS}`;
 
 /**

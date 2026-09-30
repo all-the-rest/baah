@@ -95,24 +95,75 @@
  * 1. `recoverOnBoot` — reload recovery at start-up (`recovery.ts`). Still here.
  * 2. `store.flushDelta` — was here, and is **not** any more. See above.
  *
+ * ## A parked turn is not a finished turn
+ *
+ * The engine resolves `run()` with `outcome: "awaiting-approval"` **because** it
+ * intends to be continued: the SDK is holding the loop open until
+ * `respondToApproval` marks the pending part `approval-responded`, and
+ * `AgentTurn.respondToApproval` is the only path that does. So `runTurn`'s `finally`
+ * used to destroy the answer — it cleared `turn`, `watchdog` and `turnId`
+ * unconditionally, `answerApproval` opened with `if (turn === undefined) throw`, and
+ * every click on every approval card failed while the turn stood there forever.
+ *
+ * The rule now, in one line: **release the turn unless the result parks it.**
+ * `isParked(result)` is the whole predicate, and it is asked of every result rather
+ * than of the first one, because `#continue` can park a second time on another call.
+ *
+ * Three things are held while parked, each for its own reason, and the full argument
+ * is on the `finally` itself: the `AgentTurn` (the only route to the resume), its
+ * `turnId` (`settle` needs it, and the resume is a second `settle`) and its
+ * `StallWatchdog` (whose `approval-requested` / `approval-answered` pair already
+ * models "the human is the bottleneck" as `awaiting-human`).
+ *
+ * `status` is the fourth thing and the subtle one. It reads `idle` while parked —
+ * nothing is running, and `turn-view.ts` turns `outcome: "awaiting-approval"` into
+ * "Wartet auf eine Freigabe." — and `running` for the duration of the continuation,
+ * because a card answered into a status bar that still says `idle` claims the turn
+ * ended at the moment the model is being asked again. The `inFlight` guard is held
+ * across the pause for `Plan.md` §15.5: a second `send` must not replace the turn
+ * that owns the open card.
+ *
  * ## The read port, and the shape of its failure
  *
  * `Plan.md` §16.1's second port: `baah-storage` exports a `TranscriptReader`
  * with one method, and the app takes it *beside* the `TurnStore` rather than
  * merged into it. It is **optional** here, and that is a deliberate reading of
- * the dependency rather than laziness:
+ * the dependency rather than laziness: every existing caller — including
+ * `runtime.test.ts` — would have to grow a port it does not have, and a
+ * required field would be a compile error in a test suite that is already
+ * correct. Omit it and {@link BaahRuntime.readTranscript} answers
+ * `kind: "unavailable"`, a third state that is never an empty session.
  *
- * - `@all-the.rest/baah-storage` is not in this package's `package.json`, so
- *   importing the interface would not compile. It is declared **structurally**
- *   below — identical shape, no import — which is what makes the real
- *   `createTranscriptReader` assignable to it as soon as the workspace
- *   dependency exists. When it does, the local declaration goes and the import
- *   replaces it; nothing else changes. (`pnpm install` was out of scope for this
- *   block, so this is a gap to report, not a design.)
- * - it is optional rather than required because every existing caller — including
- *   `runtime.test.ts`, which this block does not own — would have to grow a
- *   dependency it does not have. A required field would be a compile error in a
- *   test suite that is already correct.
+ * ### The port's types are the **real** ones, imported
+ *
+ * They were declared here structurally, and the header used to name that as a
+ * duplication with a cost: `@all-the.rest/baah-storage` *is* a dependency of this
+ * package, so the local declarations were a second, unchecked copy of another
+ * package's types, and the check that used to be free — a missing dependency making
+ * the import fail to compile — was gone. `components/lib/runtime.ts` papered over
+ * that with a function whose parameter was the real type and whose return was the
+ * local one, which is a typecheck and not an import.
+ *
+ * Both are gone. `TranscriptReader`, `Transcript`, `TranscriptMessage`,
+ * `TranscriptPart` and `TranscriptRequest` are imported from
+ * `@all-the.rest/baah-storage` and re-exported under their own names, so a caller
+ * that wants the port holds the port's own type and there is nothing left to drift.
+ * The import is **type-only** and is erased at build time, which is why the
+ * dynamic-import discipline in the module header is untouched: no SQLite-WASM glue
+ * reaches this file's bundle.
+ *
+ * What the narrowing cost, and why it is a gain: `role` and `type` are unions
+ * (`MessageRole`, `PartType`) where the local copies said `string`, and
+ * `baah-storage` enforces both at its own boundary (`messageRowSchema`,
+ * `partRowSchema`, `protocol.ts`). `components/lib/transcript.ts` is a *reader* of a
+ * validated port, so it reads a union and passes it into `RenderPart.role: string` —
+ * no change of behaviour, and the validation happens once, at the producer, instead
+ * of twice.
+ *
+ * ### The one type that stays here: `TranscriptRead`
+ *
+ * It is the app's own, because it is the only thing the storage port deliberately
+ * does **not** have: a union that keeps "could not read" apart from "nothing there".
  *
  * {@link TranscriptRead} is a **union, not a promise that rejects**, and the two
  * reasons are the two things `Plan.md` §16.1 says will bite the UI:
@@ -145,6 +196,13 @@ import {
   type TurnStore,
   type Workspace,
 } from "@all-the.rest/baah-core";
+import type {
+  Transcript,
+  TranscriptMessage,
+  TranscriptPart,
+  TranscriptReader,
+  TranscriptRequest,
+} from "@all-the.rest/baah-storage";
 import type { LanguageModel, UIMessage } from "ai";
 
 import { createObservable, type Observable } from "../lib/observable.ts";
@@ -179,84 +237,23 @@ import { StallWatchdog, type StallReport } from "./watchdog.ts";
 /* ------------------------------------------------------------------ */
 
 /**
- * `TranscriptReader` from `@all-the.rest/baah-storage`, declared structurally.
- *
- * Byte-for-byte the same one-method shape, so the real `createTranscriptReader`
- * is assignable to this without a cast. See the module header for why the
- * import is not there.
- */
-export interface TranscriptReadPort {
-  /**
-   * Read a session's transcript back, or one turn's slice of it.
-   *
-   * **Rejects** for every way the read could fail to be an answer — a closed
-   * database (`database_closed`), an unknown session, an unknown turn. It never
-   * resolves with an empty transcript for those cases.
-   */
-  read(request: TranscriptReadRequest): Promise<TranscriptReadResult>;
-}
-
-/** What to read. `sessionId` is the required half; `turnId` narrows inside it. */
-export interface TranscriptReadRequest {
-  readonly sessionId: string;
-  readonly turnId?: string | undefined;
-  readonly limit?: number | undefined;
-}
-
-/** `baah-storage`'s `Transcript`. Re-declared with the module header's reason. */
-export interface TranscriptReadResult {
-  readonly sessionId: string;
-  readonly turnId: string | null;
-  /** Oldest first, by `seq` (`Plan.md` §6.2). */
-  readonly messages: readonly TranscriptReadMessage[];
-  /** The store holds at least one message more than was returned. */
-  readonly truncated: boolean;
-  readonly limit: number;
-}
-
-/** One message, as the transcript view needs it. */
-export interface TranscriptReadMessage {
-  readonly id: string;
-  readonly turnId: string | null;
-  readonly seq: number;
-  readonly role: string;
-  readonly status: string | null;
-  /** `succeeded | failed | interrupted`, on the `idle` outcome message. */
-  readonly outcome: string | null;
-  readonly error: string | null;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-  readonly parts: readonly TranscriptReadPart[];
-}
-
-/** One part. `status` is the load-bearing field; see the module header. */
-export interface TranscriptReadPart {
-  readonly id: string;
-  readonly seq: number;
-  readonly type: string;
-  /** The text as of the most recent flush — the tail while `streaming`. */
-  readonly contentText: string;
-  readonly status: string | null;
-  /** The type-specific JSON, as raw text. Never parsed here. */
-  readonly data: string | null;
-  readonly updatedAt: string;
-}
-
-/**
  * What a read produced.
  *
  * Three cases, and the third is the one the type exists for: `ok` with **zero**
  * messages is the only thing that means "here there was nothing". `failed` is a
  * read that did not happen, and a UI that renders it as an empty transcript is
  * stating a falsehood it has no evidence for.
+ *
+ * The `transcript` it carries is `baah-storage`'s own `Transcript` — imported, not
+ * re-declared. See the module header for what that replaced and why the
+ * validation now happens once, at the producer.
  */
 export type TranscriptRead =
-  | { readonly kind: "ok"; readonly transcript: TranscriptReadResult }
+  | { readonly kind: "ok"; readonly transcript: Transcript }
   /** No read port is wired. A wiring gap, not an empty session. */
   | { readonly kind: "unavailable"; readonly reason: string }
   /** The read refused — `database_closed` and its siblings. Never an answer. */
   | { readonly kind: "failed"; readonly reason: string };
-
 
 /* ------------------------------------------------------------------ */
 /* Dependencies                                                        */
@@ -266,10 +263,11 @@ export interface RuntimeDependencies extends RuntimeApprovalOptions {
   /** The persistence seam. See `TurnStore` in core. */
   readonly store: TurnStore;
   /**
-   * The read port (`Plan.md` §16.1). Omit it and {@link BaahRuntime.readTranscript}
-   * answers `kind: "unavailable"` — never an empty transcript.
+   * The read port (`Plan.md` §16.1). `baah-storage`'s own `TranscriptReader`.
+   * Omit it and {@link BaahRuntime.readTranscript} answers `kind: "unavailable"` —
+   * never an empty transcript.
    */
-  readonly transcript?: TranscriptReadPort | undefined;
+  readonly transcript?: TranscriptReader | undefined;
   readonly workspace: Workspace;
   readonly settings: SettingsStore;
   readonly registry: ProviderRegistry;
@@ -313,7 +311,18 @@ export interface RuntimeDependencies extends RuntimeApprovalOptions {
 /* ------------------------------------------------------------------ */
 
 export interface SendOptions {
-  /** An empty prompt continues an approval pause rather than starting a turn. */
+  /**
+   * The user's message. Empty starts a turn with no user message.
+   *
+   * It does **not** continue an approval pause — that is
+   * {@link BaahRuntime.answerApproval} and nothing else, because continuing a pause
+   * means answering a specific card, and `AgentTurn.respondToApproval` is the only
+   * path that marks the part `approval-responded`, so the SDK's
+   * `lastAssistantMessageIsCompleteWithApprovalResponses` fires and the approved tool
+   * actually runs. Re-sending the transcript with an empty prompt would reach the
+   * model again **without** running the tool: a green turn, a card claiming it read
+   * a file, and no read. See the note on `answerApproval` below.
+   */
   readonly prompt?: string | undefined;
   /** The restored transcript. `UIMessage[]` is the storage truth (§3.1). */
   readonly messages?: readonly UIMessage[] | undefined;
@@ -355,10 +364,24 @@ export interface BaahRuntime {
   /** Resolve the configured provider. **Awaited** — see the module header. */
   resolveModel(): Promise<LanguageModel>;
 
-  /** Run a turn. Rejects with a typed error while another turn is in flight. */
+  /**
+   * Run a turn. Rejects with a typed error while another turn is in flight.
+   *
+   * **Or while one is parked on an approval** — `Plan.md` §15.5 wants the card to
+   * block further operation, and a second turn would take over the `AgentTurn` that
+   * owns the open question.
+   */
   send(input?: SendOptions): Promise<TurnResult>;
 
-  /** Answer an open approval card and resume the paused turn. */
+  /**
+   * Answer an open approval card and continue the paused turn.
+   *
+   * The **only** way `Plan.md` §7.6's pause-and-resume is reachable. It publishes
+   * `status: "running"` for the duration of the continuation, and resolves with the
+   * continuation's own `TurnResult` — or with `undefined` when no pending card
+   * matched the id, which is a double click on an already-answered card rather than
+   * a turn.
+   */
   answerApproval(input: {
     readonly approvalId: string;
     readonly approved: boolean;
@@ -511,15 +534,21 @@ export function createRuntime(dependencies: RuntimeDependencies): BaahRuntime {
   const approvals = createRuntimeApprovalChannel(dependencies);
 
   /**
-   * Set **synchronously** on entry to `send`, cleared in its `finally`.
+   * Set **synchronously** on entry to `send`, cleared when the turn is over.
    *
    * Not derived from `turn !== undefined`: `send` awaits `resolveModel()` before it
    * constructs the `AgentTurn`, so a second call arriving in that window would find
    * `turn` still `undefined` and start a second turn — two turns interleaving their
    * parts into one transcript, which is exactly what the guard exists to prevent.
+   *
+   * It also stays `true` for a turn that **parked** on an approval, because the
+   * parked turn is not over — it is waiting for a decision, and a second `send`
+   * would replace the `AgentTurn` that owns the open card. `Plan.md` §15.5 asks for
+   * exactly this ("Approval-Card blockiert die weitere Bedienung eindeutig"), so the
+   * block is the requirement and not a side effect of the bookkeeping.
    */
   let inFlight = false;
-  /** The turn in flight, plus its per-turn collaborator. */
+  /** The turn in flight — **or parked on an approval** — plus its collaborator. */
   let turn: AgentTurn | undefined;
   let watchdog: StallWatchdog | undefined;
   let turnId: string | undefined;
@@ -670,6 +699,37 @@ export function createRuntime(dependencies: RuntimeDependencies): BaahRuntime {
 
   /* ---- turns --------------------------------------------------- */
 
+  /**
+   * Is this turn still resumable?
+   *
+   * `AgentTurn.run` resolves with `outcome: "awaiting-approval"` **precisely so it
+   * can be continued** (`packages/baah-core/src/agent/loop.ts:817-834`): the SDK is
+   * holding the loop open until `respondToApproval` sends the answer, and the
+   * transcript already carries the `approval-requested` part. `#continue` can park a
+   * **second** time on another call, so this is asked of every result, not only of
+   * the first one.
+   */
+  function isParked(result: TurnResult | undefined): boolean {
+    return result?.outcome === "awaiting-approval";
+  }
+
+  /**
+   * Let go of the turn: its watchdog, its id, and the `inFlight` guard.
+   *
+   * One function so "the turn is over" has exactly one spelling. The previous code
+   * cleared three variables and a status flag in a `finally` and, in
+   * {@link answerApproval}, cleared **none** of them — which is how a resume left the
+   * status bar reading `running` forever after the continuation had finished.
+   */
+  function releaseTurn(): void {
+    turn = undefined;
+    watchdog?.disarm();
+    watchdog = undefined;
+    turnId = undefined;
+    inFlight = false;
+    publish({ status: "idle" });
+  }
+
   async function send(input: SendOptions = {}): Promise<TurnResult> {
     if (inFlight) {
       throw new RuntimeError(
@@ -683,7 +743,14 @@ export function createRuntime(dependencies: RuntimeDependencies): BaahRuntime {
     try {
       return await runTurn(input);
     } finally {
-      inFlight = false;
+      /**
+       * The safety net, and it is a real one: {@link runTurn} throws *before* its own
+       * `finally` when `resolveModel()` fails, so this is the only place that runs for
+       * a provider error. `turn === undefined` is the predicate rather than
+       * `result?.outcome` because `releaseTurn` already cleared the reference — the
+       * two stay in step by construction, and a parked turn leaves it set.
+       */
+      if (turn === undefined) inFlight = false;
     }
   }
 
@@ -753,8 +820,15 @@ export function createRuntime(dependencies: RuntimeDependencies): BaahRuntime {
     });
     turn = run;
 
+    /**
+     * Hoisted out of the `try` because the `finally` has to be able to ask what came
+     * back. Declaring it inside would make "is this turn parked" unanswerable from
+     * the one place that is allowed to release it.
+     */
+    let result: TurnResult | undefined;
+
     try {
-      const result = await run.run(input.prompt ?? "");
+      result = await run.run(input.prompt ?? "");
       settle(nextTurnId, result);
       return result;
     } catch (error) {
@@ -763,11 +837,42 @@ export function createRuntime(dependencies: RuntimeDependencies): BaahRuntime {
       // is the engine's, so the error says `turn-failed`, never `settings-write-failed`.
       throw fail(error, "turn");
     } finally {
-      turn = undefined;
-      watchdog?.disarm();
-      watchdog = undefined;
-      turnId = undefined;
-      publish({ status: "idle" });
+      /**
+       * ## The parked case, which used to throw the turn away
+       *
+       * This `finally` used to clear `turn`, `watchdog`, `turnId` and publish
+       * `status: "idle"` **unconditionally**. So a turn that parked on an approval
+       * lost the one object that could answer it, `answerApproval` — which opens
+       * with `if (turn === undefined) throw` — failed on every click, and the turn
+       * stood there forever. The engine had resolved with `awaiting-approval`
+       * *because* it intended to be continued; the `finally` threw that intent away.
+       *
+       * All three references are load-bearing while parked, and each for its own
+       * reason:
+       *
+       * - `turn` — the `AgentTurn` that owns the open card. There is no other route
+       *   to `respondToApproval`.
+       * - `turnId` — `settle` needs it, and the resume is a second `settle`.
+       * - `watchdog` — the user is the bottleneck, and `StallWatchdog`'s
+       *   `approval-requested`/`approval-answered` pair already models that
+       *   (`awaiting-human` → `awaiting-provider`). Disarming it here would leave a
+       *   resume with no stall affordance at all.
+       *
+       * `inFlight` is released by the same rule, and that is the *other* half of
+       * §15.5's "the approval card blocks further operation": a second `send` while
+       * a card is open must not replace the turn that owns it.
+       *
+       * `status` goes to `idle` while parked because nothing is running — the
+       * outcome (`awaiting-approval`, published by `settle`) and the card are what
+       * say the turn is waiting, and `turn-view.ts` renders exactly that sentence. It
+       * is published as `running` again by {@link answerApproval} for the duration of
+       * the continuation.
+       */
+      if (isParked(result)) {
+        publish({ status: "idle" });
+      } else {
+        releaseTurn();
+      }
     }
   }
 
@@ -776,25 +881,61 @@ export function createRuntime(dependencies: RuntimeDependencies): BaahRuntime {
     readonly approved: boolean;
     readonly reason?: string | undefined;
   }): Promise<TurnResult | undefined> {
-    if (turn === undefined) {
+    const parked = turn;
+    if (parked === undefined) {
       throw new RuntimeError(
         "turn-busy",
         "No paused turn to answer. An approval belongs to the AgentTurn instance that opened it, " +
           "and that instance is gone — re-send the turn instead.",
       );
     }
+    // Read before the await. `respondToApproval` can park the turn a second time on
+    // another call, and the id it settled under is the one this continuation belongs
+    // to; re-reading the mutable `turnId` afterwards would settle a later turn.
+    const parkedTurnId = turnId;
+
+    /**
+     * The continuation is **in flight from here**, and the status bar has to say so.
+     * The parked turn published `idle`, which is right while a human is deciding and
+     * wrong from the moment they have decided — a card that answers into a status bar
+     * reading "idle" claims the turn is over while the model is still being asked.
+     * `stall` is cleared with it: the watchdog latched its report about a silence
+     * that the answer has just ended, and a report about the past is not a report
+     * about the turn.
+     */
+    publish({ status: "running", stall: undefined, lastError: undefined });
+
     try {
-      const result = await turn.respondToApproval({
+      const result = await parked.respondToApproval({
         approvalId: input.approvalId,
         approved: input.approved,
         ...(input.reason === undefined ? {} : { reason: input.reason }),
       });
-      if (result !== undefined && turnId !== undefined) settle(turnId, result);
+      if (result === undefined) {
+        /**
+         * `respondToApproval` resolves `undefined` when **no** pending part matched the
+         * id — a card for a turn that is gone, or a second click on a card that was
+         * already answered. Nothing ran, so there is nothing to wait for, and holding
+         * the turn open would re-create the dead end this whole path exists to end.
+         */
+        releaseTurn();
+        return undefined;
+      }
+      if (parkedTurnId !== undefined) settle(parkedTurnId, result);
+      if (isParked(result)) {
+        // Another call wants a decision. Parked again, same rules as above.
+        publish({ status: "idle" });
+      } else {
+        releaseTurn();
+      }
       return result;
     } catch (error) {
       // Same subsystem as `run.run` — the loop is mid-turn and the store, a tool
       // or the provider failed. The approval card is a step *within* the turn, so
-      // it does not make this a different origin.
+      // it does not make this a different origin. The turn is over either way, so it
+      // is released: a held turn with a failed continuation is a turn nobody can
+      // finish.
+      releaseTurn();
       throw fail(error, "turn");
     }
   }
@@ -976,3 +1117,13 @@ export type {
   RuntimeState,
   StallReport,
 };
+
+/**
+ * The read port's own types, re-exported so a caller that wants them does not have
+ * to reach into `baah-storage` for a name it only learned from here.
+ *
+ * Re-exported rather than re-declared, and that is the whole difference: the five
+ * structural copies this module used to carry are gone, so there is no second
+ * version of `Transcript` to keep in step. See the module header.
+ */
+export type { Transcript, TranscriptMessage, TranscriptPart, TranscriptReader, TranscriptRequest };

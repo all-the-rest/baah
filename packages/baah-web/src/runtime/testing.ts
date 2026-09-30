@@ -102,6 +102,10 @@ export class RecordingTurnStore {
   readonly closedTurns: { sessionId: string; turnId: string }[] = [];
   readonly beganToolCalls: { key: unknown; toolName: string; input: unknown }[] = [];
   readonly recordedToolCalls: { key: unknown; toolName: string; output: unknown }[] = [];
+  /** The engine's own row creates, in order. See {@link RecordingTurnStore.store}. */
+  readonly appendedTurns: { id: string; sessionId: string }[] = [];
+  readonly appendedMessages: { id: string; role: string; turnId: string | null }[] = [];
+  readonly upsertedParts: { messageId: string; type: string }[] = [];
   readonly lookups: unknown[] = [];
   /** `listUnfinishedTurns` calls, in order — recovery reads, then the report reads. */
   listCalls = 0;
@@ -119,6 +123,20 @@ export class RecordingTurnStore {
   /** The `TurnStore` shape. A value, so the fake stays test-owned. */
   get store(): TurnStore {
     return {
+      // The engine's own creates. Recorded rather than ignored, because they are the
+      // evidence for "the engine writes the user's prompt itself" — the fact that
+      // removed the app's duplicate `recordUserMessage`.
+      appendTurn: async (input): Promise<void> => {
+        this.appendedTurns.push({ id: input.id, sessionId: input.sessionId });
+      },
+      appendMessage: async (input): Promise<void> => {
+        this.appendedMessages.push({ id: input.id, role: input.role, turnId: input.turnId });
+      },
+      // Core's tool-part upsert. Recorded rather than ignored, so a test can assert
+      // what the engine writes a tool part as.
+      upsertPart: async (input): Promise<void> => {
+        this.upsertedParts.push({ messageId: input.messageId, type: input.event.type });
+      },
       flushDelta: async (input): Promise<void> => {
         if (this.#failFlush !== undefined) throw this.#failFlush;
         this.deltas.push({ ...input });
@@ -211,6 +229,18 @@ export function mockModel(
      * staged.
      */
     readonly gate?: Promise<void>;
+    /**
+     * Throw from `doStream` on one specific call, zero-indexed.
+     *
+     * The only way to script a **transport** failure, as opposed to a stream that
+     * merely ends badly. A step array can carry a `finish` part with
+     * `raw: "error"`, but §5.4's terminal-event check is
+     * `rawFinishReason !== undefined` — so `"error"` is a *clean* finish and the
+     * turn succeeds. Making the model throw is what produces a `Classification`,
+     * and the approval-resume path has no retry budget of its own, so a throw there
+     * ends the turn `failed` instead of burning three attempts.
+     */
+    readonly failAt?: { readonly call: number; readonly error: unknown };
   } = {},
 ): LanguageModel {
   let call = 0;
@@ -219,7 +249,9 @@ export function mockModel(
   return new MockLanguageModelV4({
     doStream: async () => {
       const index = Math.min(call, scripted.length - 1);
+      const thisCall = call;
       call += 1;
+      if (options.failAt !== undefined && options.failAt.call === thisCall) throw options.failAt.error;
       // Awaited *before* the stream is created, so the turn is genuinely in flight
       // and genuinely has produced nothing.
       if (options.gate !== undefined) await options.gate;
@@ -260,6 +292,34 @@ export function finishPart(unified = "stop"): unknown {
       outputTokens: { total: 0, text: 0, reasoning: 0 },
     },
   };
+}
+
+/**
+ * A tool call, as the provider sends it.
+ *
+ * `input` is a **JSON string**, not an object — `type LanguageModelV4ToolCall` in
+ * `@ai-sdk/provider` says so, and getting it wrong produces a call the SDK refuses
+ * to parse. `JSON.stringify` here rather than a hand-written literal because the
+ * round trip is what the provider does and a literal is where a fixture starts
+ * lying about the wire format.
+ *
+ * Exported from `src/` for the same reason as the rest of this file: the
+ * approval-pause tests in `runtime.test.ts` need a real tool call, and a fake that
+ * only carried text parts could not produce a pause at all.
+ */
+export function toolCallParts(args: {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly input: unknown;
+}): unknown[] {
+  return [
+    {
+      type: "tool-call",
+      toolCallId: args.toolCallId,
+      toolName: args.toolName,
+      input: JSON.stringify(args.input),
+    },
+  ];
 }
 
 /* ------------------------------------------------------------------ */

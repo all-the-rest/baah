@@ -22,9 +22,10 @@ import {
   transcriptModel,
   type LiveTurn,
 } from "./transcript.ts";
-import type { TranscriptRead, TranscriptReadResult } from "../../runtime/index.ts";
+import type { Transcript, TranscriptMessage } from "@all-the.rest/baah-storage";
+import type { TranscriptRead } from "../../runtime/index.ts";
 
-function transcript(overrides: Partial<TranscriptReadResult> = {}): TranscriptReadResult {
+function transcript(overrides: Partial<Transcript> = {}): Transcript {
   return {
     sessionId: "s",
     turnId: null,
@@ -35,7 +36,19 @@ function transcript(overrides: Partial<TranscriptReadResult> = {}): TranscriptRe
   };
 }
 
-function storedMessage(overrides: Record<string, unknown> = {}) {
+/**
+ * A stored message, typed as the port's own `TranscriptMessage`.
+ *
+ * The overrides are `Partial<TranscriptMessage>` rather than `Record<string, unknown>`
+ * on purpose: the port's `role`, `status`, `outcome` and `type` are **unions** now
+ * that this package reads `baah-storage`'s real types instead of a local copy of them
+ * (`runtime/index.ts`, module header), and a fixture that could hand the projection
+ * a value outside those unions would be testing a state the store cannot produce —
+ * `baah-storage` validates every one of them in `messageRowSchema` / `partRowSchema`.
+ * The trust boundary that is *not* covered by a type is the `data` blob, and the
+ * tests below exercise it.
+ */
+function storedMessage(overrides: Partial<TranscriptMessage> = {}): TranscriptMessage {
   return {
     id: "m1",
     turnId: null,
@@ -106,7 +119,7 @@ describe("the live fold", () => {
   it("tracks a tool through call → approval → result", () => {
     const live = foldAgentEvents([
       { type: "tool-call", toolCallId: "c1", toolName: "write", input: { path: "a.txt" } },
-      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "write", reason: "Schreiben?" },
+      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, reason: "Schreiben?" },
       { type: "approval-answered", approvalId: "ap1", approved: true },
       { type: "tool-result", toolCallId: "c1", toolName: "write", output: "geschrieben" },
     ]);
@@ -123,7 +136,7 @@ describe("the live fold", () => {
     // risk class — so the placeholder would make a secret read look like an unknown
     // one.
     const live = foldAgentEvents([
-      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", reason: "Secrets?" },
+      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", input: { path: ".env" }, reason: "Secrets?" },
     ]);
     expect(live.tools[0]?.toolName).toBe("read");
     // And the `toolCallId` is on the open entry, because that is what
@@ -133,7 +146,7 @@ describe("the live fold", () => {
 
   it("closes an open approval when it is answered", () => {
     const live = foldAgentEvents([
-      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "write", reason: undefined },
+      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, reason: undefined },
     ]);
     expect(live.openApprovals).toHaveLength(1);
     const answered = applyAgentEvent(live, { type: "approval-answered", approvalId: "ap1", approved: false });
@@ -218,23 +231,27 @@ describe("the stored transcript", () => {
   it("keeps the `idle` outcome message, because that is where the outcome lives", () => {
     // `Plan.md` §6.2: the turn outcome is an `idle` message, not a column. A
     // projection that dropped it would lose the only record of how a turn ended.
-    const messages = storedMessages(
-      transcript({
-        messages: [storedMessage({ id: "i1", role: "idle", outcome: "interrupted" })],
-      }),
-    );
-    expect(messages).toHaveLength(1);
-    expect(messages[0]?.outcome).toBe("interrupted");
+    // **All three** outcomes, because the one that matters most in practice is the
+    // one a user sees after a reload: `interrupted` is what `recoverStaleTurns`
+    // leaves behind (`Plan.md` §5.1), and it is a row, not a badge.
+    for (const outcome of ["succeeded", "failed", "interrupted"] as const) {
+      const messages = storedMessages(
+        transcript({ messages: [storedMessage({ role: "idle", outcome })] }),
+      );
+      expect(messages, outcome).toHaveLength(1);
+      expect(messages[0]?.outcome, outcome).toBe(outcome);
+    }
   });
 
-  it("rejects an unknown outcome rather than passing it through", () => {
-    // A `messages.outcome` outside the `CHECK` list cannot occur against a migrated
-    // database, and a projection that echoed it would render an outcome the schema
-    // does not have.
+  it("passes the store's role through, so a row nothing else could produce still renders", () => {
+    // `Plan.md` §14.3 names eleven roles and this view has three bubbles, so
+    // `roleOf` folds the rest. The union is the port's, so the fold is total and a
+    // new role is a compile error here rather than an `undefined` on screen.
     const messages = storedMessages(
-      transcript({ messages: [storedMessage({ role: "idle", outcome: "weird" })] }),
+      transcript({ messages: [storedMessage({ role: "compaction" })] }),
     );
-    expect(messages[0]?.outcome).toBeUndefined();
+    expect(messages[0]?.role).toBe("compaction");
+    expect(roleOf(messages[0]?.role ?? "")).toBe("system");
   });
 
   it("gives a reloaded card the truncation notice and the diffs a live card has", () => {
@@ -353,9 +370,28 @@ describe("a failed read is not an empty conversation", () => {
   });
 
   it("distinguishes a not-yet-read state from a failed one", () => {
+    // A **pending** read is a request outstanding, not a problem. It used to be
+    // rendered with the warning panel, and the in-memory build hid that by being
+    // fast — real SQLite makes the read a `postMessage` round trip to the worker, so
+    // the window is now long enough for a human to read an ordinary loading state as
+    // an error. The two facts need different words and different styling.
     const pending = transcriptModel({ read: undefined, live: EMPTY_LIVE_TURN });
+    expect(pending.pending).toBe(true);
+    expect(pending.readProblem).toBeUndefined();
+    // And it must not claim the session is empty while it is in flight.
     expect(pending.empty).toBe(false);
-    expect(pending.readProblem).toContain("noch nicht gelesen");
+  });
+
+  it("reports `pending: false` for every read that came back, whatever it said", () => {
+    // The other direction: a model that reported `pending` for a resolved read would
+    // leave a "wird geladen" line up for ever next to a full transcript.
+    for (const read of [
+      { kind: "ok", transcript: transcript() },
+      { kind: "unavailable", reason: "no read port wired" },
+      failed,
+    ] as const) {
+      expect(transcriptModel({ read, live: EMPTY_LIVE_TURN }).pending, read.kind).toBe(false);
+    }
   });
 
   it("shows the live turn even when the read failed", () => {

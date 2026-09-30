@@ -25,11 +25,10 @@ import {
   renderPart,
   toolCardState,
   toolNameOf,
-  toolResultFailure,
-  toolStateForResult,
   toolStateLabel,
   truncationNotice,
 } from "./parts.ts";
+import * as parts from "./parts.ts";
 import type { UIMessage } from "ai";
 
 type Part = UIMessage["parts"][number];
@@ -309,43 +308,63 @@ describe("renderPart", () => {
  * of `definition.execute` into `{ ok: false, error }` on purpose, so the model can
  * read the failure instead of the step dying. The consequence for the UI is that a
  * failing tool's part is `output-available` and the **state alone lies**.
+ *
+ * ## These are assertions about what the user sees, not about the rule
+ *
+ * `toolResultFailure` and `toolStateForResult` are the **engine's**
+ * (`@all-the.rest/baah-core`, `agent/loop.ts`) and are tested there, against the
+ * stored row, in `packages/baah-core/test/agent/tool-part.test.ts`. What belongs to
+ * *this* package is the half above them: that {@link renderPart} turns a failure
+ * envelope into a card that says `Fehlgeschlagen`, carries the reason, and does not
+ * also print the envelope as output — on the same function the engine uses, so a
+ * reloaded card and a live card cannot disagree.
+ *
+ * Every assertion below therefore goes through `renderPart`. A test that called
+ * `toolStateForResult` directly would be a second copy of the engine's suite in the
+ * wrong package, and it is what the mutation "re-point `parts.ts` at its own copy"
+ * would have needed in order to stay green.
  */
 describe("a failure envelope on a tool result", () => {
   const failure = { ok: false, error: "File not found: gibt-es-nicht.md" } as const;
 
-  it("reads the message out of the envelope", () => {
-    expect(toolResultFailure(failure)).toBe("File not found: gibt-es-nicht.md");
-  });
-
-  it("promotes `output-available` to `output-error`, so the card says `Fehlgeschlagen`", () => {
+  it("renders `Fehlgeschlagen` with the envelope's message, and no output beside it", () => {
     // The bug this whole path exists for: a card that says `Ausgefuehrt` for a `read`
-    // of a file that does not exist is a lie the user acts on.
-    expect(toolStateForResult("output-available", failure)).toBe("output-error");
+    // of a file that does not exist is a lie the user acts on. And the envelope is not
+    // also printed as the output: its whole content is the error string, so the card
+    // would say the same sentence twice.
     const rendered = asTool(renderPart(toolPart("output-available", { output: failure }) as never));
     expect(rendered.state).toBe("output-error");
     expect(rendered.stateLabel).toBe("Fehlgeschlagen");
     expect(rendered.errorText).toBe("File not found: gibt-es-nicht.md");
-    // And the envelope is not also printed as the output: its whole content is the
-    // error string, so the card would say the same sentence twice.
     expect(rendered.output).toBeUndefined();
   });
 
   it("leaves a genuine result alone", () => {
-    expect(toolResultFailure({ ok: true, path: "a.txt" })).toBeUndefined();
-    expect(toolStateForResult("output-available", { ok: true })).toBe("output-available");
-    expect(toolResultFailure(undefined)).toBeUndefined();
-    expect(toolResultFailure("plain text")).toBeUndefined();
-    // An envelope with no message is not a failure the user can be shown anything
-    // about, so it does not get a `Fehlgeschlagen` badge and a blank reason.
-    expect(toolResultFailure({ ok: false })).toBeUndefined();
-    expect(toolResultFailure({ ok: false, error: "" })).toBeUndefined();
+    const rendered = asTool(
+      renderPart(toolPart("output-available", { output: { ok: true, path: "a.txt" } }) as never),
+    );
+    expect(rendered.state).toBe("output-available");
+    expect(rendered.errorText).toBeUndefined();
+    expect(rendered.output).toContain("a.txt");
+  });
+
+  it("does not badge a failure the envelope says nothing about", () => {
+    // `AGENTS.md`'s rule in miniature: a `Fehlgeschlagen` with a blank reason is a
+    // claim the user cannot check, so an envelope with no message is not treated as
+    // a failure at all.
+    for (const output of [{ ok: false }, { ok: false, error: "" }, undefined, "plain text"]) {
+      const rendered = asTool(renderPart(toolPart("output-available", { output }) as never));
+      expect(rendered.state, JSON.stringify(output)).toBe("output-available");
+      expect(rendered.errorText, JSON.stringify(output)).toBeUndefined();
+    }
   });
 
   it("does not claim `tool-outcome-unknown`, which is not a failure", () => {
     // `packages/baah-core/src/agent/tools.ts:449-462` returns `ok: false` **with**
     // an `error` and its own `outcome: "unknown"`. That is "the tab died mid-call",
     // and `Plan.md` §5.1 gives it its own node. Painting `Fehlgeschlagen` onto it
-    // would be the second of the two lies the scenario exists to separate.
+    // would be the second of the two lies the scenario exists to separate — so the
+    // envelope's `error` string must not reach the card as one.
     const unknown = {
       ok: false,
       outcome: "unknown",
@@ -353,16 +372,20 @@ describe("a failure envelope on a tool result", () => {
       toolName: "write",
       error: "began but never reported a result",
     } as const;
-    expect(toolResultFailure(unknown)).toBeUndefined();
-    expect(toolStateForResult("output-available", unknown)).toBe("output-available");
+    const rendered = asTool(renderPart(toolPart("output-available", { output: unknown }) as never));
+    expect(rendered.state).toBe("output-available");
+    expect(rendered.errorText).toBeUndefined();
   });
 
   it("never overrules a state the engine decided on purpose", () => {
     // `output-denied` is a refusal, not a malfunction (`Plan.md` §7.6). A tool whose
-    // own payload looks like a failure envelope must not be able to relabel it.
-    expect(toolStateForResult("output-denied", failure)).toBe("output-denied");
-    expect(toolStateForResult("approval-requested", failure)).toBe("approval-requested");
-    expect(toolStateForResult("input-available", failure)).toBe("input-available");
+    // own payload looks like a failure envelope must not be able to relabel it — and
+    // a card that is waiting for the user must not turn into a failure either.
+    for (const state of ["output-denied", "approval-requested", "input-available", "approval-responded"]) {
+      const rendered = asTool(renderPart(toolPart(state, { output: failure }) as never));
+      expect(rendered.state, state).toBe(state);
+      expect(rendered.errorText, state).toBeUndefined();
+    }
   });
 
   it("keeps the SDK's own `errorText` when the state is already `output-error`", () => {
@@ -383,6 +406,116 @@ describe("a failure envelope on a tool result", () => {
     );
     expect(rendered.truncation).toBeUndefined();
     expect(rendered.diffs).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The rule has one implementation                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `toolStateForResult` and `toolResultFailure` are the **engine's**, and
+ * `ToolCardState` is the engine's union. `parts.ts` imports all three. A copy here
+ * would be free to agree with the stored row until the day it did not, and the
+ * symptom would be a reloaded card disagreeing with a live one — which is why this
+ * is a gate and not a note.
+ *
+ * ## Two checks, because either alone has a hole
+ *
+ * - **The module's own surface.** A behaviour test cannot tell "imported" from
+ *   "re-declared and re-exported", and a non-exported local copy would satisfy every
+ *   render test in this file while forking the rule. So the *source* is read: no
+ *   declaration of either name may appear in `parts.ts`. The pattern is on the
+ *   declaration keyword, not on a call site, which is what makes it survive a
+ *   reformat — the failure mode `AGENTS.md` §6a records for
+ *   `verify-replay-window.test.ts`.
+ * - **The imported value.** `parts.ts` is not asked to declare them, and the engine
+ *   still answers: if the import were ever repointed at a local file, the next
+ *   `tsc` fails on the missing export rather than on a card that quietly changed.
+ *
+ * **No comment/string stripper here, deliberately.** The other five source gates in
+ * this repo carry one each, and `AGENTS.md` §6a says the duplication is a consequence
+ * of the layering rule. This check does not need it: a *declaration* keyword followed
+ * by the name is code by construction, and prose about a function is not a
+ * declaration. The reader is exercised against **planted** material, so a check that
+ * silently matched nothing cannot pass.
+ */
+const OWNED_BY_THE_ENGINE = ["toolResultFailure", "toolStateForResult", "ToolCardState"];
+
+/** `/src/**`, so the file under test is read as the bundler will ship it. */
+const SOURCES = import.meta.glob("/src/**/*.{ts,tsx}", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+}) as Record<string, string>;
+
+const PARTS = "/src/components/lib/parts.ts";
+
+/** A local declaration of one of the engine's names. */
+function localDeclarations(source: string): string[] {
+  const found: string[] = [];
+  for (const name of OWNED_BY_THE_ENGINE) {
+    // `function f(`, `const f =`, `type T =` — a type alias and an interface too, so
+    // the union cannot be re-declared without this noticing.
+    const declaration = new RegExp(
+      String.raw`(?:^|\n)\s*(?:export\s+)?(?:declare\s+)?(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+${name}\b`,
+    );
+    if (declaration.test(source)) found.push(name);
+  }
+  return found;
+}
+
+describe("the tool-card rule is not re-declared here", () => {
+  it("the scan really reads the sources — a glob that matches nothing passes vacuously", () => {
+    const files = Object.keys(SOURCES);
+    expect(files.length).toBeGreaterThan(10);
+    expect(files, PARTS).toContain(PARTS);
+    expect(SOURCES[PARTS]?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  it("finds no local declaration of an engine name in `parts.ts`", () => {
+    expect(
+      localDeclarations(SOURCES[PARTS] ?? ""),
+      "the rule that turns a tool *result* into a card state is the engine's " +
+        "(`@all-the.rest/baah-core`, `agent/loop.ts` — `toolPartContent` is built on it), and it " +
+        "is applied in exactly two places: the row the engine writes and the card this package " +
+        "draws from it. A third copy would be free to disagree with the row, and the symptom " +
+        "would be a reloaded card that no longer matches a live one.",
+    ).toEqual([]);
+  });
+
+  it("does not export the two functions either, so nothing can import them from here", () => {
+    // The cheap second path, and it is a real one on its own: a re-pointed import in
+    // `transcript.ts` would compile against a local export and this fails.
+    for (const name of OWNED_BY_THE_ENGINE) {
+      expect(parts, name).not.toHaveProperty(name);
+    }
+    // …and the render-side half is still here, or the tests above would be vacuous.
+    expect(typeof parts.renderPart).toBe("function");
+    expect(typeof parts.toolStateLabel).toBe("function");
+  });
+
+  it("the reader sees what it is meant to catch", () => {
+    const planted = [
+      `export function toolStateForResult(state: string, output: unknown): string {`,
+      `  return state;`,
+      `}`,
+      `const toolResultFailure = (output: unknown) => output;`,
+      `export type ToolCardState = "output-error";`,
+    ].join("\n");
+    expect(localDeclarations(planted)).toEqual(["toolResultFailure", "toolStateForResult", "ToolCardState"]);
+
+    // …and it does not fire on the import that is supposed to be there, on a call,
+    // or on prose about the function.
+    const innocent = [
+      `import { toolResultFailure, toolStateForResult, type ToolCardState } from "@all-the.rest/baah-core";`,
+      `const state = toolStateForResult(part.state, part.output);`,
+      `const failure = toolResultFailure(output);`,
+      `const copy: Readonly<Record<ToolCardState, string>> = STATE_COPY;`,
+      `// parts.ts used to declare toolResultFailure and toolStateForResult itself`,
+      `const named = { toolStateForResult: 1 };`,
+    ].join("\n");
+    expect(localDeclarations(innocent)).toEqual([]);
   });
 });
 

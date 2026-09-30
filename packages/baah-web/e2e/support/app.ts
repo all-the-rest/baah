@@ -141,11 +141,53 @@ export function toolCard(app: Page, toolCallId: string): Locator {
  * This is a *budget*, not an assertion about timing: nothing in the suite asserts that
  * a retry took 2 s. The schedule belongs to `stream/backoff.ts`'s unit test, where
  * `random` and `sleep` are injected and the numbers are exact.
+ *
+ * ## Why the outcome badge is part of the wait, and why this was a real race
+ *
+ * `idle` on its own is satisfied **before the turn starts**: `AppShell` sets
+ * `setRead(undefined)` and then calls `runtime.send`, and the runtime takes
+ * `inFlight` synchronously on entry but only publishes `status: "running"` after
+ * `await resolveModel()`. So there is a window in which the badge reads `idle` and no
+ * turn is in flight at all, and this helper used to return immediately after
+ * `sendPrompt` — every assertion after it was racing the turn.
+ *
+ * The in-memory store hid that: the turn and the read-back finished so fast that the
+ * following assertion usually saw a settled page. Real SQLite does not go that fast,
+ * and the hidden race turned into a ten-second `pending` wait. So the wait now
+ * requires the **turn's outcome** as well, and `settle` publishes that only once a
+ * `TurnResult` exists — a state the pre-send page cannot be in.
  */
 export async function waitForTurnIdle(app: Page, timeoutMs = 20_000): Promise<void> {
   await playwrightExpect(
     app.locator(`[data-testid="${TEST_IDS.turnStatus}"][data-baah-status="idle"]`),
   ).toBeVisible({ timeout: timeoutMs });
+  // And that a turn actually ran. See the header: `idle` alone is true before the
+  // turn begins, and an outcome badge only exists once a `TurnResult` has settled.
+  await playwrightExpect(
+    app.locator(`[data-testid="${TEST_IDS.turnStatusOutcome}"]`),
+  ).toBeVisible({ timeout: timeoutMs });
+}
+
+/**
+ * Wait until the **stored** transcript has been read back.
+ *
+ * ## Why this is a separate wait, and why it exists at all
+ *
+ * `data-baah-status="idle"` says the turn stopped. It does not say the transcript
+ * has been re-read: the shell kicks a `readTranscript()` off in the turn's
+ * `finally` and installs the result when it lands, so a turn can be `idle` for a few
+ * milliseconds before the view is authoritative. With the in-memory store the read
+ * was a resolved promise and won that race for free; with real SQLite it is a
+ * `postMessage` round trip to the worker and it does not.
+ *
+ * So this waits for the *pending* marker to clear **and** for the *absence of a
+ * failure*. Waiting only for "not pending" would also be satisfied by a read that
+ * refused, which is the one thing this must not accept — `Plan.md` §16.1 is explicit
+ * that a failed read is not an answer.
+ */
+export async function waitForStoredTranscript(app: Page, timeoutMs = 10_000): Promise<void> {
+  await playwrightExpect(app.locator('[data-baah-read="pending"]')).toHaveCount(0, { timeout: timeoutMs });
+  await playwrightExpect(app.locator('[data-baah-read="problem"]')).toHaveCount(0, { timeout: timeoutMs });
 }
 
 /** The state text of one tool card. */

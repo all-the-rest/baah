@@ -24,7 +24,7 @@ import {
   type RuntimeDependencies,
 } from "./index.ts";
 import type { RuntimeEvent } from "./events.ts";
-import { RecordingTurnStore, fakeRegistry, finishPart, gate, mockModel, textParts } from "./testing.ts";
+import { RecordingTurnStore, fakeRegistry, finishPart, gate, mockModel, textParts, toolCallParts } from "./testing.ts";
 
 const SESSION = "session-1";
 
@@ -41,6 +41,24 @@ const noopTool = defineTool<{ value: string }, string>({
   access: "read",
   inputSchema: z.object({ value: z.string() }),
   execute: async (_context, input) => input.value,
+});
+
+/**
+ * A `read`, with a `path` — the one tool §7.4's default policy asks about.
+ *
+ * Named `read` **on purpose**: `buildApprovalTargets` keys off the tool id, and
+ * `DEFAULT_APPROVAL_TARGETS.read` is what turns `{ path: ".env" }` into the action
+ * `read` and the resource `.env` (`packages/baah-core/src/agent/approval.ts:107`).
+ * A differently named tool would fall through to the `access` fallback, match the
+ * `{ action: "*", resource: "*" }` allow rule, and never pause — so the suite would
+ * pass while exercising a path no real read takes.
+ */
+const readTool = defineTool<{ path: string }, string>({
+  id: "read",
+  description: "reads a file",
+  access: "read",
+  inputSchema: z.object({ path: z.string() }),
+  execute: async (_context, input) => `contents of ${input.path}`,
 });
 
 function settingsWith(options: {
@@ -82,6 +100,8 @@ interface HarnessOptions {
    * hoped for.
    */
   readonly gate?: Promise<void>;
+  /** Makes one specific `doStream` call throw. See `testing.ts`'s `failAt`. */
+  readonly failAt?: { readonly call: number; readonly error: unknown };
   readonly stallTimeoutMs?: number;
   readonly setStallTimer?: (callback: () => void, ms: number) => unknown;
   readonly clearStallTimer?: (handle: unknown) => void;
@@ -107,6 +127,7 @@ function harness(options: HarnessOptions = {}): {
   const { registry, created } = fakeRegistry({
     model: mockModel(options.steps ?? [[...textParts("t0", "hello"), finishPart()]], {
       ...(options.gate === undefined ? {} : { gate: options.gate }),
+      ...(options.failAt === undefined ? {} : { failAt: options.failAt }),
     }),
   });
 
@@ -172,18 +193,23 @@ describe("the composition root", () => {
   });
 
   it("accepts a new turn once the previous one has settled", async () => {
-    // The other side of the guard, and the one a stuck flag would break. A rejected
-    // turn and a successful one both have to release the flag — otherwise the
-    // session is dead after a single failure, which is a worse bug than the one the
-    // flag prevents.
+    // The other side of the guard, and the one a stuck flag would break. A failed
+    // turn and a successful one both have to release the flag — otherwise the session
+    // is dead after a single failure, which is a worse bug than the one the flag
+    // prevents.
     const { runtime } = harness();
 
     await runtime.send({ prompt: "one" });
     await expect(runtime.send({ prompt: "two" })).resolves.toMatchObject({ outcome: "succeeded" });
 
+    // The failing half. It used to reject with a `RuntimeError`; `AgentTurn`'s
+    // `#persistPrompt` now catches a failed write and **resolves** with a `failed`
+    // `TurnResult`. The assertion is therefore on the flag, not on the shape of the
+    // failure: a second send must be *accepted*, and a stuck `inFlight` would answer
+    // `turn-busy` instead.
     const failing = harness({ store: new RecordingTurnStore({ failFlush: true }) });
-    await expect(failing.runtime.send({ prompt: "three" })).rejects.toBeInstanceOf(RuntimeError);
-    await expect(failing.runtime.send({ prompt: "four" })).rejects.toMatchObject({ code: "turn-failed" });
+    await expect(failing.runtime.send({ prompt: "three" })).resolves.toMatchObject({ outcome: "failed" });
+    await expect(failing.runtime.send({ prompt: "four" })).resolves.toMatchObject({ outcome: "failed" });
   });
 });
 
@@ -432,9 +458,20 @@ describe("the step boundary", () => {
 
     expect(store.deltas.length).toBeGreaterThan(0);
     for (const delta of store.deltas) {
-      // The engine's part id (`t0`), never the `text:<messageId>` this layer used to
-      // derive. A derived id would have been a second writer's key space.
-      expect(delta.partId).toMatch(/^t\d+$/);
+      /**
+       * The engine mints two part-id shapes and this layer used to derive a third.
+       *
+       * - `t0` — an assistant text part, from the stream loop.
+       * - a `newMessageId()` — the **prompt** part, which `AgentTurn.#persistPrompt`
+       *   writes before the first model call. That write arrived with core's
+       *   `appendTurn` / `appendMessage`, and it is why this pattern is two
+       *   alternatives rather than one.
+       * - `text:<messageId>` — the derived key space this app used before the
+       *   step-boundary writer was removed. A second writer invents exactly that, so
+       *   it is asserted *absent* as well as "not one of the other two".
+       */
+      expect(delta.partId).toMatch(/^(t\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/);
+      expect(delta.partId.startsWith("text:")).toBe(false);
       expect(delta.partType).toBe("text");
       expect(delta.sessionId).toBe(SESSION);
     }
@@ -517,14 +554,27 @@ describe("the step boundary", () => {
   });
 
   it("surfaces a failed write rather than pretending the turn was clean", async () => {
-    // The write failing is not the turn failing. `flushDelta` is awaited inside the
-    // engine's stream loop, so the failure propagates out of `run()` and the runtime
-    // reports it as a typed error instead of swapping in a "succeeded" the store
-    // never earned.
+    // The write failing is not the turn succeeding. `AgentTurn.#persistPrompt` awaits
+    // the write before the first model call and, when it fails, ends the turn
+    // `failed` with a `Classification` — which is the stronger contract of the two:
+    // the turn never reaches the model at all, so there is nothing half-written to
+    // describe, and the user is told the turn failed rather than being handed an
+    // empty "success".
+    //
+    // It used to reject with a `RuntimeError`; the assertion that survives the shape
+    // change is the one that matters — **not** `succeeded` — plus the fact that the
+    // model was never called, which is what makes it a persistence failure rather
+    // than a provider one.
     const store = new RecordingTurnStore({ failFlush: true });
     const { runtime } = harness({ store });
 
-    await expect(runtime.send({ prompt: "hi" })).rejects.toBeInstanceOf(RuntimeError);
+    const result = await runtime.send({ prompt: "hi" });
+
+    expect(result.outcome).toBe("failed");
+    // `attempts: 0` is the part that names it a *persistence* failure: the model was
+    // never asked. A provider failure has attempts.
+    expect(result.attempts).toBe(0);
+    expect(result.classification).toBeDefined();
   });
 });
 
@@ -651,5 +701,298 @@ describe("approval answering", () => {
     await expect(runtime.answerApproval({ approvalId: "a1", approved: true })).rejects.toBeInstanceOf(
       RuntimeError,
     );
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* A parked turn is not a finished turn                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ## Why this block exists at all
+ *
+ * `runTurn`'s `finally` cleared `turn`, `watchdog` and `turnId` **unconditionally**,
+ * including when the engine resolved with `outcome: "awaiting-approval"` — which it
+ * does precisely so the turn can be continued. `answerApproval` opens with
+ * `if (turn === undefined) throw new RuntimeError("turn-busy", …)`, so every answer
+ * failed and the turn stood there forever. Two E2E scenarios were encoded as
+ * `test.fail` against exactly this.
+ *
+ * The E2E suite proves the product. This block proves the **rule**, with no browser
+ * and no DOM (`AGENTS.md` §6), and it is the place where the three things a parked
+ * turn keeps — the `AgentTurn`, its `turnId`, its watchdog — are each pinned, because
+ * the E2E cannot tell a missing watchdog from a disarmed one.
+ *
+ * ## Every assertion below has a second path, on purpose
+ *
+ * A test that only checks `answerApproval` resolves would pass against a mutant that
+ * simply stopped clearing `turn` at all — which leaks the turn into the next one and
+ * breaks something else entirely. So the state assertions (status, `inFlight`,
+ * `turnId`) are not implied by the resolution ones: they are measured alongside.
+ */
+describe("a turn parked on an approval", () => {
+  /**
+   * One step that asks for `.env` — which §7.4's default policy judges `ask` — and
+   * one step that answers. Two steps, because `#continue` re-sends the transcript
+   * and the model has to be asked again; a single-step script would have the mock
+   * replay the tool call and park forever.
+   */
+  function askEnvThenAnswer(text: string): (readonly unknown[])[] {
+    return [
+      [...toolCallParts({ toolCallId: "call_env", toolName: "read", input: { path: ".env" } }), finishPart("tool-calls")],
+      [...textParts("t1", text), finishPart()],
+    ];
+  }
+
+  function parkedHarness(answer: string) {
+    return harness({ steps: askEnvThenAnswer(answer), overrides: { tools: [readTool] } });
+  }
+
+  async function park(runtime: ReturnType<typeof createRuntime>) {
+    const result = await runtime.send({ prompt: "lies da eine .env?" });
+    expect(result.outcome).toBe("awaiting-approval");
+    return result.openApprovals[0]?.approvalId;
+  }
+
+  it("resolves `run()` with the open approval, so the turn is continuable", async () => {
+    // The premise of the whole block, asserted rather than assumed: the engine parks
+    // for exactly one approval, and it is a `read` of `.env` — the `ask` §7.4
+    // produces with no rules configured at all.
+    const { runtime } = parkedHarness("gelesen");
+    const result = await runtime.send({ prompt: "lies da eine .env?" });
+
+    expect(result.outcome).toBe("awaiting-approval");
+    expect(result.openApprovals).toHaveLength(1);
+    expect(result.openApprovals[0]?.toolName).toBe("read");
+  });
+
+  it("keeps the turn reachable: answering runs the tool and finishes the turn", async () => {
+    // The mutation this kills: `turn = undefined` restored in the `finally`. Every
+    // other assertion in this block still passes with that mutant in place — the
+    // park is reported identically — so this is the one line that has to fail.
+    const { runtime, store } = parkedHarness("gelesen");
+    const approvalId = await park(runtime);
+
+    const resumed = await runtime.answerApproval({ approvalId: approvalId ?? "", approved: true });
+
+    expect(resumed?.outcome).toBe("succeeded");
+    expect(resumed?.text).toBe("gelesen");
+    // And the tool actually ran on the resumed turn — the difference between a
+    // correct resume and the "re-send with an empty prompt" shortcut, which reaches
+    // the model without ever executing the approved call.
+    expect(store.beganToolCalls).toHaveLength(1);
+    expect(store.recordedToolCalls).toHaveLength(1);
+  });
+
+  it("reads `idle` while parked — nothing is running, the card is what waits", async () => {
+    // `turn-view.ts` turns `outcome: "awaiting-approval"` into "Wartet auf eine
+    // Freigabe.", and that sentence is only reachable while `status` is not
+    // `running`. A parked turn that still claimed `running` would say "Der Turn
+    // läuft." over a card the user is supposed to answer.
+    const { runtime } = parkedHarness("gelesen");
+    await park(runtime);
+
+    const state = runtime.getState();
+    expect(state.status).toBe("idle");
+    expect(state.outcome).toBe("awaiting-approval");
+  });
+
+  it("publishes `running` for the continuation, and `idle` once it is over", async () => {
+    // The mutation this kills: `publish({ status: "idle" })` on the resume instead of
+    // `running`. Asserted as a **sequence of snapshots**, not as the end state: the
+    // end state is `idle` either way, so a test that only looked at the end would
+    // pass against the mutant and prove nothing about the window in between.
+    const { runtime } = parkedHarness("gelesen");
+    const approvalId = await park(runtime);
+
+    const seen: string[] = [];
+    runtime.subscribeState(() => {
+      seen.push(runtime.getState().status);
+    });
+
+    await runtime.answerApproval({ approvalId: approvalId ?? "", approved: true });
+
+    expect(seen).toContain("running");
+    expect(seen.at(-1)).toBe("idle");
+  });
+
+  it("blocks a second turn while parked — §15.5's card blocks further operation", async () => {
+    // A second `send` would construct a **new** `AgentTurn` and overwrite the
+    // reference, so the open card would point at a turn that no longer exists. This
+    // is the same guard the in-flight case uses, held across the pause — and it is a
+    // separate assertion from the resume one, because a mutant that clears `turn`
+    // but forgets `inFlight` fails here and nowhere else.
+    const { runtime } = parkedHarness("gelesen");
+    await park(runtime);
+
+    await expect(runtime.send({ prompt: "und jetzt?" })).rejects.toMatchObject({ code: "turn-busy" });
+  });
+
+  it("accepts a new turn again after the resume has finished", async () => {
+    // The other direction of the same guard, and the one a "never clear it" mutant
+    // dies on: holding `inFlight` across the resume too would leave the session
+    // permanently unable to send anything.
+    const { runtime } = parkedHarness("gelesen");
+    const approvalId = await park(runtime);
+    await runtime.answerApproval({ approvalId: approvalId ?? "", approved: true });
+
+    const next = await runtime.send({ prompt: "weiter" });
+
+    expect(next.outcome).toBe("succeeded");
+  });
+
+  it("keeps its turn id, so the resume settles under the turn it belongs to", async () => {
+    // The `turnId` is read *before* the await in `answerApproval` and the settled
+    // turn is published on the bus. A mutant that cleared `turnId` in the `finally`
+    // would make the resume's `settle` skip silently — no error, no event, a UI that
+    // never learns the continuation finished.
+    const { runtime, events } = parkedHarness("gelesen");
+    const parked = await runtime.send({ prompt: "lies da eine .env?" });
+    const parkedTurnId = runtime.getState().turnId;
+    expect(parkedTurnId).toBeDefined();
+
+    const approvalId = parked.openApprovals[0]?.approvalId;
+    await runtime.answerApproval({ approvalId: approvalId ?? "", approved: true });
+
+    const settled = events.filter((event) => event.kind === "turn-settled");
+    expect(settled).toHaveLength(2);
+    // Same turn, both times: a resume is a continuation, not a new turn.
+    expect(settled.map((event) => (event.kind === "turn-settled" ? event.turnId : ""))).toEqual([
+      parkedTurnId,
+      parkedTurnId,
+    ]);
+  });
+
+  it("keeps the watchdog across the pause and re-arms it for the continuation", async () => {
+    // The claim, and it is two claims with two different answers.
+    //
+    // While a human decides, **no window is open** — that is `watchdog.ts`'s own
+    // design: `approval-requested` is in `DISARM` and moves the phase to
+    // `awaiting-human`, because "a card is waiting for a person" is not a stall.
+    // Asserted first, so a mutant that simply never opened a window passes it.
+    //
+    // The second claim is the load-bearing one: **the resume opened a new window.**
+    // `approval-answered` is in `ARM`, and the only way it can be observed is if the
+    // parked turn still held its `StallWatchdog` — `handleEvent` calls
+    // `watchdog?.observe(event)`, and a `finally` that dropped the watchdog turns
+    // that into a silent no-op. A continuation with no stall affordance is invisible
+    // everywhere else, which is why it is measured through the injected timer rather
+    // than through a sleep.
+    const opened: number[] = [];
+    const closed: unknown[] = [];
+    const live = (): number => opened.length - closed.length;
+
+    const { runtime } = harness({
+      steps: askEnvThenAnswer("gelesen"),
+      overrides: { tools: [readTool] },
+      setStallTimer: (_callback, ms) => {
+        opened.push(ms);
+        return opened.length;
+      },
+      clearStallTimer: (handle) => {
+        closed.push(handle);
+      },
+    });
+
+    const approvalId = await park(runtime);
+    expect(live(), "no stall window while a human decides").toBe(0);
+    const openedWhileParked = opened.length;
+
+    await runtime.answerApproval({ approvalId: approvalId ?? "", approved: true });
+
+    // The resume armed it — more than once, because `approval-answered` and the
+    // approved call's `tool-result` both open a window.
+    expect(opened.length).toBeGreaterThan(openedWhileParked);
+    // And the finished turn released it, so a released turn leaves no timer behind.
+    expect(live(), "no stall window after the turn is over").toBe(0);
+  });
+
+  it("answers a refusal the same way, and the turn finishes", async () => {
+    // `Plan.md` §7.6: a refusal is a readable answer, not a malfunction. The two
+    // answers take the same code path in `AgentTurn`, so the runtime must treat them
+    // the same way too — a runtime that only released the turn for `approved: true`
+    // would park forever on a "nein".
+    const { runtime, events } = parkedHarness("verstanden");
+    const approvalId = await park(runtime);
+
+    const resumed = await runtime.answerApproval({ approvalId: approvalId ?? "", approved: false });
+
+    expect(resumed?.outcome).toBe("succeeded");
+    // The tool did **not** run. A denial that still executed the call would be the
+    // security bug §7.6 exists to prevent.
+    expect(
+      events.some((event) => event.kind === "agent" && event.event.type === "tool-output-denied"),
+    ).toBe(true);
+  });
+
+  it("releases the turn when the answer matches no open approval", async () => {
+    // A second click on a card that was already answered. `respondToApproval` answers
+    // `undefined` — nothing ran — and holding the turn open would re-create the
+    // dead end this path exists to end.
+    const { runtime } = parkedHarness("gelesen");
+    await park(runtime);
+
+    const result = await runtime.answerApproval({ approvalId: "gibt-es-nicht", approved: true });
+
+    expect(result).toBeUndefined();
+    await expect(runtime.send({ prompt: "weiter" })).resolves.toMatchObject({ outcome: "succeeded" });
+  });
+
+  it("parks a second time when the continuation asks about another call", async () => {
+    // `AgentTurn.#continue` runs the approved call and then hits a second one, so a
+    // park is not a one-shot. A runtime that released the turn on the first result
+    // would leave the *second* card unanswerable, and the failure would look exactly
+    // like the bug this block fixed — one card further along.
+    const { runtime } = harness({
+      steps: [
+        [...toolCallParts({ toolCallId: "call_1", toolName: "read", input: { path: ".env" } }), finishPart("tool-calls")],
+        [...toolCallParts({ toolCallId: "call_2", toolName: "read", input: { path: ".env.local" } }), finishPart("tool-calls")],
+        [...textParts("t1", "beides gelesen"), finishPart()],
+      ],
+      overrides: { tools: [readTool] },
+    });
+
+    const first = await park(runtime);
+    const second = await runtime.answerApproval({ approvalId: first ?? "", approved: true });
+
+    expect(second?.outcome).toBe("awaiting-approval");
+    expect(second?.openApprovals).toHaveLength(1);
+    // Still the same turn, still blocked, still answerable.
+    expect(runtime.getState().status).toBe("idle");
+    await expect(runtime.send({ prompt: "nein" })).rejects.toMatchObject({ code: "turn-busy" });
+
+    const third = await runtime.answerApproval({ approvalId: second?.openApprovals[0]?.approvalId ?? "", approved: true });
+    expect(third?.outcome).toBe("succeeded");
+    expect(runtime.getState().status).toBe("idle");
+  });
+
+  it("releases the turn when the continuation fails, rather than holding it open", async () => {
+    // A turn nobody can finish is the dead end this block exists to end, and a
+    // continuation that throws is one. So a failed continuation is classified
+    // **and** released — the opposite of the parked branch, and the one a
+    // `releaseTurn()`-less mutation gets wrong in the direction of "looks fine,
+    // never recovers".
+    //
+    // The failure is a **thrown** `doStream`, not a `finish` part carrying
+    // `raw: "error"`: §5.4's terminal-event check is `rawFinishReason !== undefined`,
+    // so a finish part with a reason is a *clean* finish and the turn would succeed.
+    // `mockModel`'s `failAt` exists for exactly that distinction.
+    const { runtime } = harness({
+      steps: [
+        [...toolCallParts({ toolCallId: "call_env", toolName: "read", input: { path: ".env" } }), finishPart("tool-calls")],
+      ],
+      overrides: { tools: [readTool] },
+      // The second `doStream` — the continuation — throws.
+      failAt: { call: 1, error: new TypeError("Verbindung weg") },
+    });
+    const approvalId = await park(runtime);
+
+    const result = await runtime.answerApproval({ approvalId: approvalId ?? "", approved: true });
+
+    expect(result?.outcome).toBe("failed");
+    expect(runtime.getState().status).toBe("idle");
+    // Released: a new turn is possible. A held turn would reject this with
+    // `turn-busy` and the session would be stuck behind a card nobody can answer.
+    await expect(runtime.send({ prompt: "neu" })).resolves.toMatchObject({ outcome: expect.any(String) });
   });
 });

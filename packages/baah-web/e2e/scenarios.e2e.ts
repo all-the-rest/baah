@@ -42,20 +42,22 @@
  * `harness-self-test.e2e.ts`, which fetches with its own `parseSse` and never goes
  * through the app's provider.
  *
- * ## Two scenarios cannot pass yet, and both say why in the test
+ * ## The two `test.fail` tests, and why there are none left
  *
- * A scenario that is quietly weakened is worse than one that is red, so neither of
- * these is deleted and neither is asserted "green":
+ * Both were real assertions, and both were failing for one defect: `runTurn`'s
+ * `finally` in `src/runtime/index.ts` cleared the `AgentTurn` reference even when the
+ * turn *parked* on an approval, so `answerApproval` always threw `turn-busy` and
+ * `Plan.md` §7.6's pause-and-resume could not happen through `BaahRuntime`. They
+ * were encoded as `test.fail` because they are **not** to be deleted and **not** to
+ * be asserted "green": they run, they count as neither passing nor skipped, and they
+ * flip the suite red the moment the defect is fixed. That has happened, so they are
+ * real tests now — leaving them as `test.fail` would have been a silent pass.
  *
- * 1. **The approval resume is unreachable.** `runTurn`'s `finally` clears the
- *    `AgentTurn` reference even when the turn *parked* on an approval, so
- *    `answerApproval` always throws `turn-busy` and `Plan.md` §7.6's resume cannot
- *    happen. `test.fail`, with the full argument at the test.
- * 2. **A `200` carrying an error JSON is classified as a protocol error.** The SDK
- *    consumes the body of a streamed request with an event-source handler, so the
- *    engine never sees the error and the retryable/protocol decision follows. The
- *    test pins the measured request count, so the number changes when the defect is
- *    fixed.
+ * The third scenario, "a `200` carrying an error JSON", is a genuine finding and
+ * stays a measured assertion: the SDK consumes the body of a streamed request with
+ * an event-source handler, so the engine never sees the error and the
+ * retryable/protocol decision follows. The test pins the measured request count, so
+ * the number changes when the defect is fixed.
  *
  * ## The two assertions that are load-bearing
  *
@@ -79,7 +81,16 @@
  * rather than hoped for with a `sleep(500)`.
  */
 import { expect, test } from "./support/fixtures.ts";
-import { openConfiguredApp, sendPrompt, toolCard, toolCardState, transcriptText, waitForApp, waitForTurnIdle } from "./support/app.ts";
+import {
+  openConfiguredApp,
+  sendPrompt,
+  toolCard,
+  toolCardState,
+  transcriptText,
+  waitForApp,
+  waitForStoredTranscript,
+  waitForTurnIdle,
+} from "./support/app.ts";
 import { CHAT_COMPLETIONS_PATH, PROVIDER_BASE_URL } from "./support/provider.ts";
 import { TEST_IDS } from "../src/lib/testids.ts";
 // The card's own copy, imported rather than retyped. `scenarios.e2e.ts` already
@@ -109,6 +120,8 @@ test.describe("§15.6 — reiner Text-Stream", () => {
     await sendPrompt(app, PROMPT);
 
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
     const text = await transcriptText(app);
     expect(text).toContain("Hallo aus dem Fake");
     // The provider prompt is on screen, which proves the turn actually ran rather
@@ -125,6 +138,8 @@ test.describe("§15.6 — reiner Text-Stream", () => {
     await openConfiguredApp(app);
     await sendPrompt(app, PROMPT);
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
 
     await expect(app.locator(`[data-testid="${TEST_IDS.turnStatusOutcome}"]`)).toHaveAttribute(
       "data-baah-outcome",
@@ -150,6 +165,8 @@ test.describe("§15.6 — Stream mit Tool-Call, Tool OK, dann Text", () => {
     await sendPrompt(app, PROMPT);
 
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
 
     // The card is in the transcript, in the finished state, with the tool's name.
     await expect(toolCard(app, toolCallId)).toBeVisible();
@@ -175,6 +192,8 @@ test.describe("§15.6 — Stream mit Tool-Call, Tool OK, dann Text", () => {
     await openConfiguredApp(app);
     await sendPrompt(app, PROMPT);
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
 
     const second = provider.requests.filter((entry) => entry.url.endsWith(CHAT_COMPLETIONS_PATH))[1];
     const body = JSON.stringify(second?.body ?? {});
@@ -201,6 +220,8 @@ test.describe("§15.6 — Tool-Call mit output-error", () => {
     await openConfiguredApp(app);
     await sendPrompt(app, PROMPT);
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
 
     const card = toolCard(app, toolCallId);
     await expect(card).toBeVisible();
@@ -228,6 +249,8 @@ test.describe("§15.6 — Tool-Call mit output-error", () => {
     await openConfiguredApp(app);
     await sendPrompt(app, PROMPT);
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
 
     await expect(app.locator(`[data-testid="${TEST_IDS.outcomeUnknown}"]`)).toHaveCount(0);
   });
@@ -284,38 +307,25 @@ test.describe("§15.6 — Approval-Pause und -Fortsetzung", () => {
   });
 
   /**
-   * ## The resume half of §15.6 is a `test.fail`, and why that is not a dodge
+   * The resume half of §15.6. This was a `test.fail`; it is a real assertion now.
    *
-   * **The defect:** `runTurn`'s `finally` in `src/runtime/index.ts:765-771` clears
-   * `turn` unconditionally — including when the turn **parked** on an approval. The
-   * engine resolved `run()` with `outcome: "awaiting-approval"` precisely so it
-   * *could* be continued, and `AgentTurn.respondToApproval` exists for that. But
-   * `answerApproval` opens with `if (turn === undefined) throw new RuntimeError
-   * ("turn-busy", …)`, so **every** answer fails with
-   * "Die Freigabe konnte nicht übertragen werden: RuntimeError" and the turn stays
-   * parked forever. §7.6's pause-and-resume is unreachable through `BaahRuntime`.
+   * The defect it pinned: `runTurn`'s `finally` cleared `turn` **unconditionally**,
+   * including when the engine resolved `run()` with `outcome: "awaiting-approval"` —
+   * which it does *precisely* so the turn can be continued. `answerApproval` opens
+   * with `if (turn === undefined) throw new RuntimeError("turn-busy", …)`, so every
+   * click failed and the turn stood parked forever. `test.fail` reported 0 failures
+   * and 0 skips while still running the assertions, and flipped the suite red the
+   * moment the runtime was fixed — which is why it was pinned rather than deleted.
+   * **Leaving it as `test.fail` after the fix would have been a silent pass.**
    *
-   * **Why this is a defect and not a design:** the same file's own
-   * `SendOptions.prompt` documents "an empty prompt continues an approval pause",
-   * and `AgentTurn.#runAttempt` implements that half (`prompt === ""` appends no
-   * user message) — but the continuation is reached **only** through
-   * `respondToApproval`, on the instance the `finally` threw away.
-   *
-   * **Why it is not worked around here:** the obvious app-level workaround is to
-   * re-send the answered transcript with an empty prompt. That would produce a green
-   * run and a false product: `ToolLoopAgent` is constructed without
-   * `sendAutomaticallyWhen`, so it would ask the model to continue **without ever
-   * running the approved tool** — a card claiming `read .env` produced output, with
-   * no output and no read. A test that passed that way would be the lie `§15.6`
-   * exists to catch.
-   *
-   * **Ownership:** the `finally` is in `src/runtime/index.ts`, which this block may
-   * only touch for the read-port injection. So the test stays, runs, and is
-   * **expected to fail**: `test.fail` reports 0 failures and 0 skips while still
-   * executing the assertions, and it flips the whole suite red the moment the
-   * runtime is fixed — which is the point of pinning it rather than deleting it.
+   * The obvious app-level shortcut is re-sending the answered transcript with an
+   * empty prompt. It would go green and be a false product: `ToolLoopAgent` is
+   * built without `sendAutomaticallyWhen`, so it would ask the model to continue
+   * **without ever running the approved tool** — a card claiming `read .env`
+   * produced output, with no output and no read. The last two assertions are what
+   * that shortcut cannot fake.
    */
-  test.fail("approving resumes the paused turn exactly once", async ({ app, provider }) => {
+  test("approving resumes the paused turn exactly once, and the approved tool really runs", async ({ app, provider }) => {
     const toolCallId = "call_env";
     await provider.script([
       { reply: { kind: "sse", turn: chatToolCallTurn({ toolCallId, toolName: "read", input: { path: ".env" } }) } },
@@ -329,14 +339,86 @@ test.describe("§15.6 — Approval-Pause und -Fortsetzung", () => {
     await card.locator(`[data-testid="${TEST_IDS.approvalAllow}"]`).click();
 
     // `waitForTurnIdle` cannot be used here even once the resume works: a turn
-    // parked on an approval is already `status: "idle"` — the engine resolved `run()`
-    // with `awaiting-approval` and `answerApproval` never publishes `running` — so
-    // the wait was satisfied before the resume had even started. The request count is
-    // the fact, and `expect.poll` waits for it.
+    // parked on an approval reads as `idle` — nothing is running, and
+    // `outcome: "awaiting-approval"` is what the banner renders — so the wait would
+    // be satisfied before the resume had even started. The request count is the
+    // fact, and `expect.poll` waits for it.
     await expect.poll(() => provider.countFor(CHAT_COMPLETIONS_PATH)).toBe(2);
     await expect(app.locator(`[data-testid="${TEST_IDS.transcript}"]`)).toContainText(
       "Ich habe die Konfiguration nicht gelesen.",
     );
+    // The card is gone, so the turn is not still parked on a decision.
+    await expect(card).toHaveCount(0);
+
+    /**
+     * The half the empty-prompt shortcut cannot fake.
+     *
+     * `.env` does not exist in the sandbox workspace, so the read **fails** — and
+     * that is exactly the point: a resume that asked the model again without running
+     * the tool would leave the card at `input-available` for ever, because nothing
+     * would ever report a result. Reaching `Fehlgeschlagen` is proof the tool ran,
+     * and the count above is proof it ran **once** — a second execution would need a
+     * third request.
+     */
+    expect(await toolCardState(app, toolCallId)).toBe("Fehlgeschlagen");
+    // And the model really was told: the call and its result are in the second body.
+    const second = provider.requests.filter((entry) => entry.url.endsWith(CHAT_COMPLETIONS_PATH))[1];
+    expect(JSON.stringify(second?.body ?? {})).toContain(toolCallId);
+  });
+
+  /**
+   * The second path for the `status: "running"`-on-resume rule, and the only place
+   * in the repo where the status is observed **while** a continuation is in flight.
+   *
+   * The unit test pins the transition. This pins the *window*, and it gets there by
+   * a different mechanism on purpose: the continuation's requests are **aborted**, so
+   * the `fetch` never resolves and the turn is provably still running for as long as
+   * the assertion takes. (`{ kind: "abort" }` is the harness's transport failure; the
+   * alternative — holding a stream open with the pacer — cannot gate the *second*
+   * request alone, because the pacer's budget is page-global and is counted against
+   * the previous stream.)
+   *
+   * A runtime that published `running` for one tick and `idle` afterwards would
+   * satisfy the unit test and leave the status bar lying for the whole continuation,
+   * which is the part a user is looking at.
+   */
+  test("the status bar says the turn is running while the continuation is in flight", async ({
+    app,
+    provider,
+  }) => {
+    const toolCallId = "call_env_running";
+    await provider.script([
+      { reply: { kind: "sse", turn: chatToolCallTurn({ toolCallId, toolName: "read", input: { path: ".env" } }) } },
+      // Every continuation request dies at the transport. The engine classifies that
+      // as retryable and backs off, so the turn stays in flight across several
+      // attempts — which is the window under test.
+      ...Array.from({ length: 6 }, () => ({
+        path: CHAT_COMPLETIONS_PATH,
+        reply: { kind: "abort" as const, errorCode: "failed" },
+      })),
+    ]);
+    await openConfiguredApp(app);
+    await sendPrompt(app, PROMPT);
+
+    const card = app.locator(`[data-testid="${TEST_IDS.approvalCard}"]`);
+    await expect(card).toBeVisible();
+    // Parked: nothing is running, and the card is what waits.
+    await expect(app.locator(`[data-testid="${TEST_IDS.turnStatus}"][data-baah-status="idle"]`)).toBeVisible();
+
+    await card.locator(`[data-testid="${TEST_IDS.approvalAllow}"]`).click();
+
+    // The continuation's first request went out. A poll, not a sleep: the assertion
+    // cannot pass before the request exists.
+    await expect.poll(() => provider.countFor(CHAT_COMPLETIONS_PATH), { timeout: 10_000 }).toBeGreaterThan(1);
+    // And the badge says the turn is running. **This is the mutation "publish `idle`
+    // on the resume".**
+    await expect(
+      app.locator(`[data-testid="${TEST_IDS.turnStatus}"][data-baah-status="running"]`),
+    ).toBeVisible();
+    // The turn is still in flight, not finished-with-an-error: the classification of
+    // an aborted request is retryable, and `Plan.md` §5.4's own rule is that a turn
+    // which has not run out of attempts is still running.
+    await expect(app.locator(`[data-testid="${TEST_IDS.turnStatus}"][data-baah-status="idle"]`)).toHaveCount(0);
   });
 
   test("a read of a non-secret path never asks", async ({ app, provider }) => {
@@ -350,6 +432,8 @@ test.describe("§15.6 — Approval-Pause und -Fortsetzung", () => {
     await openConfiguredApp(app);
     await sendPrompt(app, PROMPT);
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
 
     await expect(app.locator(`[data-testid="${TEST_IDS.approvalCard}"]`)).toHaveCount(0);
     expect(provider.countFor(CHAT_COMPLETIONS_PATH)).toBe(2);
@@ -359,12 +443,12 @@ test.describe("§15.6 — Approval-Pause und -Fortsetzung", () => {
    * The other half of `§7.5`'s reject: a refusal the model **reads** and routes
    * around (`§7.6`), not a malfunction it retries.
    *
-   * `test.fail` for the same reason as the allow case above, and the same one
-   * defect: `answerApproval` cannot reach the parked turn, so no answer of any kind
-   * gets past the card. The card, the three answers and the loop stopping are proven
-   * by the first test in this block; what is left here is the resume.
+   * `test.fail` for the same reason as the allow case above, and the same one defect:
+   * `answerApproval` could not reach the parked turn, so no answer of any kind got
+   * past the card. The card, the three answers and the loop stopping are proven by
+   * the first test in this block; what is left here is the resume.
    */
-  test.fail("rejecting produces `tool-output-denied` and no retry of the refused call", async ({ app, provider }) => {
+  test("rejecting produces `tool-output-denied` and no retry of the refused call", async ({ app, provider }) => {
     const toolCallId = "call_env_deny";
     await provider.script([
       { reply: { kind: "sse", turn: chatToolCallTurn({ toolCallId, toolName: "read", input: { path: ".env" } }) } },
@@ -408,6 +492,8 @@ test.describe("§15.6 — 5xx mit Backoff", () => {
     await sendPrompt(app, PROMPT);
 
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
 
     // Three requests: two refused, one answered. This is the assertion that
     // matters — a "retry" that only re-renders is not a retry.
@@ -438,6 +524,8 @@ test.describe("§15.6 — 401 ohne Retry", () => {
     await sendPrompt(app, PROMPT);
 
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
 
     // The request count is the whole assertion: one, not two.
     expect(provider.countFor(CHAT_COMPLETIONS_PATH)).toBe(1);
@@ -482,6 +570,8 @@ test.describe("§15.6 — 200 mit Fehler-JSON", () => {
     await sendPrompt(app, PROMPT);
 
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
 
     const outcome = app.locator(`[data-testid="${TEST_IDS.turnStatusOutcome}"]`);
     await expect(outcome).toBeVisible();
@@ -509,6 +599,8 @@ test.describe("§15.6 — Abbruch mitten im Stream", () => {
     await sendPrompt(app, PROMPT);
 
     await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
 
     const text = await transcriptText(app);
     // The part that arrived before the cut is still on screen.
@@ -596,12 +688,77 @@ test.describe("the app the scenarios run against", () => {
     await expect(app.locator('[data-baah-composer-disabled="true"]')).toContainText("API-Key");
   });
 
-  test("the in-memory store's limit is stated on the screen, not discovered on reload", async ({ app }) => {
-    // `Plan.md` §1's DoD says the transcript must survive a reload. This build does
-    // not, and a user who finds that out by reloading has lost their work — so the
-    // statement is in the first screen a user reads.
+  test("the transcript survives a reload — §1's DoD 4, against real SQLite in OPFS", async ({ app, provider }) => {
+    /**
+     * The persistence requirement, as a user-visible fact.
+     *
+     * Two things have to be true for this to pass, and both were broken:
+     *
+     * 1. **The database is durable.** The previous build used
+     *    `createMemoryDatabase()` because `openDatabase()`'s worker URL was emitted
+     *    as untranspiled TypeScript. Fixed in `components/lib/runtime.ts` with Vite's
+     *    `?worker&url` form; the compiled worker is `dist/assets/worker-*.js` and the
+     *    `.wasm` beside it.
+     * 2. **The session is reachable.** A durable row nothing can query has not
+     *    survived a reload, and the app minted a fresh `sessionId` on every document
+     *    load. Fixed by `lib/ids.ts`'s `resolveSessionId`.
+     *
+     * Fix either one and this test fails, which is the point: a memory database and
+     * a new session id both render an empty transcript after the reload, and only
+     * the *pair* of them is what the previous build shipped.
+     */
+    await provider.script([{ reply: { kind: "sse", turn: chatTextTurn("Das übersteht jetzt einen Reload.") } }]);
     await openConfiguredApp(app);
-    await expect(app.locator('[data-baah-ephemeral-banner="true"]')).toBeVisible();
+    await sendPrompt(app, PROMPT);
+    await waitForTurnIdle(app);
+    // The turn is idle; the stored read is a separate round trip to the worker.
+    await waitForStoredTranscript(app);
+
+    const before = await transcriptText(app);
+    expect(before).toContain("Das übersteht jetzt einen Reload.");
+    // The memory-database warning is gone with the memory database. Asserted
+    // negatively on purpose: a build that keeps the banner while persisting would
+    // be telling the user something false, and one that removed the banner while
+    // still using a `Map` is what this test exists to catch.
+    await expect(app.locator('[data-baah-ephemeral-banner="true"]')).toHaveCount(0);
+    await expect(app.locator('[data-baah-boot-failure="true"]')).toHaveCount(0);
+
+    // The reload. Not a new tab: the same document, reloaded, which is what a user
+    // does with F5 and what §15.4's D1 asks for.
+    await app.reload();
+    await waitForApp(app);
+    // The boot opens SQLite and the read comes back from the worker. The failure mode
+    // this waits out is exactly the finding: an unusable worker URL makes
+    // `openDatabase()` reject, and `App.tsx` then shows the boot-failure screen
+    // instead of a chat.
+    await waitForStoredTranscript(app);
+
+    // The wizard is skipped by the stored settings, so the chat is straight there —
+    // and the transcript is not empty.
+    await expect(app.locator(`[data-testid="${TEST_IDS.transcript}"]`)).toBeVisible();
+    const after = await transcriptText(app);
+    // The question, the answer, and in order. A session id that did not survive
+    // would render "Noch nichts in diesem Verlauf" here.
+    expect(after).toContain("Das übersteht jetzt einen Reload.");
+    expect(after).toContain(PROMPT);
+    expect(after).not.toContain("Noch nichts in diesem Verlauf");
+    /**
+     * The turn's outcome came back too — and the assertion is on the **stored**
+     * `idle` message (`Plan.md` §6.2), not on the status badge.
+     *
+     * The badge is `RuntimeState.outcome`, which is per-tab in-memory state and is
+     * `undefined` on a fresh document by definition. Asserting it here would be
+     * asserting that a reload did not happen. The `Turn-Ende: idle` row is the part
+     * that is in SQLite, so its presence after a reload is the durable claim — and
+     * it is a third message in the transcript, after the question and the answer,
+     * which is the ordering `seq` gives it.
+     */
+    expect(after).toContain("Turn-Ende: idle");
+    // The outcome badge is genuinely absent, for the reason above — said here so a
+    // future change that makes it survive a reload knows this was considered.
+    await expect(app.locator(`[data-testid="${TEST_IDS.turnStatusOutcome}"]`)).toHaveCount(0);
+    // Nothing was re-requested: the reload restored, it did not regenerate.
+    expect(provider.countFor(CHAT_COMPLETIONS_PATH)).toBe(1);
   });
 
   test("the wizard is skippable, and the app says what a turn is missing", async ({ app }) => {

@@ -77,19 +77,33 @@ export function Transcript(props: TranscriptProps) {
          * store rejects rather than answering with an empty transcript precisely so
          * this distinction can be made, and collapsing the two is the exact lie the
          * union exists to prevent.
+         *
+         * A **pending** read is a fourth thing and is not in that union at all: it is
+         * a request outstanding, so it gets a neutral line rather than the warning
+         * panel. The in-memory build never showed it because the read was a resolved
+         * promise; real SQLite makes it a `postMessage` round trip to the worker, and
+         * a loading state drawn as a warning is an error the user is asked to act on.
          */}
-        {model.readProblem !== undefined ? (
+        {model.pending && (
+          <p data-baah-read="pending" className="p-4 text-center text-sm opacity-70">
+            Der Verlauf wird geladen …
+          </p>
+        )}
+
+        {model.readProblem !== undefined && (
           <p
             data-baah-read="problem"
             className="rounded-box border border-warning/50 bg-warning/10 p-3 text-sm"
           >
             {model.readProblem}
           </p>
-        ) : model.empty ? (
+        )}
+
+        {!model.pending && !model.readProblem && model.empty && (
           <p data-testid={TEST_IDS.transcriptEmpty} className="p-4 text-center text-sm opacity-70">
             Noch nichts in diesem Verlauf.
           </p>
-        ) : null}
+        )}
 
         {model.truncated && (
           <p className="mb-2 rounded-box border border-base-300 p-2 text-xs opacity-80">
@@ -105,7 +119,25 @@ export function Transcript(props: TranscriptProps) {
               id={entry.id}
               role={entry.role}
               parts={entry.parts}
-              approval={approval}
+              /**
+               * **No card on a stored row, and the reason is that it could not
+               * work.**
+               *
+               * An approval is answerable only while the `AgentTurn` that opened it
+               * is alive — `BaahRuntime.answerApproval` answers a card by
+               * `AgentTurn.respondToApproval`, and after a reload that instance is
+               * gone, so every button on a stored card would throw `turn-busy`. The
+               * live fold is therefore the only source of an *open* card.
+               *
+               * Passing the card here as well also **rendered it twice** for a turn
+               * that is merely parked: the same `toolCallId` is in the live fold and
+               * in the stored row (the engine persists the `approval-requested` part
+               * itself), and the card is matched by `toolCallId` — so one approval,
+               * two identical sets of buttons, and a strict-mode violation in the
+               * E2E suite. The duplication is the symptom; the dead buttons after a
+               * reload are the defect.
+               */
+              approval={undefined}
               onAnswer={props.answerApproval}
               onAlways={props.grantAlways}
             />

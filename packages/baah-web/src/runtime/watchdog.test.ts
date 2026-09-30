@@ -95,7 +95,7 @@ function event(type: AgentEvent["type"]): AgentEvent {
     case "tool-output-denied":
       return { type, toolCallId: "c1", toolName: "write", reason: undefined };
     case "approval-requested":
-      return { type, approvalId: "a1", toolCallId: "c1", toolName: "write", reason: undefined };
+      return { type, approvalId: "a1", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, reason: undefined };
     case "approval-answered":
       return { type, approvalId: "a1", approved: true };
     case "step-end":

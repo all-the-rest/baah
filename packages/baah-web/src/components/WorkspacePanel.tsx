@@ -32,8 +32,6 @@ export interface WorkspacePanelProps {
   readonly mode: "opfs" | "memory" | "local-directory";
   readonly onOpen: () => void;
   readonly onRefresh: () => void;
-  /** `true` when the store is in memory, so the transcript dies on reload. */
-  readonly ephemeralTranscript: boolean;
 }
 
 export function WorkspacePanel(props: WorkspacePanelProps) {
@@ -70,17 +68,12 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
 
       <p className="text-xs opacity-80">{modeExplanation(props.mode)}</p>
 
-      {props.ephemeralTranscript && (
-        // Not a footnote. `Plan.md` §1's DoD says the transcript must survive a
-        // reload, this build does not, and a user who finds that out by reloading
-        // has lost their work. The statement is in the panel they open to look at
-        // their setup.
-        <p data-baah-ephemeral="true" className="rounded-box border border-warning/60 bg-warning/10 p-2 text-xs">
-          Der Verlauf liegt in diesem Build im Arbeitsspeicher: <strong>ein Reload löscht ihn</strong>.
-          Exportiere die Einstellungen, wenn du sie mitnehmen willst — der Verlauf selbst ist davon nicht
-          erfasst.
-        </p>
-      )}
+      {/* The "der Verlauf übersteht keinen Reload" warning that used to live here is
+          gone, and the panel's docstring is the reason it can be: this component is
+          about where **workspace writes** land (§5.3), and that question is still
+          open. The **transcript** was a different fact — SQLite in OPFS, durable —
+          and a second copy of a warning that is no longer true is worse than no
+          warning at all. */}
 
       <div className="flex flex-wrap gap-2">
         <button

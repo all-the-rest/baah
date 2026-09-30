@@ -33,13 +33,25 @@
  * 3. **Invent a fourth part type.** `Plan.md` §6.1 allows three. A file diff is
  *    tool metadata (`Plan.md` §14.3), so it is rendered by the tool card, not
  *    here.
+ *
+ * ## Which half of the tool-card rule is where
+ *
+ * `toolStateForResult` and `toolResultFailure` are imported from
+ * `@all-the.rest/baah-core`, not from `parts.ts`, and `parts.ts` no longer declares
+ * them either. They are the **engine's**, because the engine is what writes a tool
+ * part: `TurnStore.upsertPart` builds the row with `toolPartContent`, which is built
+ * on these two. This file and `parts.ts` are the *readers* of that row, and the
+ * reason they call the same function rather than re-implementing it is stated in
+ * both headers and is the short version of `Plan.md` §16.1: two writers for one row
+ * drift, and here the two are the row and the card drawn from it.
  */
-import type { AgentEvent, TurnOutcome } from "@all-the.rest/baah-core";
+import { toolResultFailure, toolStateForResult, type AgentEvent, type TurnOutcome } from "@all-the.rest/baah-core";
+import type { Transcript } from "@all-the.rest/baah-storage";
 import type { UIMessage } from "ai";
 
 import { TEST_IDS } from "../../lib/testids.ts";
-import type { TranscriptRead, TranscriptReadResult } from "../../runtime/index.ts";
-import { renderPart, fileDiffs, toolResultFailure, toolStateForResult, toolStateLabel, truncationNotice, type RenderPart, type ToolCardState } from "./parts.ts";
+import type { TranscriptRead } from "../../runtime/index.ts";
+import { renderPart, fileDiffs, toolStateLabel, truncationNotice, type RenderPart, type ToolCardState } from "./parts.ts";
 import { asDisplayText } from "./trust.ts";
 
 /* ------------------------------------------------------------------ */
@@ -65,12 +77,25 @@ export interface StoredMessage {
  * position in the message is kept — dropping it would make a live turn look
  * empty, which is the failure `Plan.md` §16.1 was written against.
  */
-export function storedMessages(transcript: TranscriptReadResult): StoredMessage[] {
+export function storedMessages(transcript: Transcript): StoredMessage[] {
   return transcript.messages
     .map((message) => ({
       id: message.id,
       role: message.role,
-      outcome: asTurnOutcome(message.outcome),
+      // **Straight through, not re-narrowed.** `outcome` is `TurnOutcome | null` and
+      // `role` is `MessageRole` because they are `baah-storage`'s own types now
+      // (`Transcript`), and that package validates both at its boundary —
+      // `messageRowSchema.outcome: turnOutcomeSchema.nullable()` in `protocol.ts`.
+      // A second `switch` here would be a second validation of a value the producer
+      // has already validated, and the *test* for it needed a cast to construct the
+      // impossible value it described.
+      //
+      // That is **not** true of the `data` blob, which the port hands over as raw
+      // JSON text on purpose (`§16.1`): nothing validates what is inside it, so
+      // `normaliseStoredState` below still has to be defensive about a `state` string
+      // it did not type. The line is drawn there, and it is drawn because that is
+      // where the trust boundary is.
+      outcome: message.outcome ?? undefined,
       error: message.error ?? undefined,
       parts: message.parts
         .map((part) => renderStoredPart(part.type, part.contentText, part.status, part.data))
@@ -79,10 +104,6 @@ export function storedMessages(transcript: TranscriptReadResult): StoredMessage[
     // An `idle` outcome message with no parts is a real thing (§6.2) and is kept:
     // it is the only place a turn's outcome is recorded.
     .filter((message) => message.role !== "idle" || message.outcome !== undefined || message.parts.length > 0);
-}
-
-function asTurnOutcome(value: string | null): TurnOutcome | undefined {
-  return value === "succeeded" || value === "failed" || value === "interrupted" ? value : undefined;
 }
 
 /**
@@ -412,12 +433,14 @@ export function applyAgentEvent(live: LiveTurn, event: AgentEvent): LiveTurn {
         // decide the risk class, so the placeholder would make a secret read look
         // like an unknown one.
         //
-        // The **input** is not set here, because the `AgentEvent` union does not
-        // carry it: `loop.ts:142` declares four fields and `OpenApproval` has a
-        // fifth. On the measured path the input arrives anyway, because
-        // `@ai-sdk/openai-compatible@3` emits the tool's input parts before the
-        // pause — but nothing in `ai`'s types promises it, so `ApprovalCard` also
-        // takes it from the runtime snapshot. See `lib/approval.ts`.
+        // The **input** is not set here, and the reason is that this file no longer
+        // has to look for it. The `approval-requested` event intersects core's
+        // `OpenApproval` (`packages/baah-core/src/agent/loop.ts`), so the input the
+        // card has to show is part of the event's own type and cannot drift away
+        // from it again. `ApprovalCard` still reads the input from the runtime
+        // snapshot, where the `tool-call` event put it — the two are the same value
+        // and the snapshot lookup is the path that is pinned by tests. See
+        // `lib/approval.ts`.
         tools: upsertTool(live.tools, event.toolCallId, (tool) => ({
           ...tool,
           toolName: event.toolName,
@@ -556,8 +579,27 @@ export interface TranscriptModel {
   readonly empty: boolean;
   /** The store holds more messages than were read. */
   readonly truncated: boolean;
-  /** Set when the transcript could not be read. Never an empty transcript. */
+  /**
+   * Set when the transcript **could not** be read. Never an empty transcript, and
+   * never a read that has not happened yet — see {@link TranscriptModel.pending}.
+   */
   readonly readProblem: string | undefined;
+  /**
+   * The read has not come back yet.
+   *
+   * ## A third state, and the reason this is not `readProblem`
+   *
+   * `unavailable` and `failed` are both **problems**, and both render as a
+   * warning. A read in flight is neither: it is a request outstanding, and the
+   * answer is on its way. Rendering it with the warning panel is how a normal
+   * loading state becomes an error the user is asked to act on.
+   *
+   * This became visible when the app moved from `createMemoryDatabase()` to real
+   * SQLite: the read is a `postMessage` round trip to the worker rather than a
+   * resolved promise, so the window is now long enough for a human to see it. The
+   * in-memory build hid the state by being fast, which is not a design.
+   */
+  readonly pending: boolean;
   /** `true` when the live turn is contributing parts. */
   readonly live: boolean;
 }
@@ -571,8 +613,10 @@ export function transcriptModel(input: {
   let readProblem: string | undefined;
   let stored: readonly StoredMessage[] = [];
 
+  const pending = input.read === undefined;
+
   if (input.read === undefined) {
-    readProblem = "Der Verlauf wurde noch nicht gelesen.";
+    // Nothing to report and nothing to claim. See {@link TranscriptModel.pending}.
   } else if (input.read.kind === "unavailable") {
     readProblem = input.read.reason;
   } else if (input.read.kind === "failed") {
@@ -596,11 +640,13 @@ export function transcriptModel(input: {
 
   return {
     entries,
-    // "Nothing was here" needs both: a read that *succeeded*, and no live parts.
-    // A failed read with a live turn must not claim the session is empty either.
-    empty: entries.length === 0 && readProblem === undefined,
+    // "Nothing was here" needs all three: a read that *succeeded*, no live parts,
+    // and no read still in flight. A pending read must not claim the session is
+    // empty, and a failed one must not either.
+    empty: entries.length === 0 && readProblem === undefined && !pending,
     truncated,
     readProblem,
+    pending,
     live: live.length > 0,
   };
 }

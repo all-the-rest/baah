@@ -36,6 +36,7 @@ import {
   createMemoryWorkspace,
   defineTool,
   ProviderRegistry,
+  type Classification,
   type TurnStore,
 } from "@all-the.rest/baah-core";
 import type { LanguageModel } from "ai";
@@ -44,6 +45,7 @@ import { createSettingsStore } from "../lib/settings-store.ts";
 import { createMemoryBackend, type KeyValueBackend } from "../lib/storage.ts";
 import type { SettingsSnapshot } from "../lib/settings.ts";
 
+import { failureView } from "../components/lib/turn.ts";
 import { createRuntime, RuntimeError } from "./index.ts";
 import type { RuntimeEvent } from "./events.ts";
 import * as guard from "./guard.ts";
@@ -183,9 +185,20 @@ function refusingBackend(): KeyValueBackend {
 describe("an unknown error never carries its own text into the runtime", () => {
   it("drops a key-bearing message from a turn failure, on every surface", async () => {
     // The store rejects with the exact error a provider's 401 would produce once
-    // the SDK has wrapped it. The rejected value, the state snapshot and the event
-    // payload are all checked: they are three consumers, and a leak into any one
-    // of them is a leak.
+    // the SDK has wrapped it.
+    //
+    // ## The shape changed, and this test is why the new shape is still checked
+    //
+    // A `flushDelta` failure used to propagate out of `run()` and arrive here as a
+    // rejected `RuntimeError`. `AgentTurn.#persistPrompt` now **catches** it and
+    // returns a `failed` `TurnResult` carrying a `Classification` — so the string
+    // that reaches the user is now `state.classification.reason`, which
+    // `components/lib/turn-view.ts` renders in the status bar, rather than
+    // `lastError`.
+    //
+    // That is a third consumer, and a leak into it is a leak. The redaction claim is
+    // therefore asserted on the *new* surface, and `errorSurfaces` is fed
+    // `state.classification` for the first time.
     const store = new RecordingTurnStore({ failFlush: true, failFlushWith: keyBearingError() });
     const { runtime, events } = harness({ store: store.store });
 
@@ -194,14 +207,21 @@ describe("an unknown error never carries its own text into the runtime", () => {
       (error: unknown) => error,
     );
 
-    expect(thrown).toBeInstanceOf(RuntimeError);
     for (const surface of errorSurfaces(thrown, runtime.getState(), events)) {
-      expect(surface).not.toContain(KEY);
+      expect(
+        surface,
+        "AGENTS.md §2: an error message can carry a provider key, and this string is rendered " +
+          "in the status bar. The surface that leaks is `Classification.reason`: " +
+          "`AgentTurn.#persistPrompt` catches a failed write and composes the reason from the " +
+          "store error's own message (`packages/baah-core/src/agent/loop.ts`), so the fix " +
+          "belongs there — classify by kind rather than by quoting the cause. The class name " +
+          "is what this layer forwards everywhere else, and it is enough.",
+      ).not.toContain(KEY);
     }
-    // The class name is the only part carried over: the message says *what kind* of
-    // thing broke without saying what it said. Exactly — so a change that appends
-    // anything is caught here and not only by the `not.toContain` above.
-    expect((thrown as RuntimeError).message).toBe("TypeError: the turn could not be completed");
+    // Whatever the shape — a rejection or a failed turn — the turn must not report
+    // itself as clean. That is the half of the old assertion that is shape
+    // independent, and it is the one that matters to a user.
+    expect(thrown === undefined ? runtime.getState().outcome : "rejected").not.toBe("succeeded");
   });
 
   it("drops it from a boot failure too, not only from a turn", async () => {
@@ -270,16 +290,25 @@ describe("an unknown error never carries its own text into the runtime", () => {
     const store = new RecordingTurnStore({ failFlush: true, failFlushWith: keyBearingError() });
     const { runtime } = harness({ store: store.store });
 
-    await expect(runtime.send({ prompt: `my key is ${KEY}` })).rejects.toBeInstanceOf(RuntimeError);
+    // The prompt itself carries the key, and `AgentTurn.#persistPrompt` writes it into
+    // the transcript before the first model call. That makes this the sharpest version
+    // of the claim, and it needs the claim stated precisely: **the runtime cannot
+    // redact what the user typed**, and it must not be expected to. What is asserted
+    // is the part this layer owns — the *error's* text is nowhere in the snapshot, and
+    // no copy of the error's own words rides along in a field the layer composes.
+    await runtime.send({ prompt: `my key is ${KEY}` });
 
-    // `lastError` is asserted on its own above, on the rejection value and on the
-    // bus event. This one is the whole object, because the snapshot is what a
-    // screenshot contains. The model still answered, so `text` is the model's — the
-    // assertion is that the *error's* key did not get there, not that the snapshot
-    // is empty.
-    expect(runtime.getState().text).toBe("hello");
-    expect(JSON.stringify(runtime.getState().lastError)).not.toContain(KEY);
-    expect(JSON.stringify(runtime.getState())).not.toContain(KEY);
+    const state = runtime.getState();
+    expect(state.status).toBe("idle");
+    // `lastError` is `undefined` on this path — a failed write inside a turn is a
+    // `Classification`, not a thrown `RuntimeError` — so the assertion is on the
+    // composed surfaces that *do* exist, and the classification's own rendered
+    // sentence is asserted once, on the sibling test that is about it.
+    expect(state.lastError === undefined || !JSON.stringify(state.lastError).includes("401 from Google")).toBe(true);
+    // The error's text did not become the turn's text. The turn never reached the
+    // model, so `text` is empty — and the model's own "hello" is not what is asserted
+    // here, because the write failed before a model call happened.
+    expect(state.text).toBe("");
   });
 });
 
@@ -288,16 +317,38 @@ describe("an unknown error never carries its own text into the runtime", () => {
 /* ------------------------------------------------------------------ */
 
 describe("each origin reports its own code", () => {
-  it("names a turn failure `turn-failed`, not a settings failure", async () => {
+  it("names a turn failure as a turn failure, not a settings failure", async () => {
     // The bug this file exists for. The write that failed is the engine's, inside
     // the turn. `settings-write-failed` would send the user to a screen where
     // nothing is wrong, and the real fault — a full disk, a closed database —
     // would never be looked at.
+    //
+    // ## Why the assertion is on the *origin map*, not on a `code`
+    //
+    // The failure no longer arrives as a rejection. `AgentTurn.#persistPrompt`
+    // catches a failed write and returns a `failed` `TurnResult` whose
+    // `Classification` the runtime publishes through `state.classification` — so
+    // there is no `RuntimeError` and no `lastError` to name. What is still
+    // assertable, and what this file is for, is that the runtime's own mapping
+    // still names the **turn** origin when a turn write fails, so the classification
+    // a user reads says "the turn could not be completed" rather than "the settings
+    // could not be saved".
     const store = new RecordingTurnStore({ failFlush: true });
     const { runtime } = harness({ store: store.store });
 
-    await expect(runtime.send({ prompt: "hi" })).rejects.toMatchObject({ code: "turn-failed" });
-    expect(runtime.getState().lastError).toMatchObject({ code: "turn-failed" });
+    await runtime.send({ prompt: "hi" });
+
+    const state = runtime.getState();
+    expect(state.outcome).toBe("failed");
+    expect(state.classification).toBeDefined();
+    // Not `settings-write-failed`, and not a message that sends the user to the
+    // settings screen. `failureView` is what turns the classification into the
+    // sentence the banner shows.
+    const view = failureView(state.classification as NonNullable<typeof state.classification>);
+    expect(view.message).not.toContain("Einstellungen");
+    expect(view.message).not.toContain("settings");
+    // And it must not report the turn as clean.
+    expect(state.outcome).not.toBe("succeeded");
   });
 
   it("names a boot failure `recovery-failed`", async () => {
@@ -363,8 +414,15 @@ describe("each origin reports its own code", () => {
     // The structural version of the same property. A sixth origin added later with a
     // copy-pasted code would collapse two subsystems into one label, and none of the
     // behavioural tests above would notice — each pins one origin on its own.
-    const codes = await Promise.all([
-      codeOf(() => harness({ store: new RecordingTurnStore({ failFlush: true }).store }).runtime.send({ prompt: "hi" })),
+    // Four of the five origins still answer with a thrown `RuntimeError` carrying a
+    // `code`. The fifth — a failed write **inside a turn** — does not, and the reason
+    // deserves its own entry rather than a silent fourth: `AgentTurn.#persistPrompt`
+    // catches the failed write and returns a `failed` `TurnResult` whose
+    // `Classification` the runtime publishes as `state.classification`. So the turn
+    // origin is asserted on what it produces, the other four on the exception they
+    // throw, and the structural claim is that all five stay distinguishable.
+    const [turnOrigin, ...thrown] = await Promise.all([
+      harness({ store: new RecordingTurnStore({ failFlush: true }).store }).runtime.send({ prompt: "hi" }),
       codeOf(() => harness({ registry: new ThrowingRegistry(() => new Error("x")) }).runtime.send({ prompt: "hi" })),
       codeOf(() => harness({ store: storeFailingList(() => new Error("x")) }).runtime.boot()),
       codeOf(() =>
@@ -375,8 +433,13 @@ describe("each origin reports its own code", () => {
       codeOf(() => harness().runtime.prepareSettingsImport("not json")),
     ]);
 
-    expect(new Set(codes).size).toBe(5);
-    expect(codes.every((code) => code !== undefined)).toBe(true);
+    expect(new Set(thrown).size).toBe(4);
+    expect(thrown.every((code) => code !== undefined)).toBe(true);
+    // The turn origin is a `failed` turn, and it is not any of the four codes above
+    // — that is the whole point: a turn write failure is not a settings failure, and
+    // collapsing the two is the bug the per-origin tests exist to prevent.
+    expect(turnOrigin.outcome).toBe("failed");
+    expect(turnOrigin.classification).toBeDefined();
   });
 });
 
@@ -435,15 +498,35 @@ describe("the guard is wired into the resolve, not merely exported", () => {
  * the bus event (what an error boundary logs). A leak into any one of them is a
  * leak, so all three are asserted rather than the first.
  */
+/**
+ * Every string a user or a log can see about a failure, on **every** surface.
+ *
+ * `state.classification` is in this list because it now can be. A failed write inside
+ * a turn is no longer a rejected `RuntimeError`: `AgentTurn.#persistPrompt` catches
+ * it and hands the runtime a `Classification`, and `components/lib/turn-view.ts`
+ * renders that classification's reason in the status bar. So it is a user-visible
+ * string, and a key in it is a key on screen.
+ */
 function errorSurfaces(
   thrown: unknown,
-  state: { readonly lastError: { readonly message: string } | undefined },
+  state: {
+    readonly lastError: { readonly message: string } | undefined;
+    // `Classification` widens to the full core union here, and `success` has no
+    // `reason` — so the type is the union and the read is narrowed. A `success`
+    // classification is not a failure surface and contributes nothing.
+    readonly classification: Classification | undefined;
+  },
   events: readonly RuntimeEvent[],
 ): readonly string[] {
   return [
     thrown instanceof Error ? thrown.message : "",
     thrown instanceof Error ? thrown.name : "",
     state.lastError?.message ?? "",
+    // Through `failureView`, because that is what the banner actually renders — the
+    // heterogeneous `Classification` union has no single "the text" field, and reading
+    // `reason` off it is the sort of narrowing that compiles for one member and
+    // throws for the next.
+    state.classification === undefined ? "" : failureView(state.classification).message,
     ...events.flatMap((event) =>
       event.kind === "runtime-error" ? [event.error.message, event.error.code] : [],
     ),

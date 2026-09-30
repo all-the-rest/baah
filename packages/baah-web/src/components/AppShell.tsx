@@ -50,64 +50,6 @@ export interface AppShellProps {
   readonly initialScreen?: Screen;
 }
 
-/**
- * Persist a tool invocation, and report a failure rather than swallowing it.
- *
- * ## Why this is a separate hook and not part of `useLiveTurn`
- *
- * `useLiveTurn` folds events into a *view*; this writes them to the *store*. They have
- * different failure modes, and a view must not fail because a write did — so the write
- * is fire-and-report and never awaited into the fold.
- *
- * The four events are the four states a `tool` part can be in, and they map one to one
- * onto the SDK's `UIToolInvocation` states, so a reloaded card says the same thing a
- * live one does. `tool-outcome-unknown` is **not** among them: it gets its own node (a
- * banner), because a card that claimed an outcome would be the lie `Plan.md` §5.1 is
- * written against.
- */
-function useToolPartRecorder(
-  app: AppRuntime,
-  runtime: AppRuntime["runtime"],
-  onWarning: (message: string) => void,
-  isMounted: () => boolean,
-): void {
-  useEffect(() => {
-    const write = (input: Parameters<AppRuntime["recordToolInvocation"]>[0]): void => {
-      void app.recordToolInvocation(input).catch((cause: unknown) => {
-        if (!isMounted()) return;
-        onWarning(
-          `Der Werkzeugaufruf konnte nicht in den Verlauf geschrieben werden: ${cause instanceof Error ? cause.name : "unbekannter Fehler"}. ` +
-            "Die Karte ist nur in dieser Sitzung sichtbar.",
-        );
-      });
-    };
-
-    return runtime.subscribe((event) => {
-      if (event.kind !== "agent") return;
-      const agent = event.event;
-      switch (agent.type) {
-        case "tool-call":
-          write({ toolCallId: agent.toolCallId, toolName: agent.toolName, state: "input-available", value: agent.input });
-          return;
-        case "tool-result":
-          write({ toolCallId: agent.toolCallId, toolName: agent.toolName, state: "output-available", value: agent.output });
-          return;
-        case "tool-error":
-          write({ toolCallId: agent.toolCallId, toolName: agent.toolName, state: "output-error", value: agent.error });
-          return;
-        case "tool-output-denied":
-          // `output-denied`, not `output-error`: `Plan.md` §7.6 — a refusal is a
-          // legitimate answer the model reads and routes around, and a card wearing
-          // the failure state would tell the user the tool broke.
-          write({ toolCallId: agent.toolCallId, toolName: agent.toolName, state: "output-denied" });
-          return;
-        default:
-          return;
-      }
-    });
-  }, [app, runtime, onWarning, isMounted]);
-}
-
 export function AppShell({ app, initialScreen }: AppShellProps) {
   const { runtime, settings, questions, todos } = app;
   const state = useRuntimeState(runtime);
@@ -129,21 +71,6 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
   const settleToken = useRef(0);
 
   /**
-   * Writes the tool parts the engine does not persist.
-   *
-   * Called before the boot effect so the subscription exists before the first event
-   * can arrive — a hook order change would silently drop the first tool card, and a
-   * test asserting `provider.count()` would still pass.
-   */
-  const isMounted = useCallback((): boolean => mounted.current, []);
-  useToolPartRecorder(
-    app,
-    runtime,
-    useCallback((message: string) => setLiveError(message), []),
-    isMounted,
-  );
-
-  /**
    * The transcript handed to the next turn, as `UIMessage[]`.
    *
    * `AGENTS.md` §3.1: `UIMessage[]` is the **storage truth**, and the loop is
@@ -159,6 +86,28 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
   const messagesRef = useRef<readonly UIMessage[]>(state.messages);
 
   /* ---- boot: recovery, then the first read -------------------------- */
+
+  /**
+   * ## There is deliberately **no** `pagehide` close
+   *
+   * `opfs-sahpool` permits exactly one connection per origin (`Plan.md` §14.2), so
+   * closing on `pagehide` looks like the obvious way to let the *next* document
+   * claim the pool. **Measured, and it is the other way round:** with the close in
+   * place, a reload of this very app came up on the boot-failure screen with a
+   * `StorageError` — the departing document's worker still held the pool while the
+   * arriving one tried to install it, and the close is asynchronous, so it loses the
+   * race it was entered to win. Removing the handler made the reload boot cleanly.
+   *
+   * So the release is the platform's job. A dedicated worker context is destroyed
+   * with its document, and `opfs-sahpool` needs no COOP/COEP precisely because its
+   * handles are owned per context (`Plan.md` §14.2). A second *tab* is the case
+   * §15.4's D2 is about, and there the refusal is the correct answer anyway: the
+   * newcomer gets a typed `database_owned_by_another_context`, which is a fact
+   * about the data rather than a corrupt file.
+   *
+   * `app.database` is still exposed, for the reason its own field says: a test has
+   * to be able to ask what is actually on disk.
+   */
 
   useEffect(() => {
     mounted.current = true;
@@ -207,24 +156,19 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
       const token = settleToken.current + 1;
       settleToken.current = token;
 
-      // The question into the log, before the turn. `AGENTS.md` §3.1: `UIMessage[]`
-      // is the storage truth, and the engine only builds the prompt in memory — so
-      // without this the transcript shows answers with their questions missing.
-      // Awaited before `send` so `seq` puts the question first; a failure is
-      // reported and the turn still runs, because a user who cannot send anything
-      // has no way to act on the error at all.
-      app.recordUserMessage(prompt)
-        .catch((cause: unknown) => {
-          if (mounted.current) {
-            setLiveError(
-              `Die Frage konnte nicht in den Verlauf geschrieben werden: ${cause instanceof Error ? cause.name : "unbekannter Fehler"}.`,
-            );
-          }
-        })
-        .then(() =>
-          // The previous transcript, per `AGENTS.md` §3.1.
-          runtime.send({ prompt, messages: messagesRef.current }),
-        )
+      /**
+       * The question is written by the **engine**, not here.
+       *
+       * `AgentTurn.#persistPrompt` puts the prompt into `messages` and `parts`
+       * through the store seam before the first model call, and names the turn it
+       * belongs to. The app used to do this itself — it had to, because the engine
+       * only built the prompt in memory — and the two writers would now disagree
+       * about the id, so the question would appear in the transcript **twice**.
+       * `seq` also settles itself: the engine writes the prompt first, so it gets the
+       * lower number and reads before its answer.
+       */
+      runtime
+        .send({ prompt, messages: messagesRef.current })
         .then((result) => {
           messagesRef.current = result.messages;
         })
@@ -249,7 +193,7 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
           });
         });
     },
-    [app, runtime],
+    [runtime],
   );
 
   const stop = useCallback((): void => {
@@ -265,6 +209,18 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
    */
   const answerApproval = useCallback(
     (approvalId: string, approved: boolean): void => {
+      // The stored read is dropped for the duration of the continuation, **exactly
+      // as `send` drops it for a turn**, and for the same reason: the live fold is
+      // the truth while work is in progress, and the stored read is the truth once it
+      // has settled.
+      //
+      // Without this the two views overlapped and the same tool call was rendered
+      // twice — once from the stored row, once from the live fold — with two
+      // different states, because the row was written from an earlier event. It did
+      // not show before only because `send`'s re-read happened to land after the
+      // resume's writes; that was a race, not a design, and the E2E suite's
+      // `toolCardState` helper is a strict-mode locator that refuses to guess.
+      setRead(undefined);
       const token = settleToken.current + 1;
       settleToken.current = token;
       runtime
@@ -384,16 +340,14 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
           </button>
         </header>
 
-        {app.ephemeralTranscript && (
-          // Repeated here as well as in the workspace panel, because this is the
-          // screen a user actually looks at. A warning that only exists behind a
-          // settings toggle is a warning nobody reads.
-          <p data-baah-ephemeral-banner="true" className="border-b border-warning/50 bg-warning/10 px-4 py-1 text-xs">
-            Arbeitsspeicher-Datenbank: Der Verlauf übersteht <strong>keinen</strong> Reload. Für dauerhafte
-            Daten ist die SQLite-Anbindung aus `Plan.md` §6 nötig.
+        {app.bootProblems.map((problem) => (
+          // Said, not swallowed: a browser that would not store the session id
+          // starts a new session on the next reload, and a user who finds that out
+          // by reloading has lost the conversation. `AGENTS.md` §5.
+          <p key={problem} data-baah-boot-problem="true" role="alert" className="border-b border-warning/50 bg-warning/10 px-4 py-1 text-xs">
+            {problem}
           </p>
-        )}
-
+        ))}
         {boot !== undefined && (
           <p data-baah-boot="recovered" className="border-b border-base-300 px-4 py-1 text-xs opacity-80">
             {boot.message}
@@ -443,7 +397,6 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
         <TodoSidebar todos={todos} />
         <WorkspacePanel
           mode={app.workspaceMode}
-          ephemeralTranscript={app.ephemeralTranscript}
           onOpen={() => undefined}
           onRefresh={() => {
             void runtime.readTranscript().then((transcript) => {
@@ -515,9 +468,12 @@ export function useRuntimeState(runtime: AppRuntime["runtime"]): RuntimeState {
  *
  * The test for "settled" is therefore the **outcome**, not the event: `turn-settled`
  * with `awaiting-approval` keeps the fold. It is also the only correct behaviour on
- * the read side. The engine persists no tool parts, so the open approval exists
- * *only* in the fold — a stored read cannot replace it, which makes clearing the
- * fold not merely a cosmetic loss but the end of the turn.
+ * the read side. The engine persists an `approval-requested` tool part
+ * (`TurnStore.upsertPart`, awaited, from the same events this fold sees), but a
+ * **stored** read does not replace the fold while the turn is open: the fold is what
+ * holds `openApprovals`, and that list exists only here. Clearing it would not be a
+ * cosmetic loss but the end of the turn — a parked turn whose card cannot be found
+ * is a turn no one can finish.
  */
 export function useLiveTurn(runtime: AppRuntime["runtime"]): LiveTurn {
   const [live, setLive] = useState<LiveTurn>(EMPTY_LIVE_TURN);

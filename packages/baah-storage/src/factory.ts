@@ -410,11 +410,40 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     if (typeof id !== "string" || typeof sessionId !== "string") {
       throw new StorageError("sql_error", "messages.id and messages.session_id must be strings.");
     }
+    /**
+     * The three `CHECK` lists, validated **before** the replay short-circuit.
+     *
+     * Not tidiness — this is the parity contract, and the *foreign keys* take the
+     * opposite side of it. Measured against real SQLite: a replayed insert whose
+     * `role` is outside `MESSAGE_ROLES` is **refused**
+     * (`SQLITE_CONSTRAINT_CHECK`), because SQLite evaluates a row's CHECKs on the
+     * *excluded* row even when the insert turns into an update; while a replay
+     * naming an unknown `session_id` or `turn_id` resolves **quietly**, because the
+     * stored row is unchanged and its foreign keys still hold. The two are
+     * asymmetric inside one statement, so a mirror that puts them in the intuitive
+     * order answers the same question differently on the two backends.
+     *
+     * The validated values are discarded on a replay — **first write wins**, the
+     * conservative direction `Plan.md` §16.1 states for migration 4. `test/
+     * turn-store.test.ts` pins the whole split on both backends; do not reorder
+     * these three blocks to "tidy" them.
+     */
+    const checkedRole = requireOneOf("messages.role", role, MESSAGE_ROLES);
+    const checkedStatus = nullableOneOf("messages.status", status, STREAM_STATUSES);
+    const checkedOutcome = nullableOneOf("messages.outcome", outcome, TURN_OUTCOMES);
+    /**
+     * `ON CONFLICT (id) DO UPDATE SET id = excluded.id`, mirrored.
+     *
+     * A duplicate id resolves to the existing row. See `INSERT_MESSAGE` in
+     * `sql.ts` for why idempotency lives on the statement at all rather than in an
+     * adapter that catches the `UNIQUE` error and matches on its text.
+     */
+    const replay = store.messages.get(id);
+    if (replay !== undefined) {
+      return { rows: [replay], changes: 1 };
+    }
     requireSession(sessionId);
     if (typeof turnId === "string") requireTurn(turnId);
-    if (store.messages.has(id)) {
-      throw new StorageError("sql_error", `UNIQUE constraint failed: messages.id = ${id}`);
-    }
     const siblings = [...store.messages.values()].filter((row) => row.sessionId === sessionId);
     const assigned = nextSeq(siblings, typeof seq === "number" ? seq : null);
     if (siblings.some((row) => row.seq === assigned)) {
@@ -429,13 +458,12 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
       turnId: typeof turnId === "string" ? turnId : null,
       parentId: typeof parentId === "string" ? parentId : null,
       seq: assigned,
-      // Checked against the schema's CHECK lists, so an invalid role/status/
-      // outcome fails here exactly as it would in SQLite instead of being
-      // coerced into a row that no SELECT would ever accept.
-      role: requireOneOf("messages.role", role, MESSAGE_ROLES),
-      status: nullableOneOf("messages.status", status, STREAM_STATUSES),
+      // Checked against the schema's CHECK lists — see the block above for why
+      // they are validated before the replay short-circuit and not here.
+      role: checkedRole,
+      status: checkedStatus,
       model: typeof model === "string" ? model : null,
-      outcome: nullableOneOf("messages.outcome", outcome, TURN_OUTCOMES),
+      outcome: checkedOutcome,
       error: typeof error === "string" ? error : null,
       usage: typeof usage === "string" ? usage : null,
       createdAt: typeof params.createdAt === "string" ? params.createdAt : nowIso(),
@@ -597,10 +625,30 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     if (typeof id !== "string" || typeof sessionId !== "string") {
       throw new StorageError("sql_error", "turns.id and turns.session_id must be strings.");
     }
-    requireSession(sessionId);
-    if (store.turns.has(id)) {
-      throw new StorageError("sql_error", `UNIQUE constraint failed: turns.id = ${id}`);
+    /**
+     * The `turns.status` CHECK, validated **before** the replay short-circuit.
+     *
+     * The same asymmetry as in `storeMessage` above, and measured the same way:
+     * SQLite refuses a replayed turn whose `status` is outside the CHECK, and
+     * resolves a replay naming an unknown session quietly. The values are
+     * discarded on a replay — first write wins.
+     */
+    const checkedStatus = requireOneOf("turns.status", status, TURN_STATUSES);
+    /**
+     * `ON CONFLICT (id) DO UPDATE SET id = excluded.id`, mirrored — the same
+     * contract as `storeMessage` above, and for the same reason.
+     *
+     * `heartbeatAt` of the *existing* row is kept, which is the half that matters
+     * here: a replayed `appendTurn` is not a heartbeat, and the 30 s staleness rule
+     * (§6.1) has exactly one writer for its anchor. `changes: 1` matches
+     * SQLite's `sqlite3_changes()` after a `DO UPDATE`, for the same reason
+     * `insertPart` reports 1 for an upsert.
+     */
+    const replay = store.turns.get(id);
+    if (replay !== undefined) {
+      return { rows: [replay], changes: 1 };
     }
+    requireSession(sessionId);
     const siblings = [...store.turns.values()].filter((row) => row.sessionId === sessionId);
     const assigned = nextSeq(siblings, typeof seq === "number" ? seq : null);
     if (siblings.some((row) => row.seq === assigned)) {
@@ -613,7 +661,8 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
       id,
       sessionId,
       seq: assigned,
-      status: requireOneOf("turns.status", status, TURN_STATUSES),
+      // Checked above, before the replay short-circuit — see that block.
+      status: checkedStatus,
       leaseOwner: typeof leaseOwner === "string" ? leaseOwner : null,
       heartbeatAt: typeof heartbeatAt === "string" ? heartbeatAt : null,
       startedAt: typeof startedAt === "string" ? startedAt : nowIso(),
