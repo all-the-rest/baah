@@ -27,11 +27,43 @@ import { useState } from "react";
 
 import { PROVENANCE_ATTRIBUTE } from "./lib/trust.ts";
 
+/** The mode names §5.3 has to make visible. Shared with the shell's header. */
+export type WorkspaceMode = "opfs" | "memory" | "local-directory";
+
 export interface WorkspacePanelProps {
   /** `Plan.md` §5.3's `Workspace["kind"]`. */
-  readonly mode: "opfs" | "memory" | "local-directory";
+  readonly mode: WorkspaceMode;
   readonly onOpen: () => void;
   readonly onRefresh: () => void;
+}
+
+/**
+ * The mode, as a badge, for a place that is **not** this panel.
+ *
+ * `AppShell` puts one in its header, because below the two-column threshold the
+ * panel itself is behind a drawer that starts closed — and §5.3 asks for the mode to
+ * be *visible*, not merely reachable. Reaching it in two taps is not the same
+ * statement.
+ *
+ * `max-lg:inline-flex hidden` rather than a `wide ? … : null`: it is one element that
+ * changes presentation rather than one that appears and disappears, so nothing in the
+ * tree can drift out of step with `lib/viewport.ts`'s threshold. The `hidden` is what
+ * keeps it off the desktop header, where the panel is visible anyway and a second copy
+ * of the mode would be noise.
+ *
+ * A **separate** attribute from the panel's `data-baah-workspace-mode` — two nodes
+ * claiming to be the mode is exactly what a strict-mode locator trips over.
+ */
+export function WorkspaceModeBadge({ mode }: { readonly mode: WorkspaceMode }) {
+  return (
+    <span
+      data-baah-workspace-mode-badge={mode}
+      {...{ [PROVENANCE_ATTRIBUTE]: "app" }}
+      className="badge badge-ghost badge-sm hidden max-lg:inline-flex"
+    >
+      {modeLabel(mode)}
+    </span>
+  );
 }
 
 export function WorkspacePanel(props: WorkspacePanelProps) {
@@ -105,7 +137,7 @@ export function WorkspacePanel(props: WorkspacePanelProps) {
   );
 }
 
-function modeLabel(mode: WorkspacePanelProps["mode"]): string {
+function modeLabel(mode: WorkspaceMode): string {
   switch (mode) {
     case "opfs":
       return "Sandbox (OPFS)";
@@ -116,7 +148,7 @@ function modeLabel(mode: WorkspacePanelProps["mode"]): string {
   }
 }
 
-function modeExplanation(mode: WorkspacePanelProps["mode"]): string {
+function modeExplanation(mode: WorkspaceMode): string {
   switch (mode) {
     case "opfs":
       return (

@@ -94,7 +94,12 @@ export function SettingsPanel(props: SettingsPanelProps) {
   };
 
   return (
-    <aside aria-label="Einstellungen" className="flex w-96 shrink-0 flex-col gap-4 overflow-y-auto border-l border-base-300 p-4">
+    /*
+     * `max-lg:w-full` for the same reason as the todo sidebar: in the shell's drawer
+     * this is a child of a `w-80` column, and `w-96` would be 64 px wider than its
+     * parent. Wide layout unchanged.
+     */
+    <aside aria-label="Einstellungen" className="flex w-96 shrink-0 flex-col gap-4 overflow-y-auto border-l border-base-300 p-4 max-lg:w-full">
       <div className="flex items-baseline justify-between">
         <h2 className="text-lg font-semibold">Einstellungen</h2>
         <button type="button" data-testid="baah-settings-close" className="btn btn-ghost btn-xs" onClick={props.onClose}>

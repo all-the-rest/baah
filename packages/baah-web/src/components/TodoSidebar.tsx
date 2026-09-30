@@ -51,7 +51,13 @@ export function TodoSidebar({ todos }: TodoSidebarProps) {
   }, [todos]);
 
   return (
-    <aside aria-label="Aufgaben" className="flex w-64 shrink-0 flex-col border-l border-base-300 p-3">
+    /*
+     * `max-lg:w-full`: inside the shell's drawer this aside is a child of a `w-80`
+     * column, and `w-64` plus the drawer's padding would leave it narrower than the
+     * panel next to it for no reason. The wide layout keeps `w-64`, which is what the
+     * desktop screenshots show.
+     */
+    <aside aria-label="Aufgaben" className="flex w-64 shrink-0 flex-col border-l border-base-300 p-3 max-lg:w-full">
       <h2 className="text-sm font-semibold">Aufgaben</h2>
 
       {/*

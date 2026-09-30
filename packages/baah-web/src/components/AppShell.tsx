@@ -36,11 +36,12 @@ import { QuestionCard } from "./QuestionCard.tsx";
 import { SettingsPanel } from "./SettingsPanel.tsx";
 import { TodoSidebar } from "./TodoSidebar.tsx";
 import { Transcript } from "./Transcript.tsx";
-import { WorkspacePanel } from "./WorkspacePanel.tsx";
+import { WorkspaceModeBadge, WorkspacePanel } from "./WorkspacePanel.tsx";
 import type { AppRuntime } from "./lib/runtime.ts";
 import { applyAgentEvent, EMPTY_LIVE_TURN, type LiveTurn } from "./lib/transcript.ts";
 import { bootNotice, turnBanner } from "./lib/turn-view.ts";
 import { isConfigured, type WizardState } from "./lib/onboarding.ts";
+import { useIsWideViewport } from "./lib/viewport.ts";
 
 export type Screen = "onboarding" | "workbench";
 
@@ -54,11 +55,71 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
   const { runtime, settings, questions, todos } = app;
   const state = useRuntimeState(runtime);
   const live = useLiveTurn(runtime);
+  const wide = useIsWideViewport();
   const [screen, setScreen] = useState<Screen | undefined>(initialScreen);
   const [read, setRead] = useState<TranscriptRead | undefined>();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [liveError, setLiveError] = useState<string | undefined>();
   const mounted = useRef(true);
+
+  /**
+   * ## The sidebar is one thing with two shapes, not two sidebars
+   *
+   * Measured defect, at 390×844: `AppShell` is `flex h-screen`, the right column had
+   * no `min-w-0`, so its automatic minimum width was its **max-content** — and
+   * `WorkspacePanel`'s `modeExplanation` is one long German paragraph. At 390 px that
+   * minimum exceeded the viewport, the chat column was squeezed to **exactly zero**,
+   * and header, transcript and composer were all rendered *underneath* the sidebar.
+   * Measured before the fix: chat column 0 px, composer 24 px, the narrowest text on
+   * screen wrapping to **7 characters per line**.
+   *
+   * `min-w-0` on the right column was the obvious one-token fix and it is **not** one.
+   * The left column is `flex-1` (basis 0) and the right is `0 1 auto`, so a
+   * negative free space is scaled by `shrink × basis`: the left column's basis is
+   * zero, it contributes nothing to the scaled shrink factor, and the *entire*
+   * deficit is taken off the right column. The sidebar would land at 390 px, still
+   * covering the whole viewport, and the chat column would still be 0 px. It fixes
+   * the overflow and none of the defect.
+   *
+   * So below the width where two columns fit at all, the sidebar stops being a column
+   * and becomes a **drawer**: not mounted unless it is open, and while open it is a
+   * fixed overlay rather than a sibling that competes for width. The chat keeps the
+   * full viewport. `lib/viewport.ts` carries the measurement and the threshold.
+   *
+   * Above the threshold this is the layout it always was — the same element, the
+   * same classes, the same DOM — which is why the 1280 px screenshots and the 44
+   * functional tests are unaffected.
+   */
+  const sidebarOpen = wide || drawerOpen;
+
+  /**
+   * A drawer that survives a rotation is a drawer that reopens over the chat the
+   * user just came back to. Crossing the threshold upwards closes it, and it is not
+   * reopened by crossing downwards — a phone that is rotated back finds the chat.
+   */
+  useEffect(() => {
+    if (wide) setDrawerOpen(false);
+  }, [wide]);
+
+  /**
+   * `Esc` closes the drawer, and only while it is actually open.
+   *
+   * `ChatView` already owns `Esc` for aborting a turn; this handler only reacts while
+   * the overlay is on screen, which cannot overlap a turn the user is reading, and it
+   * does not call `preventDefault` so it does not fight the abort path when both are
+   * live.
+   */
+  useEffect(() => {
+    if (!drawerOpen) return undefined;
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setDrawerOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [drawerOpen]);
 
   /**
    * Monotonic token for the newest send.
@@ -328,13 +389,54 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
     <div className="flex h-screen min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex flex-wrap items-center gap-2 border-b border-base-300 px-4 py-2">
+          {/*
+           * The drawer toggle, and it is **only** rendered below the threshold.
+           *
+           * Above it the sidebar is a permanent column and a button claiming to
+           * toggle something that cannot be toggled is a lie with a click handler on
+           * it. `aria-expanded` carries the real state, and `aria-controls` names the
+           * region it opens, so the relationship survives being read out.
+           */}
+          <button
+            type="button"
+            data-testid="baah-toggle-sidebar"
+            className="btn btn-ghost btn-xs lg:hidden"
+            aria-expanded={sidebarOpen}
+            aria-controls="baah-sidebar"
+            onClick={() => setDrawerOpen((open) => !open)}
+          >
+            Menü
+          </button>
           <h1 className="text-sm font-bold">baah</h1>
           <span className="badge badge-ghost badge-sm">browser-only · kein Server</span>
+          {/*
+           * `Plan.md` §5.3's standing requirement — the mode has to be **visible**,
+           * or a Firefox user expects writes on their disk that never happen — is the
+           * one thing a drawer-by-default would quietly take away on the form factor
+           * where it matters most. So the panel's own badge is repeated in the header
+           * while the panel itself is out of sight.
+           *
+           * A second element with the mode, so it gets a second attribute name
+           * (`data-baah-workspace-mode-badge`) rather than a duplicate
+           * `data-baah-workspace-mode`: two nodes claiming to be *the* mode is a
+           * strict-mode locator's problem and a reader's.
+           */}
+          <WorkspaceModeBadge mode={app.workspaceMode} />
           <button
             type="button"
             data-testid="baah-open-settings"
             className="btn btn-ghost btn-xs ml-auto"
-            onClick={() => setSettingsOpen((open) => !open)}
+            onClick={() => {
+              const next = !settingsOpen;
+              setSettingsOpen(next);
+              // Below the threshold the panel lives inside the drawer, so toggling
+              // the state alone would flip a boolean that renders into an **unmounted**
+              // sidebar: the button would be a dead control on the form factor where
+              // it is most needed. Turning the panel *on* therefore opens the drawer
+              // that holds it. Turning it off leaves the drawer alone — the user can
+              // still see the todos and the workspace panel behind it.
+              if (next && !wide) setDrawerOpen(true);
+            }}
           >
             Einstellungen
           </button>
@@ -393,26 +495,79 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
         />
       </div>
 
-      <div className="flex flex-col border-l border-base-300">
-        <TodoSidebar todos={todos} />
-        <WorkspacePanel
-          mode={app.workspaceMode}
-          onOpen={() => undefined}
-          onRefresh={() => {
-            void runtime.readTranscript().then((transcript) => {
-              if (mounted.current) setRead(transcript);
-            });
-          }}
+      {/*
+       * The backdrop. A `button`, not a `div` with an `onClick`, because it is the
+       * dismissal affordance a keyboard and a screen reader need to reach — a
+       * click-only overlay is unreachable for both. It is mounted only while the
+       * drawer is open, so it never intercepts a pointer that belongs to the chat.
+       */}
+      {drawerOpen && !wide && (
+        <button
+          type="button"
+          data-testid="baah-sidebar-backdrop"
+          aria-label="Menü schließen"
+          className="fixed inset-0 z-30 cursor-default bg-black/50 lg:hidden"
+          onClick={() => setDrawerOpen(false)}
         />
-        {settingsOpen && (
-          <SettingsPanel
-            settings={settings}
-            runtime={runtime}
-            onOpenWizard={() => setScreen("onboarding")}
-            onClose={() => setSettingsOpen(false)}
+      )}
+
+      {/*
+       * The same column as before, below the threshold a `position: fixed` overlay
+       * instead of a flex sibling.
+       *
+       * `max-lg:` rather than `lg:` on purpose: above the threshold **no** class on
+       * this element changes, so the wide layout is bit-for-bit the one the desktop
+       * screenshots and the functional suite were written against. Below it the
+       * element leaves the flex row entirely — that is the fix, not a width on it —
+       * and `w-80 max-w-[85vw]` keeps it usable on a 320 px phone. `overflow-y-auto`
+       * because the three blocks inside it are taller than 844 px together on a
+       * phone with a task list.
+       *
+       * `max-lg:bg-base-100` is **load-bearing** and was not visible in any
+       * measurement. Every width in this column read correct while the drawer was
+       * still unusable: the transcript behind it showed straight through and two sets
+       * of German sentences were drawn on top of each other. An overlay has to paint
+       * its own surface — as a static column it inherited the page background and
+       * needed none. Found by looking at the screenshot: a bounding box cannot tell
+       * you that a background is transparent.
+       */}
+      {sidebarOpen && (
+        <div
+          id="baah-sidebar"
+          className="flex flex-col border-l border-base-300 max-lg:fixed max-lg:inset-y-0 max-lg:right-0 max-lg:z-40 max-lg:w-80 max-lg:max-w-[85vw] max-lg:overflow-y-auto max-lg:bg-base-100 max-lg:shadow-2xl"
+        >
+          <div className="flex items-center justify-between gap-2 border-b border-base-300 px-3 py-2 lg:hidden">
+            <span className="text-sm font-semibold">Aufgaben &amp; Workspace</span>
+            <button
+              type="button"
+              data-testid="baah-sidebar-close"
+              className="btn btn-ghost btn-xs"
+              onClick={() => setDrawerOpen(false)}
+            >
+              Schließen
+            </button>
+          </div>
+
+          <TodoSidebar todos={todos} />
+          <WorkspacePanel
+            mode={app.workspaceMode}
+            onOpen={() => undefined}
+            onRefresh={() => {
+              void runtime.readTranscript().then((transcript) => {
+                if (mounted.current) setRead(transcript);
+              });
+            }}
           />
-        )}
-      </div>
+          {settingsOpen && (
+            <SettingsPanel
+              settings={settings}
+              runtime={runtime}
+              onOpenWizard={() => setScreen("onboarding")}
+              onClose={() => setSettingsOpen(false)}
+            />
+          )}
+        </div>
+      )}
     </div>
   );
 }

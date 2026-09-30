@@ -1661,6 +1661,94 @@ Verantwortungsfreiheit, aber nur eines ist eine Aussage.
 
 ---
 
+## U1 behoben und **von mir am Bild verifiziert** — und der beste Fund der Sitzung
+
+**Collapsed Drawer unter 1024 px.** Desktop **unverändert**, von mir am Bild geprüft:
+zweispaltig, kein Menü-Knopf, kein Header-Badge, dieselben Karten. Über 1024 px ändert
+**keine** Klasse.
+
+### Meine Warnung wurde **gemessen**, nicht bestätigt
+
+Ich hatte geschrieben, `min-w-0` allein löse es vermutlich nicht. Der Agent hat **genau
+diesen Einzeiler** angewandt und bei 390×844 gemessen: linke Spalte **weiterhin 0 px**,
+Composer **24 px**, Textarea **26 px**, `elementFromPoint(Senden)` **weiterhin** die
+Sidebar.
+
+> **Aus einer Vorsicht wird eine Messung, indem jemand sie ausprobiert.** Ich hatte
+> „vermutlich nicht"; er hat „gemessen: nicht". Das ist der Unterschied zwischen einer
+> Warnung und einem Befund, und er ist nur eine Zeile Arbeit wert.
+
+### 390×844, vorher und nachher
+
+| | vorher | nachher, Drawer zu | nachher, Drawer auf |
+|---|---|---|---|
+| linke Spalte | **0 px** | **390 px** | 390 px (hinter dem Overlay) |
+| Composer | 24 px | 390 px | 390 px |
+| Textarea | 26 px | 273 px | 273 px |
+| `elementFromPoint(Senden)` | die Sidebar | eigene Zeile | Sidebar (Overlay, korrekt) |
+| **schmalster Umbruch** | **7 Zeichen/Zeile** (93 Zeichen auf 17 Zeilen) | **50 Zeichen/Zeile** | 44 Zeichen/Zeile |
+
+> **Zeichen pro Zeile ist das ehrlichere Maß als die Spaltenbreite.** Eine Spalte mit
+> „40 px Breite" kann kaputt sein, wenn der Absatz auf 8 Zeichen umbricht — und eine
+> Spalte mit „390 px" kann in Ordnung sein, wenn sie 390 px **bedeckt** (siehe unten).
+
+### ⭐ Der Fund, für den es die Harness gibt
+
+> **Der Drawer hatte die richtige Breite, 320 px und 44 Zeichen/Zeile — war aber
+> transparent, und der Transcript schien durch ihn hindurch.**
+
+**Alle Messungen sagten, die Behebung funktioniert.** Nur das Bild zeigte, dass der
+Nutzer den Transcript **durch** die Sidebar sieht. Gefixt mit `max-lg:bg-base-100`.
+
+**Eine Bounding Box kann nicht sagen, ob ein Hintergrund transparent ist.**
+
+Damit sind die **zwei** Fehlerklassen einer Messung benannt, und sie sind verschieden:
+
+| | Fall | Beispiel aus dieser Sitzung |
+|---|---|---|
+| **(a)** | Messung **richtig**, Bericht **falsch** | „linke Spalte 0 px" → gemeldet als „jeder Klick ist tot". Der Schweregrad ging beim Übersetzen in Prosa verloren. |
+| **(b)** | Messung **richtig** und **unzureichend** | Breite 320 px, korrekt; **Deckkraft** transparent, defekt. Es gab **keine** Größe, die gefragt werden musste. |
+
+> **(a) ist ein Berichtsfehler. (b) ist eine Grenze der Messmethode — und (b) ist der
+> Grund, warum es diese Harness gibt.** Nicht, weil sie Defekte findet: die findet jeder
+> Bildvergleich. Sondern weil sie die Frage stellt, die man sich sonst **nicht** stellt.
+> Man misst Breite, weil Breite das ist, was man leicht messen kann — und dann ist die
+> Breite grün, während der Nutzer etwas sieht, das es nicht gibt.
+
+### Und die unbequeme Hälfte: ich habe die Bilder **nicht** gelesen
+
+Der Harness hatte den nächsten Defekt **schon lange** im Satz:
+`screenshot chat-question` überlappt die Statusleiste um **16 px** — bei **390 px** und bei
+**1280 px**, **identisch**. Also **viewport-unabhängig** und **vorbestehend**, und
+sichtbar auf `filled/desktop/chat-question-sec0.png`, seitdem ich die Datei habe.
+
+**Ich habe 118 Bilder erzeugt und 4 gelesen.** Welle 3 „abgeschlossen" zu melden wäre
+gelogen gewesen: der **Verifikations**schritt — der Blick drauf — war nie getan.
+
+- [ ] **U8 — `chat-question` überlappt die Statusleiste um 16 px. Desktop UND Mobil.**
+      Gemessen: der Scroll-Viewport des Transcripts fällt auf `clientH 24 / scrollH 159`
+      zusammen, weil `QuestionCard` ein **schrumpfbarer** Geschwister in einer
+      `h-screen`-Spalte ist. **Nicht behoben**, weil eine Behebung Desktop-Pixel
+      verändert — und das ist die richtige Entscheidung. Jetzt behoben werden **darf** es.
+- [ ] **U9 — `chat-todo (filled, mobile)` schlägt fehl: 45 passed, 1 failed.**
+      Gemessen: `prepare` wartet auf `[data-baah-todo-status]`, **ohne** den Drawer zu
+      öffnen. `countBefore: 0`, nach **einem** Klick auf `baah-toggle-sidebar`
+      `countAfter: 3`, sichtbar, Behauptung intakt. → **Ein Klick im Manifest fehlt.**
+      ⚠️ Dass das resultierende Bild richtig wird, ist **vermutet** — der Agent hat
+      `chat-todo` **nicht** neu aufgenommen. *Eine Behauptung über ein Bild, das niemand
+      aufgenommen hat, ist keine.*
+- [ ] **U10 — und die vier vormals unerreichbaren States sind jetzt **alle vier** mobil
+      erreichbar** (gemessen, nicht behauptet): Reasoning-`<summary>` klickbar
+      (`details.open === true`), `baah-open-settings` klickbar, Export-Checkbox klickbar,
+      Key-entfernen klickbar mit sichtbarem Composer-Hinweis.
+      **Dabei fand der Agent etwas, das niemand gefordert hatte:** der Einstellungs-Knopf
+      wäre auf Mobil eine **tote Kontrolle** gewesen — er hätte einen Boolean umgeschaltet,
+      der in eine **nicht gemountete** Sidebar rendert. Er öffnet jetzt den Drawer, der
+      sie enthält. **Das ist der Unterschied zwischen einem Layout, das hübsch aussieht,
+      und einem, das funktioniert.**
+
+---
+
 ## Abgehakt
 
 *(nach unten wandern, mit Commit-Referenz)*
