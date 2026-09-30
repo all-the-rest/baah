@@ -83,13 +83,18 @@ export interface OpenDatabaseOptions {
   vfsName?: string;
   /** OPFS directory the VFS keeps its file pool in. */
   directory?: string;
-  /** Overrides the worker URL — for tests and non-Vite bundlers. */
+  /** The compiled worker's URL. Required unless `workerFactory` is given. */
   workerUrl?: string | URL;
   /**
    * Overrides how the worker is constructed — the seam the tests use to inject
    * an in-process fake instead of a real `Worker`.
+   *
+   * `url` is `undefined` when no `workerUrl` was passed. A factory that is
+   * genuinely building its own worker does not need it; one that forwards it
+   * must check, because the alternative used to be a bundler copying
+   * `./worker.ts` verbatim into `dist/`.
    */
-  workerFactory?: (url: string | URL) => WorkerLike;
+  workerFactory?: (url: string | URL | undefined) => WorkerLike;
 }
 
 type Pending = {
@@ -399,9 +404,9 @@ let active: WorkerStorageDatabase | null = null;
  * Rejects with `database_owned_by_another_context` when another tab or worker
  * already owns the VFS — that error is a typed, expected outcome, not a crash.
  *
- * UNVERIFIED: the default worker URL uses the Vite-documented
- * `new URL("./worker.ts", import.meta.url)` form. That it resolves to a real
- * worker in the `baah-web` build is only provable in a browser.
+ * **There is no default worker URL**, and that is a decision rather than a gap:
+ * see the construction site below. `UNVERIFIED` used to stand here, describing a
+ * fallback that nothing took and no browser could have run.
  */
 export async function openDatabase(
   options: OpenDatabaseOptions = {},
@@ -414,10 +419,29 @@ export async function openDatabase(
   }
 
   const filename = options.filename ?? DEFAULT_FILENAME;
-  const workerUrl = options.workerUrl ?? new URL("./worker.ts", import.meta.url);
+  // **No `new URL("./worker.ts", import.meta.url)` fallback, deliberately.**
+  //
+  // That line was here, marked `UNVERIFIED` by the code itself, and it cost
+  // 20 738 bytes: a bundler resolves `new URL(<literal>, import.meta.url)`
+  // statically and copies the target into `dist/` **verbatim**, so the shipped
+  // artefact carried untranspiled TypeScript — which a static host then serves
+  // as `video/mp2t`. Nothing ever ran it: every test passes a `workerFactory`,
+  // and the app passes the URL from a `?worker&url` import.
+  //
+  // A path that is never taken and cannot work is not a fallback, it is a way to
+  // ship a file by accident. The error below names the import that works.
+  if (options.workerUrl === undefined && options.workerFactory === undefined) {
+    throw new StorageError(
+      "unsupported",
+      "openDatabase() needs a worker URL or a factory. In a Vite build: " +
+        "const { default: url } = await import('@all-the.rest/baah-storage/worker?worker&url'); " +
+        "then pass `workerUrl: url`. (`?worker&url`, not bare `?worker` - they differ in Vite 8.)",
+    );
+  }
+  const workerUrl = options.workerUrl;
   const worker = options.workerFactory
     ? options.workerFactory(workerUrl)
-    : new Worker(workerUrl, { type: "module", name: "baah-storage" });
+    : new Worker(workerUrl as string | URL, { type: "module", name: "baah-storage" });
   const database = new WorkerStorageDatabase(worker, filename);
 
   // Claim the slot *synchronously*, before the first `await`. Assigning it

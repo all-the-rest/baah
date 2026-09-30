@@ -565,3 +565,52 @@ describe("createDrizzleCallback", () => {
     expect(asAll.rows).toEqual([{ one: 1, two: "two" }]);
   });
 });
+
+describe("openDatabase refuses to invent a worker", () => {
+  /**
+   * The removed line was `new URL("./worker.ts", import.meta.url)`, marked
+   * `UNVERIFIED` by the code itself. It cost **20 738 bytes** in the shipped
+   * `dist/`: a bundler resolves `new URL(<literal>, import.meta.url)` statically
+   * and copies the target verbatim, so untranspiled TypeScript went into the
+   * artefact — which a static host then serves as `video/mp2t`.
+   *
+   * Nothing ever ran it: every test in this file passes a `workerFactory`, and
+   * the app passes the URL from a `?worker&url` import. So the assertion below is
+   * not "the fallback broke" — there was never a working fallback. It is that a
+   * path that cannot work must be a **typed error with the working import named**,
+   * not a file shipped by accident.
+   */
+  it("rejects when neither a worker URL nor a factory is given", async () => {
+    const error = await failure(openDatabase());
+    expect(error.code).toBe("unsupported");
+  });
+
+  it("names the import that works, so the message is actionable", async () => {
+    const error = await failure(openDatabase());
+    expect(error.message).toMatch(/\?worker&url/);
+    expect(error.message).toMatch(/baah-storage\/worker/);
+    // The message must also warn off the trap: bare `?worker` returns a **Worker
+    // subclass** in Vite 8, `?worker&url` returns the **URL string**, and this code
+    // needs the string. Checked as substrings, not a regex: a regex over a message
+    // full of backticks and question marks is a test that breaks when the wording
+    // is edited, which is a test nobody updates.
+    expect(error.message).toContain("bare");
+    expect(error.message).toContain("Vite 8");
+  });
+
+  it("accepts a factory alone, which is how every test opens a database", async () => {
+    // Regression guard, and the one that matters: the guard must **not** be
+    // "needs a workerUrl". Every loopback test in this file opens with a factory
+    // and no URL, so a stricter guard would turn a good change into a red suite and
+    // invite someone to put the fallback back.
+    const loopback: Loopback = createLoopback({
+      sqlite3InitModule: async () => sqlite3,
+      installOpfsSAHPoolVfs: installInMemoryPool(sqlite3).install,
+    });
+    const database = await openDatabase({
+      workerFactory: loopback.workerFactory,
+      filename: "/guards.sqlite3",
+    });
+    expect(database).toBeDefined();
+  });
+});

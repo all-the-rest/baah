@@ -192,7 +192,12 @@ export interface Loopback extends WorkerHarness {
   /** The transport the client posts to. */
   readonly transport: FakeWorker;
   /** A `workerFactory` for `openDatabase()`, bound to this loopback. */
-  readonly workerFactory: (url: string | URL) => WorkerLike;
+  /**
+   * `url` may be `undefined`: `openDatabase()` only has one when the caller passed
+   * a `workerUrl`. The implementation below has always ignored the argument, so this
+   * widening describes what was always true rather than changing it.
+   */
+  readonly workerFactory: (url: string | URL | undefined) => WorkerLike;
 }
 
 /**
