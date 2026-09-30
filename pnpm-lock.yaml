@@ -132,6 +132,22 @@ importers:
         specifier: ^5.0.2
         version: 5.0.2(vite@8.3.1)
 
+  packages/baah-tools/patch:
+    dependencies:
+      '@all-the.rest/baah-core':
+        specifier: workspace:*
+        version: link:../../baah-core
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.2
+        version: 5.0.2(vite@8.3.1)
+
   packages/baah-tools/question:
     dependencies:
       '@all-the.rest/baah-core':
@@ -165,6 +181,22 @@ importers:
         version: 5.0.2(vite@8.3.1)
 
   packages/baah-tools/todo:
+    dependencies:
+      '@all-the.rest/baah-core':
+        specifier: workspace:*
+        version: link:../../baah-core
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
+    devDependencies:
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^5.0.2
+        version: 5.0.2(vite@8.3.1)
+
+  packages/baah-tools/webfetch:
     dependencies:
       '@all-the.rest/baah-core':
         specifier: workspace:*
@@ -216,6 +248,33 @@ importers:
       '@all-the.rest/baah-core':
         specifier: workspace:*
         version: link:../baah-core
+      '@all-the.rest/baah-storage':
+        specifier: workspace:*
+        version: link:../baah-storage
+      '@all-the.rest/baah-tool-edit':
+        specifier: workspace:*
+        version: link:../baah-tools/edit
+      '@all-the.rest/baah-tool-glob':
+        specifier: workspace:*
+        version: link:../baah-tools/glob
+      '@all-the.rest/baah-tool-grep':
+        specifier: workspace:*
+        version: link:../baah-tools/grep
+      '@all-the.rest/baah-tool-list':
+        specifier: workspace:*
+        version: link:../baah-tools/list
+      '@all-the.rest/baah-tool-question':
+        specifier: workspace:*
+        version: link:../baah-tools/question
+      '@all-the.rest/baah-tool-read':
+        specifier: workspace:*
+        version: link:../baah-tools/read
+      '@all-the.rest/baah-tool-todo':
+        specifier: workspace:*
+        version: link:../baah-tools/todo
+      '@all-the.rest/baah-tool-write':
+        specifier: workspace:*
+        version: link:../baah-tools/write
       ai:
         specifier: ^7.0.122
         version: 7.0.122(zod@4.6.5)
