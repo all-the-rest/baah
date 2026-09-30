@@ -34,6 +34,7 @@ import { ChatView } from "./ChatView.tsx";
 import { Onboarding } from "./Onboarding.tsx";
 import { QuestionCard } from "./QuestionCard.tsx";
 import { TEST_IDS } from "../lib/testids.ts";
+import { isDirectoryPickerAvailable } from "../lib/project-folder.ts";
 import { SettingsPanel } from "./SettingsPanel.tsx";
 import { TodoSidebar } from "./TodoSidebar.tsx";
 import { Transcript } from "./Transcript.tsx";
@@ -63,6 +64,72 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [liveError, setLiveError] = useState<string | undefined>();
   const mounted = useRef(true);
+
+  /**
+   * The project folder's state, subscribed rather than read once.
+   *
+   * Two facts have to stay apart here, and this is where the earlier design had
+   * them confused. `app.workspaceMode` is **derived** from the workspace and is
+   * the answer to "where do writes land". This is the answer to "may the browser
+   * still touch the folder you picked", and after a cold start those disagree: the
+   * mode is `local-directory` while the grant is gone. Rendering the mode alone
+   * would tell a user their folder is attached when every write is about to fail.
+   *
+   * `useSyncExternalStore` for the same reason as `useRuntimeState` — the
+   * controller is a plain observable (`lib/observable.ts`), and this is the
+   * adapter. It is a separate subscription from the runtime's because the folder
+   * changes on a **click**, not on a turn, and coupling them would re-render the
+   * transcript when a folder is picked.
+   */
+  const folder = useSyncExternalStore(
+    app.projectFolder.state.subscribe,
+    app.projectFolder.current,
+    app.projectFolder.current,
+  );
+
+  /**
+   * Whether this browser has a folder picker at all (`Plan.md` §14.1's table).
+   *
+   * Read per render rather than captured in a module constant: it is a
+   * capability of the browser, and a test that installs a stub after import has
+   * to hit the stub.
+   */
+  const pickerAvailable = isDirectoryPickerAvailable();
+
+  /**
+   * Pick a folder, and swap the workspace the runtime holds.
+   *
+   * **This is the user gesture.** `requestPermission` is only legal inside it,
+   * which is why the call is not wrapped in a timer, a `useEffect` or an
+   * `await` before it — every one of those loses transient user activation and
+   * the browser throws `SecurityError` (or, worse, prompts for something the
+   * user did not ask for).
+   *
+   * The swap happens only on `connected`, so a refused or abandoned pick leaves
+   * the sandbox in place rather than pointing the runtime at a folder the browser
+   * will not let us touch.
+   */
+  const openProjectFolder = useCallback((): void => {
+    setLiveError(undefined);
+    app.projectFolder
+      .pick()
+      .then((next) => {
+        if (!mounted.current) return;
+        if (next.kind === "connected") {
+          app.workspace.swap(next.workspace);
+        }
+      })
+      .catch((cause: unknown) => {
+        // Class name only, and never the message: a picker failure message can
+        // quote the filesystem path the user is looking at. Same rule as
+        // `lib/storage.ts` and `lib/settings.ts`.
+        if (mounted.current) {
+          setLiveError(
+            `Der Ordner konnte nicht verbunden werden: ${cause instanceof Error ? cause.name : "unbekannter Fehler"}.`,
+          );
+        }
+      });
+  }, [app]);
 
   /**
    * ## The sidebar is one thing with two shapes, not two sidebars
@@ -350,7 +417,19 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
       baseUrl: summary.provider?.baseUrl ?? "",
       model: summary.provider?.model ?? "",
       hasKey: summary.keySlots.length > 0,
-      workspaceKind: app.workspaceMode,
+      // `WizardState["workspaceKind"]` is `"opfs" | "memory" | "none"` and does
+      // not list `local-directory` — it was written when the folder was not
+      // reachable at all. Its **only** two consumers are `!== "none"`
+      // (`isConfigured`, `missingSteps`), so it is a boolean wearing three
+      // values, and a picked folder answers "is a workspace configured?" with
+      // yes. It is mapped to `"opfs"` here — the member that also means "a real,
+      // durable workspace" — rather than widening a union in
+      // `components/lib/onboarding.ts`, which this block does not own.
+      //
+      // What is **not** lost: the panel and the mode badge both render
+      // `app.workspaceMode` directly, so the user is told `Lokaler Ordner`.
+      // This field only decides whether the wizard is skipped.
+      workspaceKind: app.workspaceMode === "local-directory" ? "opfs" : app.workspaceMode,
     }),
     [summary, app.workspaceMode],
   );
@@ -378,7 +457,61 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
             provider: { vendor: current?.vendor ?? "openai", model, ...(current?.baseUrl === undefined ? {} : { baseUrl: current.baseUrl }) },
           });
         }}
-        onWorkspace={() => undefined}
+        onWorkspace={() => {
+          // Choosing a sandbox in the wizard detaches a folder picked earlier, so
+          // the panel cannot go on claiming "Lokaler Ordner" over a workspace the
+          // user just left. It was a no-op before, which is how the mode and the
+          // workspace could disagree without anything noticing.
+          //
+          // **Nothing is swapped here, and that is load-bearing.** An earlier
+          // version did `app.workspace.swap(createMemoryWorkspace())` on the
+          // assumption that the mode had to change immediately. It re-renders the
+          // shell, `isConfigured` then sees provider + key + model + a workspace
+          // and returns `true`, and the wizard is replaced by the workbench
+          // **mid-step** — before the `done` step ever renders. Measured: 20 of
+          // the 44 E2E scenarios died on a `baah-wizard-finish` locator that was
+          // already gone.
+          //
+          // `release()` alone is correct and sufficient: it sets the folder state
+          // to `no-handle`, and the derived `workspaceMode` follows on the next
+          // read. The wizard keeps its own step, which is the whole point of a
+          // wizard — the shell deciding which screen to show must not change while
+          // the user is walking through one.
+          app.projectFolder.release().catch((cause: unknown) => {
+            if (mounted.current) {
+              setLiveError(
+                `Der Ordner konnte nicht getrennt werden: ${cause instanceof Error ? cause.name : "unbekannter Fehler"}.`,
+              );
+            }
+          });
+        }}
+        onPickFolder={async () => {
+          // The gesture. Same rule as `openProjectFolder` — no `setTimeout`, no
+          // intervening `await`, or transient user activation is gone and
+          // `requestPermission` throws.
+          try {
+            const next = await app.projectFolder.pick();
+            if (next.kind === "connected") {
+              app.workspace.swap(next.workspace);
+              return true;
+            }
+            if (mounted.current) {
+              setLiveError(
+                next.kind === "needs-gesture"
+                  ? "Der Browser hat die Freigabe nicht erteilt. Bitte den Ordner erneut auswählen."
+                  : "Es konnte kein Ordner verbunden werden. Die App arbeitet im Sandbox-Workspace.",
+              );
+            }
+            return false;
+          } catch (cause) {
+            if (mounted.current) {
+              setLiveError(
+                `Der Ordner konnte nicht verbunden werden: ${cause instanceof Error ? cause.name : "unbekannter Fehler"}.`,
+              );
+            }
+            return false;
+          }
+        }}
         onProbe={() => runtime.probe()}
         onFinish={() => setScreen("workbench")}
         onSkip={() => setScreen("workbench")}
@@ -552,7 +685,9 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
           <TodoSidebar todos={todos} />
           <WorkspacePanel
             mode={app.workspaceMode}
-            onOpen={() => undefined}
+            onOpen={openProjectFolder}
+            folder={folder}
+            pickerAvailable={pickerAvailable}
             onRefresh={() => {
               void runtime.readTranscript().then((transcript) => {
                 if (mounted.current) setRead(transcript);

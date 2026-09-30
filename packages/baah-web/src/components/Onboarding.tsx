@@ -60,7 +60,24 @@ export interface OnboardingProps {
   readonly onProvider: (vendor: string, baseUrl: string) => void;
   readonly onApiKey: (slot: string, apiKey: string) => void;
   readonly onModel: (model: string) => void;
+  /**
+   * The chosen workspace.
+   *
+   * `"local-directory"` is new and is **not** handled here — it cannot be, because
+   * choosing a folder needs a user gesture and a native dialog, and this step's
+   * buttons call `go("done")` immediately afterwards. It is wired in `AppShell`,
+   * which calls `projectFolder.pick()` from its own click handler and keeps the
+   * wizard on this step until the user is actually connected. See
+   * `components/WorkspacePanel.tsx` for the same path from the sidebar.
+   */
   readonly onWorkspace: (kind: "opfs" | "memory") => void;
+  /**
+   * Open the folder picker. The wizard advances **only** if a grant comes back,
+   * which is why this is a callback returning a promise rather than a plain
+   * `onClick`: a dismissed dialog must leave the user on this step instead of
+   * landing in a chat that claims a folder it does not have.
+   */
+  readonly onPickFolder: () => Promise<boolean>;
   /** §8.1 step 3's connection test. Never throws for a provider problem. */
   readonly onProbe: () => Promise<ConnectionProbeReport>;
   readonly onFinish: () => void;
@@ -104,6 +121,8 @@ export function Onboarding(props: OnboardingProps) {
   // the button's own guard (`!saved`) would otherwise make the connection test
   // unreachable the second time the user opens the wizard.
   const [saved, setSaved] = useState(props.hasKey);
+  /** A folder pick is in flight; the step is held until the browser answers. */
+  const [picking, setPicking] = useState(false);
 
   const entry = findProvider(vendor);
   const fullVendor = vendorId(vendor, label);
@@ -358,10 +377,43 @@ export function Onboarding(props: OnboardingProps) {
           >
             Nur im Arbeitsspeicher
           </button>
+          {/*
+           * The third option, and the one `AGENTS.md` §2a calls the truth source.
+           *
+           * It was a paragraph saying the feature was not offered, and that
+           * paragraph was the reason the project folder was unreachable. It is now
+           * a button: `AppShell` wires it to `projectFolder.pick()`, which is a
+           * user gesture, and the wizard only advances once the browser reports a
+           * live grant. A dismissed dialog leaves the user on this step rather
+           * than claiming a folder they did not grant.
+           *
+           * The Chromium note stays, because §14.1's table is still true — it just
+           * no longer means "therefore nothing".
+           */}
+          <button
+            type="button"
+            data-testid="baah-wizard-workspace-folder"
+            className="btn btn-outline self-start"
+            onClick={() => {
+              // The gesture is this click. `void`-ing the promise would let the
+              // wizard advance optimistically, which is the lie this step must
+              // not tell — so the step is held until the browser has answered.
+              setPicking(true);
+              props
+                .onPickFolder()
+                .then((connected) => {
+                  if (connected) go("done");
+                })
+                .finally(() => setPicking(false));
+            }}
+            disabled={picking}
+          >
+            Eigenen Projektordner verwenden
+          </button>
           <p className="text-xs opacity-70">
-            „Ordner verbinden“ (File System Access API) ist Chromium-only und wird in diesem Build nicht
-            angeboten — der Browser gibt den Ordner sonst an einen Worker weiter, den Safari nicht annimmt
-            (Plan.md §14.1).
+            Der eigene Ordner schreibt direkt auf deine Platte und ist die Wahrheitsquelle für Dateien und
+            Verlauf. Er braucht einen Klick und eine Browserfreigabe — die Freigabe überlebt keinen Kaltstart,
+            nach dem Neuladen muss der Ordner erneut verbunden werden (Plan.md §14.1, Chromium-only).
           </p>
         </section>
       )}

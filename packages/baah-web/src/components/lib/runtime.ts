@@ -69,8 +69,20 @@ import {
 import type { StorageDatabase } from "@all-the.rest/baah-storage";
 
 import { newId, resolveSessionId, SESSION_ID_KEY } from "../../lib/ids.ts";
+import {
+  createProjectFolderController,
+  createIndexedDbHandleStore,
+  type ProjectFolderController,
+  type ProjectFolderHandleStore,
+} from "../../lib/project-folder.ts";
 import { createSettingsStore, type SettingsStore } from "../../lib/settings-store.ts";
 import { createWebStorageBackend, type KeyValueBackend } from "../../lib/storage.ts";
+import {
+  createSwappableWorkspace,
+  workspaceModeOf,
+  type SwappableWorkspace,
+  type WorkspaceMode,
+} from "../../lib/swappable-workspace.ts";
 import { createDefaultProviderRegistry } from "../../providers/factories.ts";
 import { createRuntime, type BaahRuntime } from "../../runtime/index.ts";
 import { createQuestionChannelState, toolChannelFor, withQuestionFraming, type QuestionChannelState } from "./question.ts";
@@ -166,6 +178,27 @@ export interface AppRuntimeOptions {
    * browser with no `localStorage`, and vitest is one.
    */
   readonly settingsBackend?: KeyValueBackend | undefined;
+  /**
+   * Where the picked folder's handle is kept between loads.
+   *
+   * Injected for the same reason as the two backends above, and for one more:
+   * `createAppRuntime` now **touches IndexedDB at boot** to see whether a folder
+   * is still attached, and vitest has no IndexedDB. Without this seam every unit
+   * test that builds an app runtime would need a browser.
+   *
+   * Omit it and the app passes {@link createIndexedDbHandleStore}.
+   */
+  readonly folderStore?: ProjectFolderHandleStore | undefined;
+  /**
+   * Do not look for a stored folder at all.
+   *
+   * Set by the E2E build, and by any caller that injected a `workspace`. The
+   * reason is not convenience: a stored handle from a previous test run would
+   * silently replace the sandbox the suite asserts against, and the 44 scenarios
+   * would depend on the order they ran in. **A test that says nothing about the
+   * folder gets the sandbox, always.**
+   */
+  readonly restoreFolder?: boolean | undefined;
 }
 
 export interface AppRuntime {
@@ -173,7 +206,6 @@ export interface AppRuntime {
   readonly settings: SettingsStore;
   readonly questions: QuestionChannelState;
   readonly todos: TodoState;
-  readonly workspace: Workspace;
   /**
    * The store this runtime writes through.
    *
@@ -200,8 +232,38 @@ export interface AppRuntime {
    * conversation — which is exactly what the persistent database was for.
    */
   readonly bootProblems: readonly string[];
-  /** §5.3: the mode is visible, because the user must know where writes land. */
-  readonly workspaceMode: "opfs" | "memory";
+  /**
+   * §5.3: the mode is visible, because the user must know where writes land.
+   *
+   * **Derived from the workspace**, via `workspaceModeOf` — not a literal. It was
+   * `"memory"` next to a workspace that could be something else, and the panel
+   * then described writes that were not happening, which is §5.3's exact failure
+   * mode. `Plan.md` §5.3: the UI must make the mode visible, "sonst erwartet ein
+   * Firefox-Nutzer Speicherungen auf der Platte, die nicht passieren".
+   *
+   * A getter rather than a value, because the workspace is swappable at runtime
+   * and a snapshot would be stale the moment a folder is picked.
+   */
+  readonly workspaceMode: WorkspaceMode;
+  /**
+   * The workspace the runtime holds, and the one that can be repointed.
+   *
+   * A `SwappableWorkspace` rather than a `Workspace` because the runtime captured
+   * it at construction and the folder is picked later; see that module's header
+   * for why rebuilding the runtime was not an option (`opfs-sahpool` allows one
+   * connection per origin).
+   */
+  readonly workspace: SwappableWorkspace;
+  /**
+   * The project folder's own state: picked, needing a gesture, denied, or absent.
+   *
+   * Separate from {@link AppRuntime.workspaceMode} on purpose. The mode answers
+   * "where do writes land"; this answers "does the browser still let us touch the
+   * folder you chose", and after a cold start the honest answer is "not until you
+   * press the button again" while the mode is already `local-directory`. Merging
+   * them would force one of those two facts to be a lie.
+   */
+  readonly projectFolder: ProjectFolderController;
   /** `false` when a tool package failed to load. Said, not swallowed. */
   readonly toolsComplete: boolean;
   readonly missingTools: readonly string[];
@@ -294,7 +356,37 @@ export async function createAppRuntime(options: AppRuntimeOptions = {}): Promise
   const settings = createSettingsStore({
     backend: options.settingsBackend ?? createWebStorageBackend(),
   });
-  const workspace = options.workspace ?? createMemoryWorkspace(defaultSandboxFiles());
+
+  /**
+   * The workspace, and the folder controller that can replace it.
+   *
+   * ## Why the sandbox is still the default — deliberately, and it is the test's life
+   *
+   * `createMemoryWorkspace(defaultSandboxFiles())` stays the fallback and the
+   * answer for every test. That is not caution, it is a hard constraint: the E2E
+   * suite runs against the in-memory sandbox, there is no `showDirectoryPicker`
+   * in that environment, and a dialog a test cannot answer is not a test. A
+   * project folder as the *default* would make all 44 scenarios depend on a
+   * picker, and the honest outcome would be a suite that cannot run at all.
+   *
+   * So: memory by default, folder on request. `AGENTS.md` §2a asks for the
+   * folder to be the truth source, and it is — from the moment the user picks it,
+   * over every subsequent turn, until they pick something else.
+   *
+   * ## Why restore is conditional on *two* things
+   *
+   * `options.restoreFolder === false` **or** an injected `workspace`. A test that
+   * handed in a workspace and still got a stored folder swapped in underneath it
+   * would be asserting against something it never set up — and the E2E build, a
+   * real browser with a real IndexedDB, is exactly where a leftover handle from
+   * an earlier run would appear.
+   */
+  const fallback = options.workspace ?? createMemoryWorkspace(defaultSandboxFiles());
+  const workspace = createSwappableWorkspace(fallback);
+  const projectFolder = createProjectFolderController({
+    store: options.folderStore ?? createIndexedDbHandleStore(),
+  });
+
   const questions = createQuestionChannelState();
   const todos = createTodoState();
   const loaded = options.tools ?? (await loadAppTools({ questions, todos, sessionId }));
@@ -325,15 +417,66 @@ export async function createAppRuntime(options: AppRuntimeOptions = {}): Promise
     answer: () => Promise.resolve("deny"),
   });
 
+  /**
+   * Everything the user has to be told out loud, assembled **before** the folder
+   * is looked at — because looking can produce one more.
+   */
+  const bootProblems: string[] = session.degraded === undefined ? [] : [session.degraded];
+
+  /**
+   * Re-attach a folder the user picked in an earlier session.
+   *
+   * `queryPermission` only, no picker, no `requestPermission` — see
+   * `lib/project-folder.ts` for why that distinction is the whole feature. A
+   * granted handle **is** swapped in here, which is what makes the folder survive
+   * a reload; everything else leaves the sandbox in place and is reported.
+   *
+   * Every failure is caught and turned into a boot problem. `AGENTS.md` §5: no
+   * silent catch — and here it is not tidiness. An IndexedDB that refuses (a
+   * private window, a blocked third-party context, a browser that dropped the
+   * entry) would otherwise reject out of `createAppRuntime` and land the user on
+   * the boot-failure screen, which says "the app could not start" when in fact
+   * everything works and only the folder is gone.
+   */
+  if (options.restoreFolder !== false && options.workspace === undefined) {
+    try {
+      const restored = await projectFolder.restore();
+      if (restored.kind === "connected") {
+        workspace.swap(restored.workspace);
+      } else if (restored.kind === "needs-gesture") {
+        bootProblems.push(
+          `Der Ordner „${restored.label}" ist ausgewählt, aber der Browser hat die Freigabe nach dem ` +
+            "Neuladen zurückgesetzt. Drücke „Ordner verbinden“, um sie erneut zu erteilen.",
+        );
+      }
+      // `denied` and `unsupported` produce no problem line on purpose: the panel
+      // already has a state to render for each, and a second copy of the same
+      // sentence in two places is one more thing to keep in step.
+    } catch (cause) {
+      bootProblems.push(
+        "Der gespeicherte Projektordner konnte nicht wiederhergestellt werden " +
+          `(${cause instanceof Error ? cause.name : "unbekannter Fehler"}). Die App läuft im Sandbox-Workspace.`,
+      );
+    }
+  }
+
   return {
     runtime,
     settings,
     questions,
     todos,
     workspace,
+    projectFolder,
     database,
-    bootProblems: session.degraded === undefined ? [] : [session.degraded],
-    workspaceMode: "memory",
+    bootProblems,
+    /**
+     * **A getter, not a value.** The workspace is swappable — the folder is picked
+     * after this object is built — so a snapshot taken here would report `"memory"`
+     * forever, which is the exact lie this replaced. See the interface.
+     */
+    get workspaceMode(): WorkspaceMode {
+      return workspaceModeOf(workspace.current);
+    },
     toolsComplete: loaded.length >= 8,
     missingTools: loaded.length >= 8 ? [] : ["ein oder mehrere Werkzeuge"],
     // **`recordUserMessage` is gone, and the engine is why.**
