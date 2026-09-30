@@ -508,6 +508,38 @@ export function createStorageWorker(options: StorageWorkerOptions = {}): Storage
 /* Entry point                                                          */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Hand one incoming message to the worker, without producing an unhandled
+ * rejection and without swallowing a failure either.
+ *
+ * `handleMessage` answers **every** request with exactly one correlated
+ * response — that is the contract `client.ts` waits on, and it is why this call
+ * is fire-and-forget at the entry point rather than awaited. The only way it can
+ * reject is a `postMessage` that itself failed, and then the client is sitting
+ * on a promise that will never settle. A `catch {}` here would turn that hang
+ * into silence; a bare `void` would turn it into an *unhandled promise
+ * rejection*, which in a worker is reported on the worker's own
+ * `unhandledrejection` and is invisible to the parent — the client keeps waiting
+ * either way.
+ *
+ * The honest report is an uncaught error in the worker's global scope, because
+ * that is the one thing the parent does observe: `client.ts` already listens for
+ * the worker's `error` event and turns it into a typed `internal` rejection for
+ * every pending call. So the failure is re-raised in a fresh task instead of
+ * being dropped.
+ *
+ * Exported and named so the behaviour is reachable from a test — the module-level
+ * `addEventListener` registration below is the only production caller, and a
+ * branch nothing can reach is a branch nothing can check.
+ */
+export function handleWorkerMessage(worker: StorageWorker, data: unknown): void {
+  void worker.handleMessage(data).catch((error: unknown) => {
+    setTimeout(() => {
+      throw error instanceof Error ? error : new Error(String(error));
+    }, 0);
+  });
+}
+
 const worker = createStorageWorker();
 
 const workerGlobal = globalThis as unknown as Partial<WorkerScope>;
@@ -516,7 +548,9 @@ if (typeof workerGlobal.addEventListener === "function") {
   // and the test suite imports this module to drive `createStorageWorker()`
   // directly — importing it must not require a browser.
   workerGlobal.addEventListener("message", (event) => {
-    // Fire and forget: every path answers with a correlated response.
-    void worker.handleMessage(event.data);
+    // Fire and forget: every path answers with a correlated response, and a
+    // failure to answer is re-raised rather than dropped — see
+    // {@link handleWorkerMessage}.
+    handleWorkerMessage(worker, event.data);
   });
 }

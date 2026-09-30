@@ -283,12 +283,15 @@ export function createTurnStore(
      * clause — see `UPDATE_TURN_HEARTBEAT`, whose comment records the stale
      * justification that scoping replaced.
      *
-     * The engine does **not** await this call — `loop.ts` fires it as
-     * `void store.heartbeat(…)`, on every step end and at the start of every
-     * attempt — so a rejection here would be an unhandled promise rejection
-     * rather than a reported failure. An unknown turn id, or one from another
-     * session, therefore writes nothing and raises nothing, which is also what
-     * SQLite reports for a zero-row `UPDATE`.
+     * The engine does **not** await this call — `loop.ts` fires it on every step
+     * end and at the start of every attempt, because `onStepEnd` is a synchronous
+     * callback of `ToolLoopAgent` and there is no promise for it to return. So a
+     * rejection here does **not** escape as an unhandled rejection: the engine
+     * attaches a handler and reports a `storage-warning` event, which is where
+     * "the anchor is no longer being renewed" becomes visible. An unknown turn
+     * id, or one from another session, therefore writes nothing and raises
+     * nothing, which is also what SQLite reports for a zero-row `UPDATE` — and it
+     * is the *only* outcome that is meant to be silent.
      */
     async heartbeat(input: HeartbeatInput): Promise<void> {
       await database.renewHeartbeat({

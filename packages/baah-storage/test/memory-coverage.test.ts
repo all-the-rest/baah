@@ -109,6 +109,50 @@ const IMPLEMENTED: {
       }),
   },
   {
+    name: "SELECT_TURN_IN_SESSION",
+    statement: sql.SELECT_TURN_IN_SESSION,
+    // The existence check, and its own precondition: a turn has to exist, and it
+    // has to be in the session the read named. The seeded corpus has none, so
+    // this one writes its own turn.
+    needsSeed: true,
+    run: async (db) => {
+      await db.appendTurn({ id: "t1", sessionId: "s1", startedAt: T0 });
+      return db.readTranscript({ sessionId: "s1", turnId: "t1" });
+    },
+  },
+  {
+    name: "SELECT_TRANSCRIPT_MESSAGES",
+    statement: sql.SELECT_TRANSCRIPT_MESSAGES,
+    needsSeed: true,
+    run: (db) => db.readTranscript({ sessionId: "s1" }),
+  },
+  {
+    name: "SELECT_TRANSCRIPT_MESSAGES_FOR_TURN",
+    statement: sql.SELECT_TRANSCRIPT_MESSAGES_FOR_TURN,
+    // Needs a turn: the statement's own guard is `session_id = ? AND turn_id = ?`,
+    // and the turn row is written here so the read has a scope to find.
+    needsSeed: true,
+    run: async (db) => {
+      await db.appendTurn({ id: "t1", sessionId: "s1", startedAt: T0 });
+      return db.readTranscript({ sessionId: "s1", turnId: "t1" });
+    },
+  },
+  {
+    name: "SELECT_TRANSCRIPT_PARTS",
+    statement: sql.SELECT_TRANSCRIPT_PARTS,
+    needsSeed: true,
+    run: (db) => db.readTranscript({ sessionId: "s1" }),
+  },
+  {
+    name: "SELECT_TRANSCRIPT_PARTS_FOR_TURN",
+    statement: sql.SELECT_TRANSCRIPT_PARTS_FOR_TURN,
+    needsSeed: true,
+    run: async (db) => {
+      await db.appendTurn({ id: "t1", sessionId: "s1", startedAt: T0 });
+      return db.readTranscript({ sessionId: "s1", turnId: "t1" });
+    },
+  },
+  {
     name: "FLUSH_DELTA_LOG_SQL",
     statement: sql.FLUSH_DELTA_LOG_SQL,
     needsSeed: true,

@@ -514,6 +514,45 @@ ist `config-error` (endgültig, mit benanntem Code für die UI).
 `waiting`-Zustands und **misst nichts**. Der Loop kann ein `stream()`, auf das
 er wartet, nicht unterbrechen, also kann er keinen Stillstand messen — und
 `no-response` hat damit im Turn keine Erzeugung. Die Messung gehört an den
+
+#### Korrektur (datiert): `no-response` **wird** im Turn erzeugt
+
+Die Zeile oben — *„`no-response` hat damit im Turn keine Erzeugung"* — ist **falsch**, und
+sie ist mir von einem Verify-Agenten widerlegt worden. Belege:
+
+```
+classify.ts:504   if (!facts.responded) return { kind: "no-response" };
+classify.ts:517   if (isAbortLike(facts.error)) return { kind: "no-response" };
+loop.ts:829       if (classification.kind === "no-response") { … }
+```
+
+Die Engine erzeugt das Verdict. Was nicht existiert, ist ein **App-seitiger Erzeuger**, und
+genau darüber ist die Absatz verwaschen: aus „der App fehlt ein Erzeuger" wurde fälschlich
+„niemand erzeugt es".
+
+**Was tatsächlich gilt, und worauf ich in meinem Auftrag falsch bestanden habe:** ich habe
+einen Watchdog verlangt, der §5.4s `no-response` erfüllt. Der vorhandene Watchdog in
+`packages/baah-web/src/runtime/watchdog.ts` tut das **nicht** — und **soll das auch nicht**.
+Er beobachtet jedes `AgentEvent` des Loops, setzt seinen Timer echt zurück und latched in den
+Zustand, damit ein spät abonnierter Subscriber den Wartezustand noch erfährt. Aber er trägt
+`silentForMs` und `lastEventType`, **keine Klassifikation**, und er kann den Turn nicht
+beenden.
+
+| | Klassifikation | Stall-Report |
+|---|---|---|
+| wer | Engine (`classify.ts`) | App (`watchdog.ts`) |
+| was | `kind: "no-response"` | `silentForMs` + `lastEventType` |
+| Wirkung | beendet den Turn | **keine** — §5.4: ein Stall ist ein Wartezustand, nie eine automatische Aktion |
+| erreicht §5.4? | ja | **nein, und das ist dokumentiert** |
+
+**Bleibt offen, ehrlich benannt:** der **rohe Provider-Chunk**. `ToolLoopAgentSettings` hat
+kein `onChunk`, kein `includeRawChunks`, kein `onError` — dieselbe Grenze, die schon beim
+Terminal-Event aufgefallen ist. Ein Watchdog auf dem richtigen Signal, der §5.4 behauptet,
+wäre schlimmer als eine benannte Lücke. Diese Datei benennt sie.
+
+→ **Anhang, keine Überschreibung** (`AGENTS.md` §7.2b). Der Absatz oben bleibt stehen, weil
+er dokumentiert, **wie** die Aussage entstanden ist; dieser Block sagt, was daran falsch war.
+
 Transport (ein Watchdog auf die Chunk-Zeitpunkte), also an dieselbe Stelle, an
 der auch das 20-s-Fenster durchgesetzt werden müsste, damit es etwas bedeutet.
 Ein Stall-Detektor, der keinen Stall beobachten kann, ist von gar keinem nicht

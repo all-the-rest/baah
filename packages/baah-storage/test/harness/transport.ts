@@ -16,7 +16,7 @@ import type { WorkerLike, WorkerStorageDatabase } from "../../src/client.ts";
 import { WorkerStorageDatabase as Client } from "../../src/client.ts";
 import type { RpcResponse } from "../../src/protocol.ts";
 import { createStorageWorker } from "../../src/worker.ts";
-import type { StorageWorker, StorageWorkerOptions } from "../../src/worker.ts";
+import { handleWorkerMessage, type StorageWorker, type StorageWorkerOptions } from "../../src/worker.ts";
 
 /** Everything the worker posted, in order. */
 export interface RecordedScope {
@@ -219,7 +219,12 @@ export function createLoopback(options: StorageWorkerOptions): Loopback {
   });
   const transport = new FakeWorker({
     onMessage: (data) => {
-      void worker.handleMessage(data);
+      // The same entry point the module's own `addEventListener` uses, so the
+      // loopback exercises the shipped fire-and-forget *and* its failure path
+      // rather than a private copy of the happy half. It is not awaited here
+      // either — a real `postMessage` never re-enters the sender synchronously,
+      // which is the whole reason this harness answers later.
+      handleWorkerMessage(worker, data);
     },
   });
   deliverToClient = (data) => {

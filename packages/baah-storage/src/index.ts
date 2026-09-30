@@ -53,11 +53,14 @@ export {
 
 export {
   clampSearchLimit,
+  clampTranscriptLimit,
   createStorageOperations,
   decodeToolOutput,
   DEFAULT_SEARCH_LIMIT,
+  DEFAULT_TRANSCRIPT_MESSAGES,
   encodeToolOutput,
   MAX_SEARCH_LIMIT,
+  MAX_TRANSCRIPT_MESSAGES,
   requireSessionStatus,
   RESULT_PREVIEW_CHARS,
   streamingPart,
@@ -112,6 +115,11 @@ export {
   INSERT_TURN,
   INSERT_TURN_OUTCOME_MESSAGE,
   SELECT_TOOL_CALL,
+  SELECT_TRANSCRIPT_MESSAGES,
+  SELECT_TRANSCRIPT_MESSAGES_FOR_TURN,
+  SELECT_TRANSCRIPT_PARTS,
+  SELECT_TRANSCRIPT_PARTS_FOR_TURN,
+  SELECT_TURN_IN_SESSION,
   SELECT_UNFINISHED_TURNS,
   TOOL_CALL_KEY_PREDICATE,
   toolCallKeyParams,
@@ -125,5 +133,22 @@ export {
 } from "./sql.ts";
 
 export { createTurnStore, type TurnStoreOptions } from "./turn-store.ts";
+
+/**
+ * The read port, next to the write one.
+ *
+ * Two exports because the composition root takes **two** injected dependencies
+ * (`Plan.md` §16.1): `createTurnStore` for the engine's writes and
+ * `createTranscriptReader` for the app's reads. See `transcript.ts` for why they
+ * are two ports and not one object.
+ */
+export {
+  createTranscriptReader,
+  type Transcript,
+  type TranscriptMessage,
+  type TranscriptPart,
+  type TranscriptReader,
+  type TranscriptRequest,
+} from "./transcript.ts";
 
 export type * from "./types.ts";

@@ -508,8 +508,20 @@ describe("the heartbeat age threshold for `interrupted`", () => {
     expect(code).toMatch(/isTurnStale\(/);
     // Written at the start of an attempt as well as per step, so a turn that
     // dies before its first `onStepEnd` still has an anchor.
-    expect(code.match(/store\.heartbeat\(/g) ?? []).toHaveLength(1);
+    //
+    // Whitespace-tolerant on purpose: the count is the property, not the line
+    // breaking. An earlier version of this assertion was `/store\.heartbeat\(/`
+    // and it silently stopped matching the moment the call was reformatted onto
+    // two lines — a regex that measures formatting is a regex that reports
+    // nothing.
+    expect(code.match(/store\s*\.\s*heartbeat\s*\(/g) ?? []).toHaveLength(1);
     expect(code.match(/heartbeat\(\);/g) ?? []).toHaveLength(2);
+    // And the discarded promise is not there any more: the failure of the one
+    // write on this seam that is *not* awaited has to be reported, and a bare
+    // `void` is the same silence as a `catch {}` with an extra step. Asserted on
+    // the call site rather than on the word `void`, so the chained
+    // `.catch(…)` right below it is exactly what keeps the assertion true.
+    expect(code).not.toMatch(/store\s*\.\s*heartbeat\s*\([^)]*\)\s*;/);
   });
 
   it("a FRESH heartbeat is on the live side, both sides of the boundary", () => {

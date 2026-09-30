@@ -139,6 +139,91 @@ export const UPSERT_PART = `
 export const SELECT_PARTS = `
   SELECT ${PART_COLUMNS} FROM parts WHERE message_id = ? ORDER BY seq ASC`;
 
+/* ------------------------------------------------------------------ */
+/* Reading a transcript back                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The turn window: does this turn belong to this session?
+ *
+ * The **existence** check, and it is a statement rather than a post-hoc
+ * comparison because "this turn said nothing" and "there is no such turn in this
+ * session" are different facts. A caller — the reload recovery, which is handed
+ * a `turnId` by `recoverStaleTurns` — that got the second one and was told the
+ * first would render *"this turn produced no output"* over a turn that does not
+ * exist, and would render it over **another session's** turn if the guard were
+ * only the id. `id` and `session_id` are both bound, exactly like
+ * {@link UPDATE_TURN_OUTCOME}'s guard and for the same reason.
+ *
+ * One column. It decides "is it there", never "what does it say".
+ */
+export const SELECT_TURN_IN_SESSION = `
+  SELECT id FROM turns WHERE id = ? AND session_id = ? LIMIT 1`;
+
+/**
+ * The transcript window: the **newest** `limit` messages of a session.
+ *
+ * `ORDER BY seq DESC` and not `created_at`, because `seq` is the sort key
+ * (`Plan.md` §6.2) and two messages can share a millisecond. **Descending**
+ * because the read is a *window*, and a window over a growing log has to be
+ * taken from the end: the recovery wants the turn that just died, the transcript
+ * view wants what the user last saw, and neither wants the beginning of a
+ * thousand-message session. The operations layer reverses the rows back into
+ * `seq` order before handing them to a caller, because a renderer wants oldest
+ * first and the read wants newest first.
+ *
+ * The bound arrives already clamped, in the shared layer, so both backends see
+ * the identical number — the same reason `clampSearchLimit` exists.
+ */
+export const SELECT_TRANSCRIPT_MESSAGES = `
+  SELECT ${MESSAGE_COLUMNS} FROM messages
+  WHERE session_id = ?
+  ORDER BY seq DESC
+  LIMIT ?`;
+
+/** {@link SELECT_TRANSCRIPT_MESSAGES} narrowed to one turn of that session. */
+export const SELECT_TRANSCRIPT_MESSAGES_FOR_TURN = `
+  SELECT ${MESSAGE_COLUMNS} FROM messages
+  WHERE session_id = ? AND turn_id = ?
+  ORDER BY seq DESC
+  LIMIT ?`;
+
+/**
+ * The parts of the messages in {@link SELECT_TRANSCRIPT_MESSAGES}' window.
+ *
+ * **One statement for the whole transcript, and the window is a subquery rather
+ * than an interpolated id list.** A list of message ids would have to be built
+ * from the rows the previous read returned, which is fine as a shape and wrong
+ * as a design: the `LIMIT` would then be enforced by the caller and a future
+ * reader that forgot it would load a whole session. As written, the bound is the
+ * statement's own and cannot be forgotten.
+ *
+ * The subquery carries `limit`, not `limit + 1` — the message read asks for one
+ * row more than it returns (that is how `truncated` is detected), and the
+ * retained rows are exactly this subquery's rows. Correctness does not depend on
+ * that agreement, though: the reader attaches parts to *returned* messages by
+ * id, so a part whose message was dropped is dropped with it.
+ *
+ * `parts.session_id` is deliberately **not** in the guard, mirroring
+ * {@link ABORT_TURN_PARTS}: the message ids already come from a session-scoped
+ * subquery, so the session is named once and in one place, and a redundant
+ * second predicate is a second thing a reader has to convince itself is right.
+ */
+export const SELECT_TRANSCRIPT_PARTS = `
+  SELECT ${PART_COLUMNS} FROM parts
+  WHERE message_id IN (
+    SELECT id FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?
+  )
+  ORDER BY message_id, seq ASC`;
+
+/** {@link SELECT_TRANSCRIPT_PARTS} narrowed to one turn of that session. */
+export const SELECT_TRANSCRIPT_PARTS_FOR_TURN = `
+  SELECT ${PART_COLUMNS} FROM parts
+  WHERE message_id IN (
+    SELECT id FROM messages WHERE session_id = ? AND turn_id = ? ORDER BY seq DESC LIMIT ?
+  )
+  ORDER BY message_id, seq ASC`;
+
 /**
  * FTS5 over `parts.content_text`.
  *
@@ -315,9 +400,10 @@ export const SELECT_UNFINISHED_TURNS = `
  * that would have talked the next reader into removing it is gone with it.
  *
  * A turn id that does not exist — or is not in that session — changes 0 rows
- * and raises nothing: the recoverable direction, and the reason the engine may
- * fire this without awaiting it (`loop.ts` calls it as `void store.heartbeat(…)`,
- * so a rejection here would be an unhandled promise rejection).
+ * and raises nothing: the recoverable direction. A rejection, by contrast, is not
+ * silent — `loop.ts` cannot await this call (`onStepEnd` is a synchronous SDK
+ * callback) but it does attach a handler, and the failure arrives as a
+ * `storage-warning` on the turn rather than as an unhandled rejection.
  */
 export const UPDATE_TURN_HEARTBEAT = `
   UPDATE turns SET heartbeat_at = ? WHERE id = ? AND session_id = ?`;

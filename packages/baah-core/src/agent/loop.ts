@@ -47,10 +47,22 @@
  * where the check is used rather than approximated, because approximating it is
  * exactly what made the previous check fire on correct answers.
  *
- * ## Nothing here writes to the console
+ * ## Nothing here writes to the console, and no promise is discarded bare
  *
  * AGENTS.md §5: everything the user must see becomes a typed event. A provider
  * error that only reached `console.error` would be invisible in the product.
+ *
+ * The same rule extends to a **discarded promise**, and there the shape matters
+ * rather than the syntax. `void somePromise()` throws the rejection away with no
+ * `.catch`, so it does not become invisible — it becomes an *unhandled promise
+ * rejection*, which the browser routes to `unhandledrejection` and vitest
+ * treats as a fatal error. That is the same silent failure as a `catch {}` with
+ * one extra step. Two writes on {@link TurnStore} are fired rather than awaited —
+ * `heartbeat` and `recordToolCall`, both because their call sites are synchronous
+ * SDK callbacks — and both attach a handler that reports a `storage-warning`. The
+ * reasoning for *warning* rather than *abort* is written out at `heartbeat()`; the
+ * short version is that both are bookkeeping, and the write that genuinely ends a
+ * turn is the delta flush, which is awaited.
  *
  * ## Storage is injected, not imported
  *
@@ -145,7 +157,39 @@ export type AgentEvent =
    */
   | { type: "turn-stopped"; stage: "attempt" | "approval-resume" }
   | { type: "turn-finished"; outcome: TurnOutcome; attempts: number }
-  | { type: "error"; error: unknown; classification: Classification };
+  | { type: "error"; error: unknown; classification: Classification }
+  /**
+   * A **bookkeeping** write the engine fires without awaiting failed.
+   *
+   * Its own event, and not a `catch {}`, because `AGENTS.md` §5 is a rule about
+   * what the user gets to see and a discarded promise is worse than a silent
+   * catch: with a bare `void` the rejection never reaches the turn at all, it
+   * leaves as an *unhandled promise rejection* — routed to the browser's
+   * `unhandledrejection`, and fatal to a vitest run. The three states that
+   * matters are named on the interface: the operation, the attempt it belongs
+   * to, and — for the one that has a subject — which tool call it is about.
+   *
+   * A **warning, not a verdict.** The full argument is at
+   * {@link describeStorageFailure}'s call site, in `heartbeat()`; the short
+   * version is that a heartbeat is a liveness ping whose only reader is the
+   * *next* start-up, and that the write which genuinely ends a turn — the delta
+   * flush — is awaited and does fail loudly on its own.
+   */
+  | {
+      type: "storage-warning";
+      operation: "heartbeat";
+      attempt: number;
+      /** The store's own message. Never a stack trace (`AGENTS.md` §5). */
+      message: string;
+    }
+  | {
+      type: "storage-warning";
+      operation: "record-tool-call";
+      attempt: number;
+      toolCallId: string;
+      toolName: string;
+      message: string;
+    };
 
 export type TurnOutcome = "succeeded" | "failed" | "interrupted" | "waiting" | "awaiting-approval";
 
@@ -1262,8 +1306,61 @@ export class AgentTurn {
       await flushPart(partId);
     };
 
+    /**
+     * Renew the reload anchor, and report a failure as a typed event.
+     *
+     * ## Why the call is not awaited
+     *
+     * `onStepEnd` is a **synchronous** callback of `ToolLoopAgent`; there is no
+     * promise for it to return, and awaiting inside it is not an option. Making
+     * the callback async would not help — the SDK does not await it, so the
+     * heartbeat would become a floating promise anyway, one call removed.
+     *
+     * ## Why a rejection is a `storage-warning` and not a verdict
+     *
+     * This is the decision the whole helper is, so it is written out rather than
+     * left to the next reader:
+     *
+     * 1. **A heartbeat is a best-effort liveness ping.** Its only reader is
+     *    {@link recoverStaleTurns}, on the *next* start-up — nothing in the
+     *    running turn consults it. `UPDATE_TURN_HEARTBEAT` writes one column and
+     *    touches no other row, so a heartbeat that cannot be written has not
+     *    corrupted anything the user is looking at.
+     * 2. **Aborting here would throw away a turn that is working.** The stream
+     *    is in flight and the user is watching tokens arrive. The signal lands at
+     *    the start of an attempt, i.e. routinely *before* the first delta flush —
+     *    and that flush is the write whose rejection is allowed to end the turn,
+     *    because it is the write that carries the sentence. Letting the ping
+     *    decide the turn's outcome would invert the two: the least load-bearing
+     *    write would be fatal and the transcript would lose its text to it.
+     * 3. **The damage is bounded, visible and reversible.** A stale anchor means
+     *    the next start-up marks the turn `interrupted` and offers `regenerate`
+     *    (`Plan.md` §5.1) — a turn the user did not lose, offered back to them.
+     *    That is the same trade §5.1 already makes for the 30 s threshold,
+     *    applied one level up.
+     * 4. **The first heartbeat is the *earliest* symptom, not different
+     *    information.** A rejection here is almost always "the database is
+     *    closed", and the delta flush that follows fails loudly on its own. So
+     *    the warning buys earliness, not a verdict — which is exactly why it is
+     *    worth reporting and not worth aborting over.
+     *
+     * `onEvent` is the caller's callback and is deliberately not wrapped: a throw
+     * there is a bug in the app, and every other `emit` in this file has the same
+     * exposure. Inside this handler it would additionally leave an unhandled
+     * rejection rather than a classified turn error, which is the one asymmetry
+     * worth stating rather than hiding.
+     */
     const heartbeat = (): void => {
-      void store.heartbeat({ turnId, sessionId, at: new Date(now()).toISOString() });
+      store
+        .heartbeat({ turnId, sessionId, at: new Date(now()).toISOString() })
+        .catch((error: unknown) => {
+          emit({
+            type: "storage-warning",
+            operation: "heartbeat",
+            attempt,
+            message: describeStorageFailure(error),
+          });
+        });
     };
     // Written at the start of every attempt, not only per step, so a turn that
     // dies *before* its first `onStepEnd` still has an anchor to be measured
@@ -1432,11 +1529,38 @@ export class AgentTurn {
             // the fact that the tool ran, or a replay would run it again. The
             // key is the *same* one the short-circuit will look the call up
             // under, so a replay finds it and a same-id reuse does not.
-            void store.recordToolCall({
-              key: toolCallKeys.get(part.toolCallId) ?? nextToolCallKey(sessionId, attempt, part.toolCallId, occurrences),
-              toolName: part.toolName,
-              output: part.output,
-            });
+            //
+            // A rejection is the `storage-warning` case too, and the reasoning
+            // mirrors the heartbeat's with the stakes inverted. It does not
+            // make *this* turn fail: the model already holds the tool's real
+            // output, and the call really did happen. What a lost record costs
+            // is the *proof* — a later replay of the same
+            // `(sessionId, attempt, toolCallId, occurrence)` may run the tool
+            // again, which for a `write` tool is a second append to the user's
+            // file. That is worth a line on screen and nothing more; the engine
+            // has no way to make the record appear.
+            //
+            // It is deliberately *not* an `UnknownToolOutcome`: that says the
+            // outcome is unknown, and here it is known exactly — only the proof
+            // of it is missing. Filing it as unknown would send the model off to
+            // "verify instead of repeating" about a call whose answer it just
+            // received.
+            store
+              .recordToolCall({
+                key: toolCallKeys.get(part.toolCallId) ?? nextToolCallKey(sessionId, attempt, part.toolCallId, occurrences),
+                toolName: part.toolName,
+                output: part.output,
+              })
+              .catch((error: unknown) => {
+                emit({
+                  type: "storage-warning",
+                  operation: "record-tool-call",
+                  attempt,
+                  toolCallId: part.toolCallId,
+                  toolName: part.toolName,
+                  message: describeStorageFailure(error),
+                });
+              });
             break;
           }
 
@@ -1814,6 +1938,20 @@ function describe(classification: Classification): string {
       // at the network.
       return `API key missing: ${classification.message}`;
   }
+}
+
+/**
+ * The one-line description of a store failure, for a `storage-warning`.
+ *
+ * **The message and nothing else.** `AGENTS.md` §5's rule for the tool-error
+ * path applies verbatim here: a stack trace is a leak of engine internals into
+ * a string the UI renders, and the store's own `code` (`sql_error`,
+ * `database_closed`, …) is the part a user can act on. A thrown value that is
+ * not an `Error` is stringified rather than dropped — an unprintable failure is
+ * still a failure, and `String(value)` is all a description can honestly be.
+ */
+function describeStorageFailure(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export type { ToolSet, AiToolSet, UIMessageChunk };

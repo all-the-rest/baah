@@ -55,6 +55,8 @@ import type {
   StorageDatabase,
   ToolCallKey,
   ToolCallRecord,
+  TranscriptQuery,
+  TranscriptRows,
   Turn,
   TurnInput,
   TurnOutcomeEntry,
@@ -260,6 +262,19 @@ export class WorkerStorageDatabase implements StorageDatabase {
 
   listMessages(sessionId: string): Promise<Message[]> {
     return this.#operations.listMessages(sessionId);
+  }
+
+  /**
+   * A transcript window, over the shared operations module like every other read.
+   *
+   * That is what makes the closed-database case honest without a line of code
+   * here: `engine.all` is `query`, `query` is `#send`, and `#send` refuses a
+   * closed handle with `database_closed`. The read does not catch it, and the
+   * read port does not catch it either — a refusal that became an empty array
+   * would be a lie the UI could not detect.
+   */
+  readTranscript(input: TranscriptQuery): Promise<TranscriptRows> {
+    return this.#operations.readTranscript(input);
   }
 
   appendPart(input: PartInput): Promise<Part> {

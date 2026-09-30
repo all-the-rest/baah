@@ -40,6 +40,11 @@ import {
   SELECT_SESSIONS,
   SELECT_DELTA_SEQ,
   SELECT_TOOL_CALL,
+  SELECT_TRANSCRIPT_MESSAGES,
+  SELECT_TRANSCRIPT_MESSAGES_FOR_TURN,
+  SELECT_TRANSCRIPT_PARTS,
+  SELECT_TRANSCRIPT_PARTS_FOR_TURN,
+  SELECT_TURN_IN_SESSION,
   SELECT_UNFINISHED_TURNS,
   UPDATE_PART_STATUS,
   UPDATE_TURN_HEARTBEAT,
@@ -69,6 +74,8 @@ import type {
   ToolCallRecord,
   ToolInvocation,
   ToolInvocationStatus,
+  TranscriptQuery,
+  TranscriptRows,
   Turn,
   TurnInput,
   TurnOutcome,
@@ -523,7 +530,25 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
       messageId,
       sessionId,
       seq: assigned,
-      type: requireOneOf("parts.type", type, PART_TYPES),
+      /**
+       * `type` is **not** updated by an upsert, and this line is where the two
+       * backends were found to disagree.
+       *
+       * `UPSERT_PART`'s `ON CONFLICT (id) DO UPDATE SET` names four columns:
+       * `content_text`, `data`, `status`, `updated_at`. `type` is not one of them,
+       * so a re-flush of a part cannot re-kind it — and SQLite keeps the original
+       * value. This mirror used to write the caller's `type` on every upsert, so a
+       * part seeded as `reasoning` and re-flushed as `text` came back `text` here
+       * and `reasoning` there: a silent divergence, measured by
+       * `test/transcript.test.ts` rather than argued about, and of exactly the kind
+       * `Plan.md` §6.2's interchangeability forbids.
+       *
+       * SQLite is the shipped behaviour and it is the conservative one: a part's
+       * kind cannot change underneath a reader. An explicit `INSERT` of the same
+       * id is refused above, so there is no path on which `type` is written twice
+       * for one id.
+       */
+      type: existing?.type ?? requireOneOf("parts.type", type, PART_TYPES),
       data: typeof data === "string" ? data : null,
       contentText: typeof contentText === "string" ? contentText : "",
       status: nullableOneOf("parts.status", status, STREAM_STATUSES),
@@ -821,6 +846,68 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     return undefined;
   };
 
+  /** `SELECT_TRANSCRIPT_MESSAGES[_FOR_TURN]`: the newest N, so descending. */
+  const selectTranscriptMessages = (params: readonly SqlParam[]): ExecutionResult => {
+    const byTurn = params.length === 3;
+    const sessionId = params[0];
+    const turnId = byTurn ? params[1] : null;
+    const rawLimit = byTurn ? params[2] : params[1];
+    if (typeof sessionId !== "string" || (byTurn && typeof turnId !== "string")) {
+      return { rows: [], changes: 0 };
+    }
+    const rows = [...store.messages.values()]
+      .filter((row) => row.sessionId === sessionId)
+      .filter((row) => (byTurn ? row.turnId === turnId : true))
+      // `seq DESC`, not `created_at`: §6.2's sort key, and two messages can
+      // share a millisecond.
+      .sort((a, b) => b.seq - a.seq)
+      .slice(0, typeof rawLimit === "number" ? Math.max(0, rawLimit) : 0);
+    return { rows, changes: 0 };
+  };
+
+  /**
+   * `SELECT_TRANSCRIPT_PARTS[_FOR_TURN]`: the parts of the same window.
+   *
+   * The window is re-derived rather than handed in, because the statement
+   * re-derives it too: `message_id IN (SELECT id FROM messages WHERE … LIMIT ?)`
+   * is one statement with its own bound, so a caller cannot drop the bound by
+   * forgetting something on this side. `ORDER BY message_id, seq ASC` — and the
+   * cross-message order is irrelevant to every caller, which groups by message
+   * id; what matters is that it is *deterministic*.
+   */
+  const selectTranscriptParts = (params: readonly SqlParam[]): ExecutionResult => {
+    const byTurn = params.length === 3;
+    const sessionId = params[0];
+    const turnId = byTurn ? params[1] : null;
+    const rawLimit = byTurn ? params[2] : params[1];
+    if (typeof sessionId !== "string" || (byTurn && typeof turnId !== "string")) {
+      return { rows: [], changes: 0 };
+    }
+    const messageIds = new Set(
+      [...store.messages.values()]
+        .filter((row) => row.sessionId === sessionId)
+        .filter((row) => (byTurn ? row.turnId === turnId : true))
+        .sort((a, b) => b.seq - a.seq)
+        .slice(0, typeof rawLimit === "number" ? Math.max(0, rawLimit) : 0)
+        .map((row) => row.id),
+    );
+    const rows = [...store.parts.values()]
+      .filter((row) => messageIds.has(row.messageId))
+      .sort(
+        (a, b) =>
+          (a.messageId < b.messageId ? -1 : a.messageId > b.messageId ? 1 : 0) || a.seq - b.seq,
+      );
+    return { rows, changes: 0 };
+  };
+
+  /** `SELECT_TURN_IN_SESSION`: the existence check, scoped by id *and* session. */
+  const selectTurnInSession = (params: readonly SqlParam[]): ExecutionResult => {
+    const turnId = params[0];
+    const turn = typeof turnId === "string" ? store.turns.get(turnId) : undefined;
+    if (turn === undefined || turn.sessionId !== params[1]) return { rows: [], changes: 0 };
+    return { rows: [{ id: turn.id }], changes: 0 };
+  };
+
   const runSearch = (params: readonly SqlParam[]): ExecutionResult => {
     const [query, second, third] = params;
     // Whether the session filter is present is decided by the parameter count,
@@ -934,6 +1021,22 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
       const deltaId = params[0];
       const row = typeof deltaId === "string" ? store.partDeltas.get(deltaId) : undefined;
       return { rows: row === undefined ? [] : [{ seq: row.seq }], changes: 0 };
+    }
+
+    if (statement === canonical(SELECT_TURN_IN_SESSION)) return selectTurnInSession(params);
+
+    if (
+      statement === canonical(SELECT_TRANSCRIPT_MESSAGES) ||
+      statement === canonical(SELECT_TRANSCRIPT_MESSAGES_FOR_TURN)
+    ) {
+      return selectTranscriptMessages(params);
+    }
+
+    if (
+      statement === canonical(SELECT_TRANSCRIPT_PARTS) ||
+      statement === canonical(SELECT_TRANSCRIPT_PARTS_FOR_TURN)
+    ) {
+      return selectTranscriptParts(params);
     }
 
     if (statement === canonical(SELECT_UNFINISHED_TURNS)) {
@@ -1057,6 +1160,8 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     appendMessage: (input) => operations.appendMessage(input),
     getMessage: (id) => operations.getMessage(id),
     listMessages: (sessionId) => operations.listMessages(sessionId),
+    readTranscript: (input: TranscriptQuery): Promise<TranscriptRows> =>
+      operations.readTranscript(input),
 
     appendPart: (input) => operations.appendPart(input),
     upsertPart: (input) => operations.upsertPart(input),

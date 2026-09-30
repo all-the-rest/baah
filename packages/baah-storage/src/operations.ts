@@ -39,6 +39,11 @@ import {
   SELECT_SESSION,
   SELECT_SESSIONS,
   SELECT_TOOL_CALL,
+  SELECT_TRANSCRIPT_MESSAGES,
+  SELECT_TRANSCRIPT_MESSAGES_FOR_TURN,
+  SELECT_TRANSCRIPT_PARTS,
+  SELECT_TRANSCRIPT_PARTS_FOR_TURN,
+  SELECT_TURN_IN_SESSION,
   SELECT_UNFINISHED_TURNS,
   UPDATE_PART_STATUS,
   UPDATE_TURN_HEARTBEAT,
@@ -84,6 +89,8 @@ import type {
   SqlParam,
   ToolCallKey,
   ToolCallRecord,
+  TranscriptQuery,
+  TranscriptRows,
   Turn,
   TurnInput,
   TurnOutcomeEntry,
@@ -148,6 +155,44 @@ export function clampSearchLimit(limit: number | undefined): number {
   if (typeof limit !== "number" || Number.isNaN(limit)) return 0;
   if (!Number.isFinite(limit)) return MAX_SEARCH_LIMIT;
   return Math.max(0, Math.min(Math.trunc(limit), MAX_SEARCH_LIMIT));
+}
+
+/**
+ * How many messages a transcript read returns when the caller names no bound.
+ *
+ * A screenful of conversation, not a page of it: the read exists so a reloaded
+ * tab can show what was said and the recovery can quote what a dead turn got
+ * through, and neither wants a thousand-message session in memory to render the
+ * last one.
+ */
+export const DEFAULT_TRANSCRIPT_MESSAGES = 50;
+
+/**
+ * Ceiling for a transcript bound.
+ *
+ * The read is two statements over an *indexed* window, so a huge bound is not a
+ * correctness problem — but it is a memory one, and the whole reason the read
+ * has a bound at all is that a caller cannot accidentally ask for everything. A
+ * caller asking for more is served the ceiling rather than an error, exactly as
+ * {@link clampSearchLimit} serves its ceiling: the value is a policy decision
+ * about one read, and refusing it would push the decision onto every caller.
+ */
+export const MAX_TRANSCRIPT_MESSAGES = 200;
+
+/**
+ * Clamp a caller-supplied transcript bound into `[0, MAX_TRANSCRIPT_MESSAGES]`.
+ *
+ * Same four rules as {@link clampSearchLimit}, and for the same reason: the
+ * clamp happens in the shared layer so the two backends see the identical value
+ * and therefore return the identical rows. `0` is a legitimate "show me nothing"
+ * and is not an error — a caller that has nothing to render can say so without
+ * first fetching a page.
+ */
+export function clampTranscriptLimit(limit: number | undefined): number {
+  if (limit === undefined) return DEFAULT_TRANSCRIPT_MESSAGES;
+  if (typeof limit !== "number" || Number.isNaN(limit)) return 0;
+  if (!Number.isFinite(limit)) return MAX_TRANSCRIPT_MESSAGES;
+  return Math.max(0, Math.min(Math.trunc(limit), MAX_TRANSCRIPT_MESSAGES));
 }
 
 /**
@@ -279,6 +324,8 @@ export interface StorageOperations {
   appendMessage(input: MessageInput): Promise<Message>;
   getMessage(id: string): Promise<Message | null>;
   listMessages(sessionId: string): Promise<Message[]>;
+  /** The newest `limit` messages of a session, or of one turn of it. */
+  readTranscript(input: TranscriptQuery): Promise<TranscriptRows>;
   appendPart(input: PartInput): Promise<Part>;
   upsertPart(input: PartInput): Promise<Part>;
   listParts(messageId: string): Promise<Part[]>;
@@ -348,6 +395,84 @@ export function createStorageOperations(engine: StorageEngine): StorageOperation
 
     async listMessages(sessionId) {
       return many(engine, SELECT_MESSAGES, [sessionId], messageRowSchema, "listMessages");
+    },
+
+    /**
+     * Read a transcript back, as a **window** over the log.
+     *
+     * Four statements in the general case and three in the session case, and
+     * every one of them earns its place:
+     *
+     * 1. `SELECT_SESSION` — the session has to be **there**. This is the check
+     *    that stops a caller being told "this conversation says nothing" about a
+     *    session that does not exist, which is a different fact and the one a UI
+     *    would render as an empty room.
+     * 2. `SELECT_TURN_IN_SESSION`, when a turn is named — the same argument one
+     *    level down, and the guard that keeps a read of another session's turn
+     *    impossible rather than empty.
+     * 3. `SELECT_TRANSCRIPT_MESSAGES[_FOR_TURN]` — the window, asked for one row
+     *    more than the caller wanted. That extra row is how `truncated` is known
+     *    without a second `COUNT`, and it is dropped before anything sees it.
+     * 4. `SELECT_TRANSCRIPT_PARTS[_FOR_TURN]` — the parts of that same window, in
+     *    one statement. Deliberately not a `listParts` per message: `N + 1` round
+     *    trips over a worker boundary for one screen of transcript.
+     *
+     * **Rows come back newest first**, because that is the order the window is
+     * taken in and it is the only order that needs no `MIN(seq)` to express the
+     * bound. The read port reverses them.
+     */
+    async readTranscript(input) {
+      const limit = clampTranscriptLimit(input.limit);
+      const turnId = input.turnId;
+      const sessionId = input.sessionId;
+
+      const session = await firstRow(engine, SELECT_SESSION, [sessionId]);
+      if (session === undefined) {
+        throw new StorageError(
+          "sql_error",
+          `readTranscript: there is no session ${sessionId}.`,
+          { sessionId },
+        );
+      }
+      if (turnId !== undefined) {
+        const turn = await firstRow(engine, SELECT_TURN_IN_SESSION, [turnId, sessionId]);
+        if (turn === undefined) {
+          throw new StorageError(
+            "sql_error",
+            `readTranscript: there is no turn ${turnId} in session ${sessionId}.`,
+            { turnId, sessionId },
+          );
+        }
+      }
+
+      const byTurn = turnId !== undefined;
+      const messageParams: SqlParam[] = byTurn
+        ? [sessionId, turnId, limit + 1]
+        : [sessionId, limit + 1];
+      const newest = await many(
+        engine,
+        byTurn ? SELECT_TRANSCRIPT_MESSAGES_FOR_TURN : SELECT_TRANSCRIPT_MESSAGES,
+        messageParams,
+        messageRowSchema,
+        "readTranscript[messages]",
+      );
+      const truncated = newest.length > limit;
+      const messages = truncated ? newest.slice(0, limit) : newest;
+
+      // `limit` and not `limit + 1`: the messages actually returned are the newest
+      // `limit`, which is exactly what this subquery selects. The port attaches
+      // parts by message id, so an extra part would be dropped rather than
+      // misfiled — the agreement is an efficiency property, not a correctness
+      // one, and it is stated here so nobody tightens the two together by accident.
+      const parts = await many(
+        engine,
+        byTurn ? SELECT_TRANSCRIPT_PARTS_FOR_TURN : SELECT_TRANSCRIPT_PARTS,
+        byTurn ? [sessionId, turnId, limit] : [sessionId, limit],
+        partRowSchema,
+        "readTranscript[parts]",
+      );
+
+      return { messages, parts, limit, truncated };
     },
 
     async appendPart(input) {
@@ -550,9 +675,10 @@ export function createStorageOperations(engine: StorageEngine): StorageOperation
      * (`Plan.md` §6.1), so the timestamp that lands here is the caller's, not
      * this layer's. `sessionId` is bound into the `WHERE` clause rather than
      * checked afterwards: a turn that is not in that session changes no row, the
-     * same as a turn that does not exist at all. Either way the engine's
-     * un-awaited `void store.heartbeat(…)` resolves instead of rejecting, which
-     * is the only outcome it could act on.
+     * same as a turn that does not exist at all. A zero-row update is the
+     * *only* silent outcome — a rejection is not: the engine fires this without
+     * awaiting it (its call site is a synchronous SDK callback) and reports a
+     * `storage-warning` on the turn.
      */
     async renewHeartbeat(input) {
       await engine.run(UPDATE_TURN_HEARTBEAT, [input.at, input.turnId, input.sessionId]);

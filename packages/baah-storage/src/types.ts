@@ -580,6 +580,71 @@ export interface SearchHit {
 }
 
 /* ------------------------------------------------------------------ */
+/* Reading a transcript back                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What to read: a session's log, or one turn's slice of it.
+ *
+ * **`sessionId` is required, `turnId` is a narrowing inside it.** Not the other
+ * way round, and the direction is the whole design:
+ *
+ * - The **transcript view** knows a session: "show me this conversation".
+ * - The **reload recovery** knows a *turn id* — `recoverStaleTurns` hands one
+ *   back — and needs to know what that turn said, because without it a reloaded
+ *   tab can say *that* a turn died and nothing about what it managed to write
+ *   (`AGENTS.md` §3.1, `Plan.md` §6.1: the partial text survives, so it has to be
+ *   readable).
+ *
+ * So both callers exist and they do not ask the same question, which is why this
+ * is one method with an optional narrowing rather than two methods: the window,
+ * the ordering, the bound and the parts join are identical, and a second method
+ * would be a second place to keep them in step.
+ *
+ * The narrowing cannot be the *only* key. A turn id alone would make a read of
+ * another session's turn possible, and would turn "no such turn here" into the
+ * same empty array as "that turn said nothing" — two different facts the UI
+ * renders differently. So a named turn is checked for existence **in that
+ * session** and a missing one is an error.
+ *
+ * `limit` counts **messages** and takes the **newest** ones: the read is a window
+ * over a growing log, and both callers want the end of it. See
+ * `clampTranscriptLimit` for the bound and why it is a clamp.
+ */
+export interface TranscriptQuery {
+  sessionId: string;
+  /**
+   * Narrow to one turn of that session.
+   *
+   * Optional, and with `exactOptionalPropertyTypes` an *omitted* key is a
+   * different type from an explicitly-undefined one — so a caller that has an
+   * optional turn id in hand spreads it conditionally, as `SearchInput` does.
+   */
+  turnId?: string;
+  /** Newest-N messages. Clamped; see `clampTranscriptLimit`. */
+  limit?: number;
+}
+
+/**
+ * The rows a transcript read returns, before the read port projects them.
+ *
+ * Newest-first on `messages`, because that is the order the window is taken in
+ * and the only order that expresses the bound without a `MIN(seq)`. The read port
+ * reverses them, because a renderer wants oldest first.
+ *
+ * `truncated` is "the store holds at least one message more than was returned",
+ * and it is a fact rather than a `COUNT`: the window asks for one row more than
+ * the caller wanted, which is why the read is still two statements.
+ */
+export interface TranscriptRows {
+  messages: Message[];
+  parts: Part[];
+  /** The bound after clamping, echoed so a caller can say which window it got. */
+  limit: number;
+  truncated: boolean;
+}
+
+/* ------------------------------------------------------------------ */
 /* Public database surface                                              */
 /* ------------------------------------------------------------------ */
 
@@ -615,6 +680,29 @@ export interface StorageDatabase {
   appendMessage(input: MessageInput): Promise<Message>;
   getMessage(id: string): Promise<Message | null>;
   listMessages(sessionId: string): Promise<Message[]>;
+  /**
+   * The newest `limit` messages of a session, or of one turn of it, with their
+   * parts — the rows a reloaded tab needs to show what a turn said.
+   *
+   * Separate from {@link StorageDatabase.listMessages} on purpose. That one is
+   * the whole log, unbounded, and it is what the *engine*'s own start-up read
+   * (`listTurnOutcomes`) and the parity tests use; a UI read wants a window, a
+   * bound and the parts joined in the same round trips. Two methods, because they
+   * have two shapes and one of them is a footgun if it is the other.
+   *
+   * Rejects (`sql_error`) for a session that does not exist and for a turn that
+   * is not in that session. Both are refusals to answer a different question,
+   * and an empty array would be an answer: it would render as "nothing was
+   * said here", which is a claim about the conversation rather than about the
+   * request. A read on a **closed** database rejects with `database_closed` and
+   * is never turned into an empty result.
+   *
+   * Consistent with a write in flight, up to the flush interval: a part that is
+   * still `streaming` is returned with the text of its most recent flush, not
+   * skipped and not stale to the beginning. See the read port for why that is the
+   * bound rather than an approximation.
+   */
+  readTranscript(input: TranscriptQuery): Promise<TranscriptRows>;
 
   appendPart(input: PartInput): Promise<Part>;
   /** Insert-or-update by `id`; retrying the same payload changes nothing. */
