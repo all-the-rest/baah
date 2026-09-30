@@ -29,11 +29,32 @@
 import { readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 
-// The dist directory is an argument so this can be **tested against a synthetic
-// tree**. Verified only against a real build, this script is untestable: it needs a
-// finished build, and a finished build needs a green typecheck, and a green
-// typecheck is exactly what a parallel agent can take away for an hour.
-const DIST = resolve(process.cwd(), process.argv[2] ?? "packages/baah-web/dist");
+/**
+ * The dist directory, as `--dist <path>` — so this can be tested against a
+ * synthetic tree. Verified only against a real build it is untestable: it needs a
+ * finished build, and a finished build needs a green typecheck, and a green
+ * typecheck is exactly what a parallel agent can take away for an hour.
+ *
+ * **An explicit flag, not a positional argument, and that is a bug I shipped.**
+ * The first version read `process.argv[2]`. This script is chained at the end of
+ * `build`, and the Playwright web server calls `pnpm … build --mode e2e` — pnpm
+ * appends pass-through arguments to the **end** of the script, so `argv[2]` was
+ * `"--mode"` and the script died with `scandir("--mode")`. `pnpm e2e` could not
+ * start at all, and it failed at a place with no relation to what it was testing.
+ *
+ * The lesson is the shape, not the typo: **a positional argument in an npm-script
+ * chain is not yours.** Anything after the script name belongs to whoever appended
+ * it.
+ */
+function parseDist(argv) {
+  const flag = argv.indexOf("--dist");
+  if (flag !== -1 && argv[flag + 1] !== undefined) return resolve(process.cwd(), argv[flag + 1]);
+  const inline = argv.find((a) => a.startsWith("--dist="));
+  if (inline !== undefined) return resolve(process.cwd(), inline.slice("--dist=".length));
+  return resolve(process.cwd(), "packages/baah-web/dist");
+}
+
+const DIST = parseDist(process.argv.slice(2));
 
 const COLLECTED_EXTENSIONS = new Set([
   ".js",

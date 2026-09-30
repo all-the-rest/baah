@@ -226,30 +226,65 @@ describe("the required half is not satisfied by nothing", () => {
   });
 });
 
+/**
+ * A local stand-in for `KNOWN_UNSATISFIED`.
+ *
+ * The first version of these tests used the **production** entry, so deleting it —
+ * which is precisely what the gate demanded the moment the project folder was wired —
+ * turned two mechanism tests red. The mechanism is a rule **about the object**, so it
+ * must be testable with any object. A test welded to live data breaks when the data
+ * gets fixed, and the failure then looks like the fix was wrong.
+ */
+const A_TRACKED_GAP: Readonly<Record<string, string>> = {
+  "project-folder":
+    "Stand-in for a tracked gap. Long enough to satisfy the reason check, which is " +
+    "the point: a list entry without a reason is an explanation nobody can act on.",
+};
+
 describe("the known-unsatisfied list cannot rot in either direction", () => {
   it("a tracked gap does not become a problem", () => {
-    // The load-bearing pair. `project-folder` is genuinely unmet today, and a gate
-    // that fails for a *planned* gap is a gate people learn to skip.
-    const report = verifyRepository({ "packages/x/src/a.ts": ALL_BUT_PROJECT_FOLDER });
+    // The load-bearing half. A gate that fails for a *tracked* gap is a gate people
+    // learn to skip, and then it protects nothing.
+    const report = verifyRepository({ "packages/x/src/a.ts": ALL_BUT_PROJECT_FOLDER }, A_TRACKED_GAP);
     expect(report.missing).toContain("project-folder");
     expect(report.problems).toEqual([]);
   });
 
   it("a tracked gap that got FIXED is a problem, so the entry cannot go stale", () => {
-    const report = verifyRepository({ "packages/x/src/a.ts": ALL_CAPABILITIES });
+    const report = verifyRepository({ "packages/x/src/a.ts": ALL_CAPABILITIES }, A_TRACKED_GAP);
     expect(report.missing).toEqual([]);
-    expect(report.problems).toContainEqual(expect.stringContaining('delete the entry'));
+    expect(report.problems).toContainEqual(expect.stringContaining("delete the entry"));
   });
 
   it("an untracked gap is a problem", () => {
-    const report = verifyRepository({
-      "packages/x/src/a.ts": `const a = 1;\n`,
-    });
+    const report = verifyRepository({ "packages/x/src/a.ts": `const a = 1;\n` });
     expect(report.problems.join("\n")).toContain("untracked missing capability");
     expect(report.problems.join("\n")).toContain("origin-private-storage");
   });
 
-  it("every entry names a real capability and carries a reason, not just an id", () => {
+  it("an entry that is not a capability is a problem", () => {
+    // Otherwise a typo in the list silences a real gap forever: it is "tracked", so it
+    // is not reported as missing, and the reverse check never fires because the id can
+    // never become satisfied. A list that cannot fail is a comment.
+    const report = verifyRepository(
+      { "packages/x/src/a.ts": ALL_CAPABILITIES },
+      { "project-folderr": "A typo. Silent forever if this check does not exist." },
+    );
+    expect(report.problems.join("\n")).toContain("is not a capability");
+  });
+
+  it("an entry without a real reason is a problem", () => {
+    const report = verifyRepository(
+      { "packages/x/src/a.ts": ALL_BUT_PROJECT_FOLDER },
+      { "project-folder": "todo" },
+    );
+    expect(report.problems.join("\n")).toContain("needs a reason");
+  });
+
+  it("every entry in the real list names a real capability and carries a reason", () => {
+    // The production list is **empty** right now, and this is what makes that a fact
+    // rather than an assumption: it iterates whatever is there, so an entry added later
+    // is checked by the same two rules that are exercised above with a fixture.
     for (const [id, reason] of Object.entries(KNOWN_UNSATISFIED)) {
       expect(REQUIRED.some((c) => c.id === id), `${id} is not a capability`).toBe(true);
       expect(reason.length, `${id} needs a reason`).toBeGreaterThan(60);
@@ -261,6 +296,7 @@ describe("the known-unsatisfied list cannot rot in either direction", () => {
     expect(new Set(CAPABILITY_IDS).size).toBe(CAPABILITY_IDS.length);
   });
 });
+
 
 describe("the documented limit: deletion yes, miswiring no", () => {
   it("a remote call BESIDE an untouched database import passes both halves", () => {

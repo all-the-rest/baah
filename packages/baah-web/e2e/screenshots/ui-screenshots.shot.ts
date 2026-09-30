@@ -60,7 +60,18 @@ import { shots, type UiReviewShot, type UiReviewState, type UiReviewViewport } f
 const OUTPUT_DIR = "packages/baah-web/test-results/ui-screenshots";
 
 /** `index.html`'s static `<title>`. A guard, not a claim about the app. */
-const EXPECTED_TITLE = "opencode-harness-web";
+/**
+ * The foreign-server guard's expected value.
+ *
+ * It was `"opencode-harness-web"`, which stopped being true in commit 1dc13dd —
+ * the project was renamed to `baah` and `index.html` kept the old title. That
+ * went unnoticed for two commits because the *screenshot* suite is not in CI
+ * (`ui-review`: "nothing here gates CI"), and the E2E suite never asserted the
+ * title. Now that `index.html` says `baah`, the guard has something real to
+ * compare against: a wrong port serving somebody else's app produces a different
+ * title, which is the entire point of the assertion.
+ */
+const EXPECTED_TITLE = "baah";
 
 /**
  * How many `-secN` files one state may produce.

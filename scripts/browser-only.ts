@@ -397,7 +397,21 @@ export function scanBrowserOnly(files: Readonly<Record<string, string>>): Report
  * remembers to run a test. The pure logic is still tested by vitest, against
  * fixtures, where it belongs.
  */
-export function verifyRepository(files: Readonly<Record<string, string>>): Report {
+export function verifyRepository(
+  files: Readonly<Record<string, string>>,
+  /**
+   * The known-unsatisfied list to check against, defaulting to the real one.
+   *
+   * A parameter, not a hard reference, and that is a correction to the first
+   * version of this file: the self-test verified the mechanism using the
+   * *production* entry, so deleting that entry — which is exactly what the gate
+   * demanded once the folder got wired — turned two mechanism tests red. The
+   * mechanism is a rule **about the object**, so it has to be testable with any
+   * object. A test coupled to live data is a test that breaks when the data is
+   * fixed.
+   */
+  known: Readonly<Record<string, string>> = KNOWN_UNSATISFIED,
+): Report {
   const report = scanBrowserOnly(files);
   const problems: string[] = [];
 
@@ -406,8 +420,8 @@ export function verifyRepository(files: Readonly<Record<string, string>>): Repor
   }
 
   for (const id of report.missing) {
-    const known = KNOWN_UNSATISFIED[id];
-    if (known === undefined) {
+    const reason = known[id];
+    if (reason === undefined) {
       problems.push(
         `untracked missing capability "${id}" — ${REQUIRED.find((c) => c.id === id)?.why ?? ""}`,
       );
@@ -417,7 +431,7 @@ export function verifyRepository(files: Readonly<Record<string, string>>): Repor
   // The reverse direction, and it is the one that keeps the list honest: an entry
   // whose capability has become satisfied is a stale explanation for a problem
   // that no longer exists. Failing here is the reminder to delete it.
-  for (const id of Object.keys(KNOWN_UNSATISFIED)) {
+  for (const id of Object.keys(known)) {
     if (!report.missing.includes(id)) {
       problems.push(
         `KNOWN_UNSATISFIED lists "${id}" but the scan finds it satisfied — delete the entry`,
@@ -425,7 +439,7 @@ export function verifyRepository(files: Readonly<Record<string, string>>): Repor
     }
   }
 
-  for (const [id, reason] of Object.entries(KNOWN_UNSATISFIED)) {
+  for (const [id, reason] of Object.entries(known)) {
     if (reason.length <= 60) problems.push(`KNOWN_UNSATISFIED "${id}" needs a reason, not just an id`);
     if (!REQUIRED.some((c) => c.id === id)) problems.push(`KNOWN_UNSATISFIED "${id}" is not a capability`);
   }
@@ -465,11 +479,21 @@ export const RULE_IDS: readonly string[] = FORBIDDEN.map((r) => r.id);
  * mechanical: a new problem fails, a solved problem fails, and only a deliberate
  * edit to this object changes either.
  */
-export const KNOWN_UNSATISFIED: Readonly<Record<string, string>> = {
-  "project-folder":
-    "Not wired, and that is the point of tracking it: `showDirectoryPicker` is called " +
-    "zero times in src/, `createFileSystemAccessWorkspace` is constructed nowhere, " +
-    "`workspaceMode` is the literal \"memory\" and the folder button is permanently " +
-    "disabled. Found by the independent PWA audit at 1fb9821. Fails closed as soon as " +
-    "the folder is reachable; the entry must then be deleted.",
-};
+/**
+ * **Empty on purpose.** It held one entry, `project-folder`, from the moment the
+ * gate landed until the project folder was actually wired — and the gate is what
+ * said so: `KNOWN-UNSATISFIED lists "project-folder" but the scan finds it
+ * satisfied — delete the entry`.
+ *
+ * That is the mechanism working as designed. The reverse check means a solved gap
+ * cannot go stale: someone wires the folder, the gate stops being quiet, and the
+ * only way to make it quiet again is a deliberate edit here. An entry that was
+ * never deleted would have been a permanent explanation for a problem that no
+ * longer exists, and this file is read on every `pnpm check`.
+ *
+ * `project-folder` is now genuinely satisfied: `showDirectoryPicker` is called
+ * from a user gesture in `lib/project-folder.ts`, the handle lives in its own
+ * IndexedDB database, and `components/lib/runtime.ts` constructs
+ * `createFileSystemAccessWorkspace` in the composition root.
+ */
+export const KNOWN_UNSATISFIED: Readonly<Record<string, string>> = {};
