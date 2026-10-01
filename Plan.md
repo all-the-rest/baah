@@ -1988,3 +1988,272 @@ Gerät · Reload nach Kaltstart · überlebt die Ordner-Freigabe · `storage.per
 einem echten Browser · „Website-Daten löschen", Deinstallation, Gerätewechsel · zweiter
 Tab gegen `opfs-sahpool` (der Code markiert das selbst als `UNVERIFIED`,
 `errors.ts:126-130`).
+
+---
+
+## 18. Workspace → Session → Nachricht → Tool-Aufruf
+
+Ergänzt am 2026-10-01. Alle Aussagen **gemessen**, mit `Datei:Zeile`. Grundlage war die
+Frage des Nutzers; sie ist in dieser Reihenfolge präzisiert worden und die
+Zwischenstände sind hier festgehalten, weil **zwei** davon falsch waren.
+
+### 18.1 Die Kardinalität, wie der Nutzer sie meint
+
+```text
+Workspace  1 ── n  Session   (Konversation)
+Session    1 ── n  Message
+Message    1 ── n  Part  und  Tool-Aufruf
+```
+
+- **Workspace ist das Projekt.** Ein Workspace ist ein **geöffneter Ordner**
+  (`workspaces.kind ∈ ('opfs','directory')`, `workspaces.root_handle_id` verweist in
+  das Sidecar-IndexedDB, weil ein `FileSystemHandle` in SQLite nicht lagerbar ist).
+- **Session ist die Konversation.** Kein abgeleitetes Konstrukt: `sessions` **ist** die
+  Konversation, `sessions.id` ihre Identität.
+- **Ein Workspace hat mehrere Sessions**, eine Session mehrere Nachrichten, eine
+  Nachricht mehrere Parts und Tool-Aufrufe.
+
+### 18.2 Was bereits steht — und es steht vollständig
+
+```text
+workspaces            id, name, kind, root_handle_id, metadata, created_at, last_opened_at
+sessions              id, title, status, model, system_prompt, metadata, …
+  messages.session_id       TEXT NOT NULL REFERENCES sessions(id)          ON DELETE CASCADE
+    parts.message_id        TEXT NOT NULL REFERENCES messages(id)          ON DELETE CASCADE
+    parts.session_id        TEXT NOT NULL REFERENCES sessions(id)          ON DELETE CASCADE   ← §18.4
+      tool_invocations      session_id NOT NULL REFERENCES sessions(id)    ON DELETE CASCADE
+                            message_id     REFERENCES messages(id)        ON DELETE CASCADE
+                            call_part_id   REFERENCES parts(id)            ON DELETE CASCADE
+                            result_part_id REFERENCES parts(id)            ON DELETE CASCADE
+```
+
+**Drei Ebenen, echte Fremdschlüssel, echte Kaskaden.** Was fehlt, ist **eine** Spalte.
+
+### 18.3 Der gemessene Ist-Stand — und er ist schlechter als „eine Spalte fehlt"
+
+```text
+sessions.workspace_id          existiert nicht.  0 Spalten mit "workspace".
+packages/baah-web/src          "workspaceId" kommt 0 mal vor.
+workspaces                     0 INSERTs im ganzen Repository.  Die Tabelle ist leer.
+                               Der einzige Treffer auf "workspaces" ist die
+                               Fremdschlüssel-Deklaration in file_handles.
+createSession                  1 Aufrufstelle: runtime.ts:341
+                               Kommentar dort: "And it must not be created twice."
+                               Titel: die Konstante "Sitzung" (runtime.ts:341)
+AgentEvent                     trägt 0 mal eine sessionId
+```
+
+→ **Es gibt genau eine Session, für immer.** Nicht die Spalte fehlt — es fehlt der
+**gesamte Mechanismus** für eine zweite: kein „neue Konversation", keine Liste, kein
+Titel aus dem Inhalt. Und der Ordner-Agent des vorigen Blocks hat in das
+**Sidecar-IndexedDB** verdrahtet, **nicht** in SQLite — die Projektebene blieb leer.
+
+### 18.4 ⚠️ Gefunden beim Messen: `parts.session_id` ist **redundant und ungeprüft**
+
+`parts` trägt `message_id` **und** `session_id` — **zwei Spalten für eine Tatsache**, und
+die zweite ist **über `message_id → messages.session_id` bereits ableitbar**.
+
+```text
+parts.session_id in SELECTs:    0
+als WHERE-Filter:               0   (sql.ts:124-239 filtert auf messages, turns,
+                                     tool_invocations — nie auf parts)
+Trigger, die die Konsistenz erzwingen:  0
+                                  (die 3 Trigger in schema.ts:220-231 sind alle FTS)
+```
+
+**Damit kann ein Part `session_id = A` tragen und auf eine Message aus Session B
+zeigen, und nichts beschwert sich.** Die Spalte kostet dafür bei **jedem** Schreibvorgang
+einen `NOT NULL`-Wert und einen Fremdschlüssel, und liefert **null** Abfragen.
+
+Das ist dieselbe Fehlerklasse wie „zwei Quellen für eine Tatsache" an anderer Stelle —
+und der Grund, warum die `sessionId` am `AgentEvent` eingeführt wird: damit die
+Zugehörigkeit **überprüfbar** wird statt behauptet.
+
+### 18.5 Refactor in dieser Reihenfolge — und die Reihenfolge ist nicht verhandelbar
+
+| # | Schritt | Risiko | Nachweis |
+|---|---|---|---|
+| **1** | `AgentEvent` trägt `sessionId` | niedrig | Divergenz zwischen Event und `turn-store`-Argument **muss** unmöglich sein |
+| **2** | Migration `sessions.workspace_id` | niedrig | `workspaces.kind`-Fremdschlüssel auf `workspaces(id)` |
+| **3** | `workspaces` beim Öffnen befüllen, ID **identisch** mit der Sidecar-ID | mittel | zwei Ordner → zwei Projekte → Konversationen wandern nicht |
+| **4** | `.baah/project.json` als **Wahrheit** der Projektidentität | niedrig | zwei Läufe, derselbe Ordner → **dieselbe** Projekt-ID |
+| **5** | `parts.session_id` **entfernen** | **hoch** | siehe unten |
+
+**Warum Schritt 5 der letzte ist, und warum er der gefährlichste:**
+
+SQLite kann eine Spalte nicht löschen. Ein Drop braucht einen **Tabellen-Neubau**
+(`CREATE TABLE neu` → kopieren → `DROP` → `ALTER TABLE RENAME`). Und in diesem Projekt
+gilt gemessen:
+
+> **`DROP TABLE` auf eine referenzierte Tabelle löst `ON DELETE CASCADE` aus — auch mit
+> `PRAGMA defer_foreign_keys`.**
+
+`parts` wird von `tool_invocations.call_part_id` und `result_part_id` referenziert. Ein
+Naive-Rebau würde diese **löschen**, nicht nur entkoppeln. Also: **FKs prüfen, sichern,
+wiederherstellen** — und **ein Test, der `tool_invocations` nach dem Umbau zählt**, weil
+ein stiller Datenverlust hier die schlimmste mögliche Folge ist.
+
+**Und die ehrliche Gegenfrage**, die vor Schritt 5 beantwortet sein muss: **begrenzt
+`parts.session_id` keine Abfrage, die heute nur *langsam* ist?** Ein Index auf
+`session_id` wäre eine **geplante** Abfrage, die es noch nicht gibt. Falls ja, ist
+Schritt 5 kein Refactor, sondern ein Index, und das ist eine andere Entscheidung.
+
+### 18.6 Was **nicht** gilt: der Service-Worker-Cache
+
+Der **Shell**-Cache (`scripts/build-sw.mjs`) schlüsselt über eine **feste Liste gehashter
+Dateinamen** — für alle Sitzungen identisch. **Er darf nie nach `sessionId` schlüsseln.**
+Ein Shell-Cache pro Sitzung wäre dasselbe wie `npm ci` bei jedem Commit.
+
+Sobald jemand **Daten** cacht — ein Transcript, eine Providerantwort — **muss** der
+Schlüssel die `sessionId` sein. Sonst zeigt ein Cache-Treffer den Verlauf der
+**falschen** Konversation, und das ist der Fehler, der **stumm** ist: die Unterhaltung
+sieht geladen aus, nur halt die falsche.
+
+### 18.7 Was der Nutzer entschieden hat
+
+| Frage | Antwort |
+|---|---|
+| Wie bleibt ein Projekt über Läufe eindeutig? | **`<ordner>/.baah/project.json`** trägt die stabile ID — sie überlebt Browserwechsel, Gerätewechsel und Ordner-Kopieren |
+| Wie weit darf die App in den Ordner schreiben? | **Still anlegen**, `.baah/` ist Konvention — wie `.git` |
+| Oberfläche jetzt oder später? | **Erst Speicher, dann Oberfläche** — sonst mischt man Datenmodell und UI und kann keines einzeln prüfen |
+
+**Rand der zweiten Antwort, festgehalten, damit sie nicht ausufert:** Die App legt
+**ausschließlich** `.baah/` an und schreibt **darin**. Kein `.gitignore`-Eintrag, kein
+Aufräumen, kein Schreiben außerhalb. „Konvention" ist ein Freibrief, keine Erlaubnis
+für Nebelwirkungen.
+
+### 18.8 Konzept, nicht Implementierung
+
+„Konversation ist Session" ist eine **Begriffsklärung, kein Feature.** Sie sagt nichts
+darüber, **wie** eine zweite Session entsteht. Das ist eine getrennte Entscheidung und
+gehört in die Oberflächen-Diskussion, **nach** §18.5 Schritte 1–4 stehen.
+
+**Was heute fehlt und niemand gebaut hat, vollständig:** ein „neue Konversation", eine
+Liste der Konversationen eines Workspace, ein Titel aus dem Inhalt statt der
+Konstante `"Sitzung"`, ein Wechsel zwischen Konversationen, und ein Export, der eine
+Konversation **außerhalb** dieses Browsers lesbar macht. Fünf Dinge, keines davon
+implizit.
+
+---
+
+## 19. Korrektur zu §18: die vierte Lesart, und ein sichtbarer Fehler
+
+Ergänzt am 2026-10-01, nach einer **unabhängigen Analyse** derselben Frage
+(`packages/baah-core/docs/projekt-konversation.md`). Diese Sektion **ersetzt §18.1 und
+§18.8** und begründet, warum.
+
+### 19.1 §18.1 war **falsch**, und zwar mit zwei Messungen
+
+§18.1 behauptete, die Konversation werde durch die **Wurzel-Nachrichten-ID** identifiziert.
+Das war meine Folgerung, nicht die Aussage des Nutzers. Zwei Messungen widerlegen sie,
+und jede allein reicht:
+
+```text
+schema.ts:74   messages.id  ist der PRIMÄRSCHLÜSSEL
+→ „alle Nachrichten mit derselben Message-ID" ist per Definition EINE Zeile.
+  In ihrer wörtlichen Fassung nicht implementierbar, außer man gibt den
+  Primärschlüssel auf.
+
+schema.ts:77   messages.parent_id  existiert, mit Index (schema.ts:250)
+sql.ts:344     der einzige Parameterpfad: input.parentId ?? null
+→ rg "parentId:" über packages/*/src findet NUR Typdeklarationen.
+  Kein Aufrufer außerhalb der Tests befüllt es. JEDE Nachricht ist heute eine Wurzel.
+```
+
+→ Der Aufstieg, den die Regel brauchte, **hat nichts zu laufen**. Die Frage war
+beantwortbar, bevor Code entstand — und mein Bau-Auftrag hätte etwas **sehr Gutes**
+gebaut, das die Frage nicht beantwortet.
+
+### 19.2 Die **fachlich** richtige Ebene ist `turnId`, und die **stabile** ist der Ordner
+
+```text
+turn_id   eine Frage + Antwort + Abschlussnachricht  — loop.ts:1347, sql.ts:556-565
+          die Ebene, die alle drei Nachrichtentypen eines Turns teilt
+Ordner    die einzige Identität, die mehrere Läufe übersteht
+```
+
+Der Nutzer sagt „Message id", weil das im heutigen Code der **einzige Identifier** ist,
+den er je gesehen hat (`testids.ts:124`). `turn_id` ist die Ebene, die **schon
+existiert** und schon teilt. **„Konversation ist Session" bleibt richtig** — es ist nur
+die **Granularität**, die zu klären war.
+
+Die zwei anderen Lesarten scheiden aus: Lesart 2 macht den Satz redundant, Lesart 3
+widerlegt sich am zweiten Halbsatz („über mehrere Läufe eindeutig") selbst.
+
+### 19.3 🔴 Ein **sichtbarer** Fehler, gefunden beim Messen
+
+```text
+AppShell.tsx:112-132   ruft nur workspace.swap(…)
+                       sessionId bleibt unverändert.
+```
+
+→ **Wer Projekt B öffnet, sieht den Verlauf von Projekt A.** Der Ordner ist seit dem
+vorigen Block wählbar, und der Wechsel ist damit **kosmetisch**.
+
+Das ist der praktische Kern von §18.3 und die Begründung, warum `sessionId` an das
+Event muss — eine Ebene höher als dort steht.
+
+### 19.4 Und die Projektidentität ist **derselbe Fehler in einer anderen Form**
+
+```text
+file-system-access.ts:164-165   die Projekt-ID ist `local:${name}`
+```
+
+→ **Zwei Ordner namens `api` sind derselbe String.** Und sie wird nirgends gespeichert:
+`workspaces` und `file_handles` existieren als Tabellen und werden **nie beschrieben**
+(null INSERT, keine `operations`-Methode, kein Protokoll-Statement).
+
+**Ersetzen, nicht reparieren.** Nach der Entscheidung in §18.7 trägt
+`<ordner>/.baah/project.json` die stabile ID; ein aus dem Ordnernamen abgeleiteter
+String ist genau die Sorte „stabiler" Kennung, die beim ersten Namenskonflikt kippt.
+
+### 19.5 Die Kante, die meine frühere Aussage teuer macht
+
+§18.8 sagte: *„Konversation ist Session ist eine Begriffsklärung, kein Feature"*, und
+§18.5 Schritt 1 schrieb *„es gibt keine leere Konversation"*. **Beides folgt aus der
+falschen Wurzel-Regel und ist als Verhalten falsch.**
+
+Ein neuer Workspace ohne Konversation braucht eine Session, die **noch keine Nachricht**
+hat — sonst gibt es nichts, wohin die erste Nachricht geschrieben werden könnte, denn
+`messages.session_id` ist `NOT NULL`. Also sind **zwei** Dinge nötig und sie sind
+verschieden:
+
+1. eine Session, die existiert, **bevor** eine Nachricht existiert, und
+2. die Fähigkeit, sie später an eine Nachricht zu binden — falls die Identität **nicht**
+   aus der Nachricht kommen soll.
+
+§18.5 bleibt in der **Reihenfolge** richtig; §18.5 Schritt 5 (`parts.session_id`
+entfernen) ist weiterhin der **gefährlichste** Schritt und **nicht** Teil des laufenden
+Blocks.
+
+### 19.6 Was fehlt, vollständig — keines davon implizit
+
+| | gemessen |
+|---|---|
+| „neue Konversation" | **existiert nicht** |
+| Liste der Konversationen eines Workspace | `listSessions` hat **null** Aufrufer außerhalb `baah-storage` und Tests |
+| Titel aus dem Inhalt | `runtime.ts:341` schreibt die **Konstante** `"Sitzung"`, nie aktualisiert |
+| Wechsel zwischen Konversationen | **existiert nicht** |
+| `status='archived'` | wird in `src/` **nirgends** gesetzt |
+| Export einer Konversation **außerhalb** dieses Browsers | **existiert nicht** |
+
+Und die Reichweite von „über mehrere Läufe eindeutig", wie sie **heute** gilt:
+
+```text
+überlebt:   Reload
+überlebt NICHT: Tab schließen · localStorage leeren · „Website-Daten löschen"
+              · Ordner wechseln · Rechner wechseln
+```
+
+**Die Forderung ist größer, als sie klingt**, und §18.7 (`.baah/project.json`) ist genau
+der Punkt, an dem sie von „Reload" zu „Gerät" wächst.
+
+### 19.7 Als **Vermutung** markiert, nicht gemessen
+
+Der Analyse-Agent hat **keine Tests ausgeführt**. Und drei Punkte sind aus dem Code
+geschlossen, nicht im Browser geprüft:
+
+- ob Chrome keinen absoluten Pfad preisgibt,
+- ob die Freigabe jeden Kaltstart erlischt (Repo-Angabe, zitiert),
+- ob **zwei** Sessions in einer Datenbank funktionieren — das ist eine **Folgerung** aus
+  dem Schema, denn es gibt keinen gemessenen Pfad: `listSessions` ist unbenutzt.

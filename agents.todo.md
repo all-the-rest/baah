@@ -1950,3 +1950,70 @@ der Stand **nach** diesem Block.
 ## Abgehakt
 
 *(nach unten wandern, mit Commit-Referenz)*
+
+## Projekt-/Konversationsmodell — Analyse des Nutzerbegriffs
+
+Der Nutzer hat gefragt: „Haben wir nicht das Konzept von Projekten und Konversationen.
+Nachrichten mit der gleichen Message id sind eine eigene Konversation in einem Projekt —
+das sollte es ein geben. Ein Projekt ist ein Ordner der geöffnet wird. Soll über mehrere
+Läufe eindeutig bleiben."
+
+**Die vollständige Analyse mit allen Messungen:**
+[`packages/baah-core/docs/projekt-konversation.md`](packages/baah-core/docs/projekt-konversation.md)
+
+### Befund vor dem Bauen: die Wurzel-Nachricht-Regel ist **nicht** die richtige Lesart
+
+Die naheliegende Deutung („die Identität einer Konversation ist die Message-ID ihrer
+**Wurzel**-Nachricht") ist mit dem bestehenden Schema **nicht vereinbar**:
+
+- `messages.id` ist der **Primärschlüssel** (`packages/baah-storage/src/schema.ts:74`).
+  „Alle Nachrichten mit derselben Message-ID" ist damit per Definition **eine** Zeile.
+- `messages.parent_id` existiert (`schema.ts:77`, Index `schema.ts:250`) und wird
+  **nie befüllt**: der einzige Pfad ist `sql.ts:344` (`input.parentId ?? null`), und kein
+  Aufrufer außerhalb der Tests übergibt ihn. Jede Nachricht ist heute eine Wurzel.
+
+Wer diese Deutung als Spezifikation an einen Bau-Agenten gibt, baut etwas **sehr gut**, das
+die Frage nicht beantwortet. Die Empfehlung in der Analyse ist eine **vierte Lesart**: die
+fachlich passende Ebene ist `turnId` (eine Frage + Antwort + Abschlussnachricht), die
+stabile Ebene über Läufe ist der **Ordner**.
+
+### Drei weitere Befunde, die die Größe der Aufgabe zeigen
+
+1. **„Konversation" existiert nicht als Oberfläche.** Die App erzeugt genau **eine** Session
+   (`runtime.ts:340-342`, `title` ist das Literal `"Sitzung"`, wird nie aktualisiert) und
+   kann keine zweite erzeugen — `listSessions` hat **null Aufrufer** außerhalb von
+   `baah-storage`/Tests, und es gibt keine Session-UI. `status='archived'` wird in `src/`
+   nirgends gesetzt. **Das ist keine Spaltenfrage, das ist eine Oberflächenfrage.**
+2. **„Über mehrere Läufe eindeutig" überlebt heute genau einen Fall: Reload.** Nicht:
+   Tab schließen (der Ordner-**Zugriff** erlischt), `localStorage` leeren (neue Session, die
+   alte bleibt verwaist), „Website-Daten löschen", Ordner wechseln, Rechner wechseln. Die
+   Forderung ist **größer, als sie klingt**.
+3. **Ordnerwechsel hat heute keine Wirkung auf die Sitzung.** `AppShell.openProjectFolder`
+   (`AppShell.tsx:112-132`) ruft nur `workspace.swap(...)`; `sessionId` bleibt. Wer Projekt B
+   öffnet, **sieht den Verlauf von Projekt A**. Das ist der wichtigste einzelne Befund.
+
+### 🔴 Entscheidungsfragen an den Nutzer — vor dem Bauen stellen
+
+1. **Ebene:** „Konversation" = eine Frage-Antwort (ein *Turn*) oder ein Verlauf mit mehreren
+   Fragen (eine *Session*)? Bestimmt die Oberfläche, nicht das Schema.
+2. **Identität:** Soll die Projektidentität eine **Datei im Ordner** sein (UUID; überlebt
+   Umbenennen, gleiche Ordnernamen, Rechnerwechsel) oder reicht der Browser-Fingerabdruck?
+   Heute ist die ID `` `local:${name}` `` (`file-system-access.ts:164-165`) — **zwei Ordner
+   mit demselben Namen sind derselbe String**, und sie wird nirgends gespeichert.
+3. **Ordnerwechsel:** Soll der Verlauf des vorigen Ordners verschwinden oder sichtbar
+   bleiben? Der Code entscheidet heute **stillschweigend** für „sichtbar".
+4. **Bestand:** Was passiert mit der einen heutigen Session
+   (`localStorage["baah.session.v1"]`, `title = "Sitzung"`)? Sobald `localStorage` leer ist,
+   ist sie verwaist **und unauffindbar**, weil es keine Liste gibt.
+5. **Grenze:** Gilt „über mehrere Läufe eindeutig" auch über **Gerätewechsel**? Das ist die
+   einzige Frage, auf die „nein" eine **richtige** Antwort ist — dann ist der Projektordner
+   die Wahrheitsquelle (`Plan.md:1933-1941`), ein eigenes Vorhaben.
+
+### Was als **gemessen** gilt — und was nicht
+
+Gemessen (Quelltext, Treffer gezählt): alle `Datei:Zeile`-Angaben oben und in der Analyse.
+**Nicht gemessen, nur vermutet:** ob Chrome wirklich keinen absoluten Pfad preisgibt (aus dem
+Code geschlossen — der Workspace nimmt nur `handle.name`); ob der Grant **jeden** Kaltstart
+erlischt (Repo-Angabe, zitiert); ob zwei Sessions in einer Datenbank funktionieren (kein
+gemessener Pfad, weil `listSessions` unbenutzt ist); was ein zweiter Tab dem Nutzer zeigt.
+**Keine Tests ausgeführt** — `pnpm check` lief hier nicht.
