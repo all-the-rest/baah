@@ -22,6 +22,16 @@
  * UI cannot pretend it can save.
  *
  * Import path: `@all-the.rest/baah-core/workspace/file-system-access.ts`
+ *
+ * ## The project's identity is a file, not a name
+ *
+ * `FileSystemAccessWorkspaceOptions.id` is **required**, and it comes from
+ * {@link resolveProjectId}, which reads — and on first open creates —
+ * `<folder>/.baah/project.json`. The previous default, `` `local:${handle.name}` ``,
+ * was removed rather than repaired: two folders named `api` were one string, and a
+ * renamed folder was a different project. A browser-held id would not have been
+ * enough either, because it does not follow the folder to another machine. See
+ * {@link PROJECT_DIRECTORY} for the exact and complete write footprint.
  */
 
 import { z } from "zod";
@@ -33,6 +43,7 @@ import {
   type WorkspaceKind,
 } from "./directory-workspace.ts";
 import { isDirectoryHandle } from "./paths.ts";
+import type { Workspace } from "../workspace.ts";
 
 /**
  * The DOMException-free permission surface. TypeScript's DOM lib does not ship
@@ -125,8 +136,22 @@ function failureState(error: unknown): HandlePermissionState {
 export interface FileSystemAccessWorkspaceOptions {
   /** Label shown in the UI. Defaults to the picked folder name. */
   readonly label?: string;
-  /** Stable id. Defaults to `local:<folder name>`. */
-  readonly id?: string;
+  /**
+   * The project's stable id — **required**.
+   *
+   * It used to be optional and default to `` `local:${handle.name}` ``. That
+   * default is gone, and deliberately: two folders named `api` produced the **same
+   * string**, so the third project on a machine collided with the first, and a
+   * renamed folder became a different project. A name is a display label, never an
+   * identity.
+   *
+   * Making it required rather than merely discouraged is the point. An optional id
+   * with a fallback is a fallback somebody eventually takes, and the resulting bug —
+   * two projects sharing one id — is silent: both open, both list, and the
+   * conversations of one appear under the other. `resolveProjectId` is how a caller
+   * gets a correct value; see the module section on `.baah/project.json`.
+   */
+  readonly id: string;
   /** See `DirectoryWorkspaceOptions.maxOpenFileHandles`. */
   readonly maxOpenFileHandles?: number;
 }
@@ -153,7 +178,7 @@ export interface FileSystemAccessWorkspace extends DirectoryWorkspace {
 
 export function createFileSystemAccessWorkspace(
   handle: FileSystemDirectoryHandle,
-  options: FileSystemAccessWorkspaceOptions = {},
+  options: FileSystemAccessWorkspaceOptions,
 ): FileSystemAccessWorkspace {
   const parsed = directoryHandleSchema.parse(handle);
   if (!isDirectoryHandle(parsed)) {
@@ -162,7 +187,7 @@ export function createFileSystemAccessWorkspace(
   }
 
   const label = options.label ?? parsed.name;
-  const id = options.id ?? `local:${parsed.name}`;
+  const id = options.id;
   const kind: WorkspaceKind = "local-directory";
   const api = permissionApi(parsed);
   let last: HandlePermissionState = "prompt";
@@ -245,4 +270,222 @@ export function createFileSystemAccessWorkspace(
       permission: last,
     }),
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* The project's own identity: `<folder>/.baah/project.json`          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The one directory this app is allowed to create inside a user's folder.
+ *
+ * **The whole of the app's write footprint in a project folder, and the reason is
+ * stated rather than implied.** `Plan.md` §18.7 records the decision: the user chose
+ * "still anlegen, `.git` gleich" — create it silently, the way `.git` is created.
+ * That is a licence for **one** directory and nothing else:
+ *
+ * - no `.gitignore` entry, and no attempt to be ignored,
+ * - no cleanup, no pruning, no "temporary" file left behind,
+ * - no write anywhere outside `.baah/`.
+ *
+ * A convention is a permission, not a blank cheque. The second bullet is the one
+ * that is easy to drift into: a "helpful" cleanup would delete a file a user put
+ * there, and the app cannot tell their file from its own.
+ */
+export const PROJECT_DIRECTORY = ".baah";
+
+/** The file inside {@link PROJECT_DIRECTORY} that carries the project's stable id. */
+export const PROJECT_ID_PATH = `${PROJECT_DIRECTORY}/project.json`;
+
+/** The `format` marker, so a file from a future version is recognisable. */
+export const PROJECT_ID_FORMAT = "baah-project";
+
+/**
+ * The file's shape, validated with `zod` like every other foreign boundary
+ * (`AGENTS.md` §5). **Read from a file the user can edit**, which is the strongest
+ * version of that rule in this codebase: this is not a message from a provider, it
+ * is a file on the user's disk.
+ */
+const projectIdFileSchema = z.strictObject({
+  format: z.literal(PROJECT_ID_FORMAT),
+  id: z.string().min(1),
+  createdAt: z.string().min(1),
+});
+
+/** What {@link resolveProjectId} found, and what it did about it. */
+export type ProjectIdResolution =
+  | {
+      readonly kind: "resolved";
+      readonly projectId: string;
+      /** `true` when this call is the one that wrote the file. */
+      readonly created: boolean;
+    }
+  | {
+      /**
+       * The folder is usable, but it has **no trustworthy project identity**.
+       *
+       * Reached when the file exists and is not our JSON, or when it is ours and the
+       * write of a new one failed. `projectId` is then a fresh id that is **not**
+       * persisted, so it will differ on the next run — which is exactly why this is
+       * a separate kind instead of a `resolved` with a caveat: a caller that renders
+       * a project list must be able to say "this project's conversations are not
+       * reachable from the next run", and it cannot say that about a `resolved`.
+       */
+      readonly kind: "unstable";
+      readonly projectId: string;
+      readonly reason: string;
+    };
+
+export interface ResolveProjectIdOptions {
+  /** Injected so a test gets a deterministic id. Defaults to `crypto.randomUUID()`. */
+  readonly mint?: (() => string) | undefined;
+  /** Injected clock, ISO-8601. Only used when the file is written. */
+  readonly now?: (() => string) | undefined;
+}
+
+function mintProjectId(mint: (() => string) | undefined): string {
+  if (mint !== undefined) return mint();
+  const cryptoRef = globalThis.crypto;
+  if (typeof cryptoRef?.randomUUID === "function") return cryptoRef.randomUUID();
+  // The same degraded-browser fallback `newId` uses. A colliding project id merges
+  // two projects' conversation lists, so it is worth the counter rather than a
+  // timestamp that two calls in one millisecond would share.
+  return `unstable-${Date.now().toString(36)}-${Math.trunc(performance.now()).toString(36)}`;
+}
+
+/**
+ * Read the project's stable id out of the folder, creating it on first open.
+ *
+ * ## Why the identity lives in the folder and not in the browser
+ *
+ * A browser-stored id (IndexedDB, `localStorage`) is *this device's* id. It does not
+ * survive copying the project to another machine, and it does not survive "clear
+ * site data" — both of which the requirement "über mehrere Läufe eindeutig" is about.
+ * A file inside the folder travels with the folder, so two machines that open the
+ * same directory agree on the project without talking to each other. That is the
+ * whole reason this function exists.
+ *
+ * ## What it writes, and what it never does
+ *
+ * Exactly one file, at exactly {@link PROJECT_ID_PATH}, and only when that file is
+ * absent. It never rewrites a file that is already there, and — the important half —
+ * it never **overwrites a file it does not understand**. A `.baah/project.json`
+ * holding something else is reported as {@link ProjectIdResolution} `"unstable"`,
+ * because silently replacing it would destroy whatever the user or a newer version
+ * of the app put there, and an identity that changes when you re-open a project is
+ * worse than one the app admits it cannot vouch for.
+ *
+ * ## Why the workspace, and not the handle
+ *
+ * The parameter is a {@link Workspace}, not a `FileSystemDirectoryHandle`, so this
+ * is testable against `createMemoryWorkspace()` in plain Node — no browser, no
+ * permission dance, no `AGENTS.md` §2 exception needed. The real caller passes the
+ * folder's own workspace, which is the only thing that should be writing there.
+ */
+export async function resolveProjectId(
+  workspace: Pick<Workspace, "exists" | "readText" | "writeText">,
+  options: ResolveProjectIdOptions = {},
+): Promise<ProjectIdResolution> {
+  const mint = (): string => mintProjectId(options.mint);
+  const existing = await readExistingProjectId(workspace);
+  if (existing.kind === "resolved") return existing;
+  if (existing.kind === "foreign") {
+    return {
+      kind: "unstable",
+      projectId: mint(),
+      reason:
+        `${PROJECT_ID_PATH} exists but is not a ${PROJECT_ID_FORMAT} file, so its id cannot be ` +
+        "trusted. It was left untouched.",
+    };
+  }
+  if (existing.kind === "unreadable") {
+    // **Not** "absent", and therefore not a write attempt: creating a file in a
+    // folder the app could not even stat would turn a read failure into a write
+    // failure, and the user would see two problems instead of one.
+    return { kind: "unstable", projectId: mint(), reason: existing.reason };
+  }
+
+  const projectId = mint();
+  const at = (options.now ?? ((): string => new Date().toISOString()))();
+  const file = `${JSON.stringify({ format: PROJECT_ID_FORMAT, id: projectId, createdAt: at }, null, 2)}\n`;
+  try {
+    await workspace.writeText(PROJECT_ID_PATH, file);
+  } catch (error: unknown) {
+    // Reported, never swallowed (`AGENTS.md` §5) and never retried with a different
+    // path. The id exists for this run and the user is told it will not survive it.
+    return {
+      kind: "unstable",
+      projectId,
+      reason:
+        `${PROJECT_ID_PATH} could not be written (${
+          error instanceof Error ? error.name : "unbekannter Fehler"
+        }), so this project's identity is not stable across restarts.`,
+    };
+  }
+  return { kind: "resolved", projectId, created: true };
+}
+
+type ExistingProjectId =
+  | { readonly kind: "resolved"; readonly projectId: string; readonly created: boolean }
+  /** The file is there and is not ours. Never overwritten. */
+  | { readonly kind: "foreign" }
+  /** The file is not there. */
+  | { readonly kind: "absent" }
+  /** The folder could not be inspected. A different fact, and never "absent". */
+  | { readonly kind: "unreadable"; readonly reason: string };
+
+/**
+ * **Total on purpose** — every outcome is a value, none is a throw.
+ *
+ * The first version threw a `ProjectIdUnavailable` when `exists()` failed, and that
+ * forced every caller to wrap a function whose whole job is to describe a folder's
+ * identity in a `try`. A throw from here reaches a click handler
+ * (`projectFolder.pick()`), where an escaping error is a rejected promise the UI has
+ * to catch separately from the ordinary "not connected" answer. Reading a folder can
+ * fail for reasons that are not bugs — a revoked grant, a folder removed from under
+ * the handle — and those belong in the same union as everything else.
+ */
+async function readExistingProjectId(
+  workspace: Pick<Workspace, "exists" | "readText">,
+): Promise<ExistingProjectId> {
+  let present: boolean;
+  try {
+    present = await workspace.exists(PROJECT_ID_PATH);
+  } catch (error: unknown) {
+    return {
+      kind: "unreadable",
+      reason:
+        `${PROJECT_ID_PATH} could not be checked (${
+          error instanceof Error ? error.name : "unbekannter Fehler"
+        }).`,
+    };
+  }
+  if (!present) return { kind: "absent" };
+
+  let raw: string;
+  try {
+    raw = await workspace.readText(PROJECT_ID_PATH);
+  } catch (error: unknown) {
+    return {
+      kind: "unreadable",
+      reason:
+        `${PROJECT_ID_PATH} could not be read (${
+          error instanceof Error ? error.name : "unbekannter Fehler"
+        }).`,
+    };
+  }
+  const parsed = projectIdFileSchema.safeParse(safeJsonParse(raw));
+  // `strictObject`: a file with an extra key is **not** silently accepted. It may be a
+  // newer version's file, and treating it as ours would mean this build writes over
+  // fields it does not understand.
+  if (!parsed.success) return { kind: "foreign" };
+  return { kind: "resolved", projectId: parsed.data.id, created: false };
+}
+
+function safeJsonParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
 }

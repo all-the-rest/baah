@@ -2257,3 +2257,85 @@ geschlossen, nicht im Browser geprüft:
 - ob die Freigabe jeden Kaltstart erlischt (Repo-Angabe, zitiert),
 - ob **zwei** Sessions in einer Datenbank funktionieren — das ist eine **Folgerung** aus
   dem Schema, denn es gibt keinen gemessenen Pfad: `listSessions` ist unbenutzt.
+
+---
+
+## 20. Korrektur zu §18.4: `parts.session_id` ist **tragend**, nicht redundant
+
+Ergänzt am 2026-10-01. §18.4 behauptete, die Spalte erscheine in **null** SELECTs und
+**null** WHERE-Filtern und sei damit ein Refactor-Ziel. **Das ist falsch**, und der Fehler
+ist ein Grep-Fehler, kein Analyse-Fehler — deshalb steht er hier so ausführlich.
+
+### Was tatsächlich dasteht
+
+```text
+sql.ts:390          p.session_id    AS sessionId
+sql.ts:396          FROM parts_fts
+sql.ts:405-407      export function searchSql(bySession: boolean): string {
+                      bySession
+                        ? `${SEARCH_SELECT} AND p.session_id = ? ORDER BY score LIMIT ?`
+                        : `${SEARCH_SELECT} ORDER BY score LIMIT ?`
+                    }
+schema.ts:254       CREATE INDEX idx_parts_session_seq ON parts (session_id, seq)
+schema.ts:499       "idx_parts_session_seq",   ← auch als erwarteter Index-Name geführt
+```
+
+**Ein SELECT, ein bedingter Filter, und ein Index, der genau dafür gebaut ist.**
+
+### Warum ich es nicht gesehen habe — und das ist der Teil, den man merken muss
+
+Ich habe nach `WHERE.*session_id|AND session_id` gesucht. **Die Abfrage sagt
+`AND p.session_id`** — mit Tabellen-Alias. Mein Muster verlangte das Präfix **nicht**,
+also passte es nicht, und ich habe die Treffer auf `messages`/`turns` gelesen und
+daraus „`parts` hat keine" geschlossen.
+
+> **Ich habe nach der Schreibweise gesucht, die ich erwartet habe, nicht nach der, die in
+> der Datei steht.** Das ist der Umkehrfehler von „nach dem Namen suchen": dort findet man
+> nichts, hier findet man **das Falsche** — und das Falsche ist schlimmer, weil es eine
+> Zahl ergibt.
+
+Und `searchSql(bySession)` ist ein **Schalter**, kein Versehen. **Sitzungsbezogene Suche ist
+ein geplantes Feature**, und die Spalte ist seine tragende Säule.
+
+### Die Folge ist unangenehmer als Redundanz
+
+Gemessen, beide Backends:
+
+```text
+readTranscript({ sessionId: "s1" })  →  zeigt den Part
+search({ query, sessionId: "s1" })   →  findet ihn nicht
+```
+
+Ein Part mit **fremder** `session_id` geht heute unbemerkt durch (das ist der Test in
+`parts-session-id.test.ts`), und **zwei öffentliche Leser widersprechen sich dann über
+dieselbe Zeile.** Das ist nicht „eine tote Spalte", das ist eine **latente
+Widersprüchlichkeit mit einem Index darauf**.
+
+### Also: §18.5 Schritt 5 ist **kein** Refactor
+
+Er ist eine **Verhaltensänderung mit offener Frage**, und die Frage gehört dem Nutzer:
+
+| | |
+|---|---|
+| Spalte entfernen **und** den Suchfilter auf `messages` umbiegen | schneller, aber ein **JOIN** pro Suche — und der Index `idx_parts_session_seq` wäre nutzlos |
+| Spalte behalten und die **Konsistenz erzwingen** | Trigger beim Schreiben, oder den Schreibpfad so legen, dass die Engine sie setzt statt ein Aufrufer |
+| Spalte behalten, **beides** messbar machen | der ehrliche Zustand: zwei Leser, ein Filter, und ein Test, der die Inkonsistenz benennt statt sie zu verbergen |
+
+**Empfehlung: die zweite Variante, und erst nach einem Test, der sie beweist.** Der
+gesuchte Test existiert bereits (`parts-session-id.test.ts`) und zeigt den Widerspruch —
+er beweist aber **noch nicht**, dass eine Konsistenzerzwingung ihn behebt.
+
+**Und bis dahin gilt:** §18.4s Zahl „0" ist **aus dem Dokument entfernt**, nicht
+überschrieben — sie steht hier als Widerruf, damit jemand, der §18.4 liest, weiß, dass er
+zu einer widerlegten Aussage greift.
+
+### Und was das über die Kette aussagt
+
+`parts.session_id` war die **letzte** Stelle, an der zwei Spalten eine Tatsache hielten —
+und sie war die mit einem Index dahinter. Eine Spalte, die niemand liest, ist harmlos; eine
+Spalte, die **niemand liest außer einer Abfrage, die ich nicht gefunden habe**, ist ein
+Fehler, der erst beim Suchen auffällt.
+
+> **Beim Refactor ist die gefährlichste Spalte nicht die unbenutzte, sondern die, die
+> aussieht wie eine.** Sie hat einen Index, sie hat Tests, sie hat eine Query — nur eben
+> keine, die man beim ersten Grep sieht.

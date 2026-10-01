@@ -59,9 +59,13 @@ import {
   createFileSystemAccessWorkspace,
   isDirectoryHandleLike,
   PERMISSION_REQUIRES_USER_GESTURE,
+  resolveProjectId,
   type FileSystemAccessWorkspace,
   type HandlePermissionState,
+  type ProjectIdResolution,
+  type ResolveProjectIdOptions,
 } from "@all-the.rest/baah-core/workspace/file-system-access";
+import type { Workspace } from "@all-the.rest/baah-core";
 
 import { createObservable, type Observable } from "./observable.ts";
 
@@ -98,6 +102,55 @@ export type ProjectFolderState =
   | { readonly kind: "denied"; readonly label: string }
   /** No File System Access API, or no permission surface on the handle. */
   | { readonly kind: "unsupported"; readonly reason: string };
+
+/**
+ * The project's stable identity, as far as it could be established.
+ *
+ * **A separate fact from {@link ProjectFolderState}, and deliberately not a field on
+ * it.** The two come apart in ways that matter:
+ *
+ * - the folder is **granted** but its id could not be written (read-only mount, a
+ *   `.baah/project.json` that is not ours) — usable, but the conversation list will
+ *   not survive the next run;
+ * - the folder is **not granted**, so it cannot be read at all and no id is known
+ *   even though the folder is still selected;
+ * - the folder is connected and its id is stable — the ordinary case.
+ *
+ * Putting `projectId` on the state union would have made the second case carry an id
+ * it does not have, and every caller would then re-derive the same distinction from a
+ * state that cannot express it. It is an accessor on the controller instead:
+ * {@link ProjectFolderController.project}.
+ */
+export interface ProjectIdentity {
+  readonly projectId: string;
+  /** The folder's own name. A **label**; never an identity. */
+  readonly name: string;
+  /**
+   * The folder as a workspace, carrying the project id as its own `id`.
+   *
+   * On the identity rather than looked up again, because a second
+   * `createFileSystemAccessWorkspace` for the same handle would be a second object
+   * claiming the same id — and `switchProject` needs the workspace that belongs to
+   * *this* id, not one rebuilt from the handle.
+   *
+   * Typed as the base {@link Workspace} and not as `FileSystemAccessWorkspace`: the
+   * only thing a consumer does with it is hand it to `createAppRuntime({ workspace })`,
+   * and the narrower type would make a caller that is not a browser — a test, or a
+   * future non-FSAA project kind — cast its way past the very check this module exists
+   * to provide. `workspace.id` is the project id either way, and that is the property
+   * callers read.
+   */
+  readonly workspace: Workspace;
+  /**
+   * `false` when the id could not be read from or written to
+   * `.baah/project.json`. Such an id holds **for this run** and will differ on the
+   * next one, which is why a caller that persists anything keyed on it must not
+   * pretend otherwise.
+   */
+  readonly stable: boolean;
+  /** Present when `stable === false`: the sentence a user has to be told. */
+  readonly problem: string | undefined;
+}
 
 /* ------------------------------------------------------------------ */
 /* The ports                                                           */
@@ -159,6 +212,18 @@ export interface ProjectFolderHandleStore {
   readonly description: string;
 }
 
+/**
+ * The id the **throwaway** workspace is built with, inside `attach`, before the
+ * folder's own `.baah/project.json` has been read.
+ *
+ * It is a constant and not a name-derived string on purpose. The probe never leaves
+ * `attach` — the workspace handed to the UI and to the runtime is built a few lines
+ * later with the real id — so this value has no meaning outside those lines. Naming
+ * it makes that visible: a reader who finds it in a debugger is looking at the probe,
+ * not at the project's identity.
+ */
+const PROJECT_ID_PROBE = "probe:not-yet-resolved";
+
 export interface ProjectFolderPorts {
   readonly store: ProjectFolderHandleStore;
   /**
@@ -166,12 +231,32 @@ export interface ProjectFolderPorts {
    * plant a handle; the app never passes it.
    */
   readonly pick?: (() => Promise<FileSystemDirectoryHandle>) | undefined;
+  /**
+   * How `.baah/project.json` is read and written — the id mint and the clock.
+   *
+   * Injected for the reason every other seam here is: `crypto.randomUUID` and the
+   * wall clock are the two things a test must not depend on, and `resolveProjectId`
+   * writes a **file into a user's folder** on first open. A test that cannot fix the
+   * id cannot assert "the same folder yields the same project twice", which is the
+   * property the whole feature rests on.
+   */
+  readonly projectId?: ResolveProjectIdOptions | undefined;
 }
 
 export interface ProjectFolderController {
   readonly state: Observable<ProjectFolderState>;
   /** The current value, for callers outside a subscription. */
   readonly current: () => ProjectFolderState;
+  /**
+   * The attached folder's stable id, or `undefined` when there is no readable
+   * folder.
+   *
+   * Read through a getter rather than off {@link ProjectFolderState}, for the reason
+   * at {@link ProjectIdentity}: a `needs-gesture` folder is selected and has **no**
+   * readable id, and a `connected` folder can have an id that is not stable. Both are
+   * states the union cannot carry, so both live here.
+   */
+  readonly project: () => ProjectIdentity | undefined;
   /**
    * Open the picker and attach the folder.
    *
@@ -228,6 +313,16 @@ export function isHandleStoreAvailable(): boolean {
 
 export function createProjectFolderController(ports: ProjectFolderPorts): ProjectFolderController {
   const state = createObservable<ProjectFolderState>({ kind: "no-handle" });
+  /**
+   * The attached folder's identity, kept beside the state rather than inside it.
+   *
+   * A plain `let`, not an observable: the value only ever changes together with
+   * `state.set(...)`, and every reader of it (`project()`) is reached from the same
+   * call. A second observable would be a second thing that can notify without the
+   * first, which is the "two sources for one fact" shape this whole block exists to
+   * remove.
+   */
+  let identity: ProjectIdentity | undefined;
 
   const openPicker = async (): Promise<FileSystemDirectoryHandle> => {
     if (ports.pick !== undefined) return ports.pick();
@@ -277,6 +372,14 @@ export function createProjectFolderController(ports: ProjectFolderPorts): Projec
    * then fail on the first `writeText`. `queryPermission` is free and never
    * prompts, so asking for the stricter mode at restore costs nothing and makes
    * the answer honest.
+   *
+   * ## And the third thing `attach` decides: the project's identity
+   *
+   * Once the grant is in, `attach` reads — and on first open creates —
+   * `<folder>/.baah/project.json`, and the workspace the UI and the runtime receive
+   * is built **with that id**. That is why `FileSystemAccessWorkspaceOptions.id` is
+   * required: the old `` `local:${name}` `` made two folders called `api` the same
+   * project, and nothing on disk remembered either of them.
    */
   const attach = async (
     handle: FileSystemDirectoryHandle,
@@ -286,18 +389,50 @@ export function createProjectFolderController(ports: ProjectFolderPorts): Projec
       // The stored entry did not survive. Drop it, or it fails the same way on
       // every future load and the button can never fix it.
       await forget(ports.store, handle);
+      identity = undefined;
       return { kind: "unsupported", reason: "Der gespeicherte Ordner-Zugriff ist nicht mehr gültig." };
     }
-    const workspace = createFileSystemAccessWorkspace(handle);
+
+    // **The order is forced, and it is the whole point of this change.**
+    //
+    // The permission is asked on a throwaway workspace, because reading
+    // `.baah/project.json` needs a folder the app may actually touch — and the
+    // second workspace is built *with the id that file carried*. The old code built
+    // one workspace and gave it `` `local:${name}` ``; the name is not an identity,
+    // two folders called `api` collided, and nothing on disk remembered either of
+    // them.
+    //
+    // The probe's id is a constant placeholder, not a fallback: it never leaves this
+    // function, and `FileSystemAccessWorkspaceOptions.id` is required precisely so
+    // that no caller can end up shipping one.
+    const probe = createFileSystemAccessWorkspace(handle, { id: PROJECT_ID_PROBE });
     const permission =
-      ask === "request" ? await workspace.ensurePermission(true) : await workspace.refreshPermission(true);
-    return fromPermission(workspace.label, permission.state, permission.reason, workspace);
+      ask === "request" ? await probe.ensurePermission(true) : await probe.refreshPermission(true);
+    if (permission.state !== "granted") {
+      // Not readable ⇒ no id. A `needs-gesture` folder is still *selected*, which is
+      // why the state says so and the identity says nothing: they are two facts.
+      identity = undefined;
+      return fromPermission(probe.label, permission.state, permission.reason, probe);
+    }
+
+    const resolution: ProjectIdResolution = await resolveProjectId(probe, ports.projectId);
+    const label = probe.label;
+    const workspace = createFileSystemAccessWorkspace(handle, { id: resolution.projectId, label });
+    identity = {
+      projectId: resolution.projectId,
+      name: label,
+      stable: resolution.kind === "resolved",
+      problem: resolution.kind === "resolved" ? undefined : resolution.reason,
+      workspace,
+    };
+    return fromPermission(label, permission.state, permission.reason, workspace);
   };
 
   const restore = async (): Promise<ProjectFolderState> => {
     const handle = await ports.store.read();
     if (handle === undefined) {
       const next: ProjectFolderState = { kind: "no-handle" };
+      identity = undefined;
       state.set(next);
       return next;
     }
@@ -324,6 +459,11 @@ export function createProjectFolderController(ports: ProjectFolderPorts): Projec
   const release = async (): Promise<ProjectFolderState> => {
     const handle = await ports.store.read();
     if (handle !== undefined) await forget(ports.store, handle);
+    // The identity goes with the folder. Leaving it behind would be the exact bug
+    // this block exists to kill in the other direction: a released folder's id still
+    // naming a project, so the conversation list would show a project the user just
+    // detached.
+    identity = undefined;
     // **Only notify when the state actually changed.** `createObservable.set` is
     // a no-op on `Object.is` equality, and `{ kind: "no-handle" }` is a fresh
     // object literal every call — so an unconditional `set` notifies a
@@ -335,7 +475,7 @@ export function createProjectFolderController(ports: ProjectFolderPorts): Projec
     return state.get();
   };
 
-  return { state, current: state.get, pick, restore, release };
+  return { state, current: state.get, project: () => identity, pick, restore, release };
 }
 
 /**

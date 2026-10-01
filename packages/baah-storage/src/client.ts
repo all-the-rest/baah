@@ -62,6 +62,8 @@ import type {
   TurnOutcomeEntry,
   UnfinishedTurn,
   TxResult,
+  Workspace,
+  WorkspaceInput,
 } from "./types.ts";
 
 const DEFAULT_FILENAME = "/baah.sqlite3";
@@ -249,12 +251,28 @@ export class WorkerStorageDatabase implements StorageDatabase {
     return this.#operations.getSession(id);
   }
 
-  listSessions(): Promise<Session[]> {
-    return this.#operations.listSessions();
+  listSessions(input?: { readonly workspaceId?: string | undefined }): Promise<Session[]> {
+    return this.#operations.listSessions(input);
   }
 
   deleteSession(id: string): Promise<void> {
     return this.#operations.deleteSession(id);
+  }
+
+  attachSessionToWorkspace(sessionId: string, workspaceId: string | null): Promise<void> {
+    return this.#operations.attachSessionToWorkspace(sessionId, workspaceId);
+  }
+
+  createWorkspace(input: WorkspaceInput): Promise<Workspace> {
+    return this.#operations.createWorkspace(input);
+  }
+
+  getWorkspace(id: string): Promise<Workspace | null> {
+    return this.#operations.getWorkspace(id);
+  }
+
+  listWorkspaces(): Promise<Workspace[]> {
+    return this.#operations.listWorkspaces();
   }
 
   appendMessage(input: MessageInput): Promise<Message> {

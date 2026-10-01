@@ -185,7 +185,7 @@ function makeWorkspace(permission?: {
   const { handle, node } = makeRoot(permission);
   return {
     node,
-    workspace: createFileSystemAccessWorkspace(handle, { label: "project" }),
+    workspace: createFileSystemAccessWorkspace(handle, { label: "project", id: "test-project" }),
   };
 }
 
@@ -400,9 +400,9 @@ describe("createFileSystemAccessWorkspace — Workspace contract", () => {
   it("rejects a handle that is not a directory handle", () => {
     const notADirectory = { kind: "file", name: "x", getFile: () => undefined };
     expect(() =>
-      createFileSystemAccessWorkspace(
-        notADirectory as unknown as FileSystemDirectoryHandle,
-      ),
+      createFileSystemAccessWorkspace(notADirectory as unknown as FileSystemDirectoryHandle, {
+        id: "test-project",
+      }),
     ).toThrow(/FileSystemDirectoryHandle/);
   });
 
@@ -533,7 +533,10 @@ describe("list caps concurrently open file handles", () => {
       "root",
       node,
     ) as unknown as FileSystemDirectoryHandle;
-    const workspace = createFileSystemAccessWorkspace(handle, { maxOpenFileHandles: 3 });
+    const workspace = createFileSystemAccessWorkspace(handle, {
+      id: "test-project",
+      maxOpenFileHandles: 3,
+    });
 
     openFileTracker.active = 0;
     openFileTracker.peak = 0;
@@ -560,7 +563,7 @@ describe("walk", () => {
       "root",
       tree(),
     ) as unknown as FileSystemDirectoryHandle;
-    return createFileSystemAccessWorkspace(handle);
+    return createFileSystemAccessWorkspace(handle, { id: "test-project" });
   }
 
   it("yields the whole tree, depth first", async () => {
@@ -635,7 +638,7 @@ describe("walk", () => {
       "root",
       directory({ deep }),
     ) as unknown as FileSystemDirectoryHandle;
-    const workspace = createFileSystemAccessWorkspace(handle);
+    const workspace = createFileSystemAccessWorkspace(handle, { id: "test-project" });
 
     let count = 0;
     for await (const entry of workspace.walk(".").entries) {

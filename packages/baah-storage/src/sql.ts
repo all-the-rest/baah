@@ -17,6 +17,7 @@ import type {
   SqlParam,
   ToolCallKey,
   TurnInput,
+  WorkspaceInput,
 } from "./types.ts";
 
 /** Column list, aliased to the camelCase field names of `Session`. */
@@ -26,7 +27,8 @@ export const SESSION_COLUMNS = `
   metadata,
   created_at   AS createdAt,
   updated_at   AS updatedAt,
-  archived_at  AS archivedAt
+  archived_at  AS archivedAt,
+  workspace_id AS workspaceId
 `;
 
 export const MESSAGE_COLUMNS = `
@@ -69,11 +71,20 @@ export const TOOL_CALL_KEY_PREDICATE = `session_id = ? AND attempt = ? AND tool_
 /**
  * `archived_at` is bound, not hardcoded: §6.1's CHECK says an archived session
  * must carry the timestamp, so the write path has to be able to supply it.
+ *
+ * `workspace_id` is bound too, and that is the one column here that did not exist
+ * when this statement was written: migration 5 adds it
+ * (`STEP_SESSION_WORKSPACE`). Binding it on the insert — rather than having the
+ * caller `UPDATE` it afterwards — means there is no moment in which a conversation
+ * exists without the project it belongs to, and a project-scoped read cannot miss
+ * one. The column is nullable with no default because SQLite only permits
+ * `ADD COLUMN … REFERENCES` in that shape, and because `null` is the truthful
+ * value for a session whose project is not known yet.
  */
 export const INSERT_SESSION = `
   INSERT INTO sessions
-    (id, title, status, model, system_prompt, metadata, created_at, updated_at, archived_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (id, title, status, model, system_prompt, metadata, created_at, updated_at, archived_at, workspace_id)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   RETURNING ${SESSION_COLUMNS}`;
 
 export const SELECT_SESSION = `
@@ -83,7 +94,96 @@ export const SELECT_SESSIONS = `
   SELECT ${SESSION_COLUMNS} FROM sessions
   ORDER BY updated_at DESC, created_at DESC`;
 
+/**
+ * The project-scoped variant of {@link SELECT_SESSIONS}: "the conversations of this
+ * project, newest first".
+ *
+ * A **second statement rather than `? IS NULL`** on the general one, for the same
+ * reason `searchSql()` has two variants: the query plan is then the same either way,
+ * and the index `idx_sessions_workspace_id (workspace_id, updated_at DESC)` is used
+ * as written instead of as a scan that happens to filter.
+ *
+ * `WHERE workspace_id = ?` does not match `NULL`, and that is correct rather than a
+ * gap: a detached session belongs to no project, so it is in no project's list.
+ */
+export const SELECT_SESSIONS_BY_WORKSPACE = `
+  SELECT ${SESSION_COLUMNS} FROM sessions
+  WHERE workspace_id = ?
+  ORDER BY updated_at DESC, created_at DESC`;
+
+/**
+ * Bind a conversation to a project, or detach it with `null`.
+ *
+ * Scoped by `id` **and** `workspace_id` in one statement rather than read-then-write:
+ * a `RETURNING` row means the conversation moved, and zero rows means the caller's
+ * session id does not exist — which is a different fact from "it was already
+ * attached to that project", and the caller is entitled to be told which one it got.
+ */
+export const UPDATE_SESSION_WORKSPACE = `
+  UPDATE sessions SET workspace_id = ? WHERE id = ?
+  RETURNING ${SESSION_COLUMNS}`;
+
 export const DELETE_SESSION = `DELETE FROM sessions WHERE id = ?`;
+
+/** Column list, aliased to the camelCase field names of `Workspace`. */
+export const WORKSPACE_COLUMNS = `
+  id, name, kind,
+  root_handle_id AS rootHandleId,
+  metadata,
+  created_at     AS createdAt,
+  last_opened_at AS lastOpenedAt
+`;
+
+/**
+ * Record a project, or refresh the one that is already there.
+ *
+ * ## Why this one is an upsert and `INSERT_SESSION` is not
+ *
+ * Two different facts, and confusing them is a boot failure:
+ *
+ * | | `INSERT_SESSION` | this statement |
+ * |---|---|---|
+ * | the id comes from | a freshly minted session id, once per conversation | the project's own stable id, read from the folder |
+ * | a second call means | a bug — two conversations with one id | **the normal case**: the same folder opened again |
+ *
+ * So the conflict clause is not a convenience here, it is the difference between
+ * "the user opened their project again" working and raising `UNIQUE constraint
+ * failed: workspaces.id = …` on the second boot of every project. The same argument
+ * `INSERT_MESSAGE` carries, applied to a different arbiter.
+ *
+ * ## What a repeat call does and does not change
+ *
+ * `name`, `last_opened_at` and `metadata` move — they describe the *current* state of
+ * the folder. `created_at` does **not**: it is in the `SET` list as itself, so a
+ * re-open cannot make a project look newer than it is. `id` and `kind` are not in the
+ * `SET` list at all, and that is deliberate: the id is the project's identity and must
+ * not be rewritten by a statement that only meant to bump a timestamp.
+ */
+export const INSERT_WORKSPACE = `
+  INSERT INTO workspaces
+    (id, name, kind, root_handle_id, metadata, created_at, last_opened_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT (id) DO UPDATE SET
+    name           = excluded.name,
+    root_handle_id = excluded.root_handle_id,
+    metadata       = excluded.metadata,
+    last_opened_at = excluded.last_opened_at
+  RETURNING ${WORKSPACE_COLUMNS}`;
+
+export const SELECT_WORKSPACE = `
+  SELECT ${WORKSPACE_COLUMNS} FROM workspaces WHERE id = ?`;
+
+/**
+ * Most recently opened first, and `id` as the tie-break.
+ *
+ * The tie-break is not decoration: two projects opened in the same run carry
+ * timestamps from the same injected clock in a test, and an order that is not total
+ * would make the two backends disagree about row order — which `backend-parity` is
+ * built to catch, and which a user would see as a list that reorders itself.
+ */
+export const SELECT_WORKSPACES = `
+  SELECT ${WORKSPACE_COLUMNS} FROM workspaces
+  ORDER BY last_opened_at DESC, created_at DESC, id ASC`;
 
 /**
  * `seq` is `MAX(seq) + 1` over the session, evaluated inside the same
@@ -332,7 +432,32 @@ export function sessionParams(input: SessionInput, now: string): SqlParam[] {
     input.createdAt ?? now,
     input.updatedAt ?? now,
     status === "archived" ? (input.archivedAt ?? now) : null,
+    input.workspaceId ?? null,
   ];
+}
+
+/**
+ * Positional parameters for {@link INSERT_WORKSPACE}.
+ *
+ * `created_at` and `last_opened_at` are both bound rather than one derived from the
+ * other: a re-open must move `last_opened_at` and leave `created_at` alone, and a
+ * statement that computed the second from the first could not do that.
+ */
+export function workspaceParams(input: WorkspaceInput, now: string): SqlParam[] {
+  return [
+    input.id,
+    input.name,
+    input.kind,
+    input.rootHandleId ?? null,
+    input.metadata ?? null,
+    input.createdAt ?? now,
+    input.lastOpenedAt ?? now,
+  ];
+}
+
+/** The two bound values of {@link UPDATE_SESSION_WORKSPACE}, in statement order. */
+export function sessionWorkspaceParams(sessionId: string, workspaceId: string | null): SqlParam[] {
+  return [workspaceId, sessionId];
 }
 
 /** Positional parameters for {@link INSERT_MESSAGE}. */

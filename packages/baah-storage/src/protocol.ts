@@ -279,6 +279,25 @@ export const sessionRowSchema = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   archivedAt: z.string().nullable(),
+  /**
+   * Nullable on purpose, and not `z.string().default(null)`: a row written before
+   * migration 5 has no such column at all until the `ALTER TABLE` runs, and a
+   * `default` would turn "the column is missing" into "this conversation belongs to
+   * no project" — two different facts that would look the same here.
+   */
+  workspaceId: z.string().nullable(),
+});
+
+const workspaceKindSchema = z.enum(["opfs", "directory"]);
+
+export const workspaceRowSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  kind: workspaceKindSchema,
+  rootHandleId: z.string().nullable(),
+  metadata: z.string().nullable(),
+  createdAt: z.string(),
+  lastOpenedAt: z.string().nullable(),
 });
 
 export const messageRowSchema = z.object({
@@ -375,6 +394,7 @@ export const unfinishedTurnRowSchema = z.object({
 });
 
 export type SessionRow = z.infer<typeof sessionRowSchema>;
+export type WorkspaceRow = z.infer<typeof workspaceRowSchema>;
 export type MessageRow = z.infer<typeof messageRowSchema>;
 export type PartRow = z.infer<typeof partRowSchema>;
 export type TurnRow = z.infer<typeof turnRowSchema>;

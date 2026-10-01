@@ -99,6 +99,271 @@ export function apiKeySlot(vendor: string, name?: string | undefined): string {
 /** The default key the current session id is stored under. */
 export const SESSION_ID_KEY = "baah.session.v1";
 
+/**
+ * The key the **per-project** session pointers live under.
+ *
+ * ## Why this is a second key and not a change of `SESSION_ID_KEY`
+ *
+ * `baah.session.v1` held one value: "the session this browser talks to". With
+ * projects that is no longer a fact — a browser now has one session **per project**,
+ * and opening project B must not cost project A's conversation. So the mapping is
+ * project → session, and it is keyed by the project's own stable id (the one in
+ * `.baah/project.json`), which is why the key can be a plain object.
+ *
+ * The old key is left alone and still read. Dropping it would make every existing
+ * browser open an empty project on the next load, and the rows of the old session
+ * would be unreachable — the exact "verwaist und unauffindbar" state
+ * `Plan.md` §19.6 lists as missing. So {@link readLegacySessionId} is the migration
+ * path, and it is used **once**, for the project a legacy pointer can name: none. A
+ * legacy pointer has no project, so it is adopted as the *sandbox* project's session
+ * and nothing else — which is the truth about it.
+ */
+export const PROJECT_SESSIONS_KEY = "baah.sessions.v2";
+
+/**
+ * The project id used for the browser's own sandbox workspace.
+ *
+ * The sandbox is a project too — its files live in the browser rather than on the
+ * user's disk, and it has the same "one folder, many conversations" shape. Giving it
+ * a reserved id rather than treating "no folder" as a special case means the session
+ * lookup has exactly one code path, and it means the sandbox's conversation also
+ * survives a reload: `localStorage["baah.session.v1"]` becomes this project's entry.
+ *
+ * A literal rather than a minted id, because there is exactly one sandbox per origin
+ * and it must be the **same** project on every run.
+ */
+export const SANDBOX_PROJECT_ID = "opfs:sandbox";
+
+/**
+ * The two backends {@link resolveProjectSession} needs.
+ *
+ * **Two, not one, because `KeyValueBackend` is bound to a single key at construction**
+ * (`createWebStorageBackend({ key })` in `lib/storage.ts`) and the project map and the
+ * legacy pointer are two different keys. Widening the interface to `write(key, value)`
+ * would have been the tidier shape and it is not available here: `lib/storage.ts` is
+ * not this block's file, and a second `KeyValueBackend` costs one object.
+ */
+export interface ProjectSessionStores {
+  /** Bound to {@link PROJECT_SESSIONS_KEY}. */
+  readonly projects: KeyValueBackend;
+  /** Bound to {@link SESSION_ID_KEY}, the pre-project single pointer. */
+  readonly legacy: KeyValueBackend;
+}
+
+/** One project's remembered session, as stored. */
+interface ProjectSessionPointer {
+  readonly sessionId: string;
+  readonly at: string;
+}
+
+const PROJECT_SESSIONS_PATTERN = /^\{[\s\S]*\}$/;
+
+/** What {@link resolveProjectSession} did, so a caller can say it out loud. */
+export interface ProjectSessionResolution {
+  readonly sessionId: string;
+  /** `true` when the id came out of storage — i.e. this is a returning user. */
+  readonly restored: boolean;
+  /**
+   * `true` when the stored pointer was a **legacy** `baah.session.v1` value adopted
+   * for the sandbox project.
+   *
+   * Its own flag because adopting it moves the pointer: the legacy key is written
+   * once and then left for the record, so a second browser profile on the same
+   * machine cannot end up adopting the same session into two different projects.
+   */
+  readonly adopted: boolean;
+  /** Set when the stored value was unusable, or writing the new one failed. */
+  readonly degraded: string | undefined;
+}
+
+/**
+ * The session this browser uses **for one project**, across reloads.
+ *
+ * The same contract as {@link resolveSessionId} and the same reason it exists — a
+ * durable row nothing can query has not survived anything — with one difference that
+ * is the whole point: the lookup is by project, so two projects on one machine keep
+ * two conversations instead of one overwriting the other's pointer.
+ *
+ * A hostile stored value is **replaced, not trusted**, exactly as in
+ * {@link resolveSessionId}: `readTranscript` refuses a session that does not exist,
+ * so a corrupted pointer would leave the app permanently unable to read anything. The
+ * value is additionally checked to be a `session-…` string *and* to belong to the
+ * project asked for — the map is keyed by project id, so a pointer filed under the
+ * wrong project is as wrong as a malformed one.
+ */
+export function resolveProjectSession(
+  stores: ProjectSessionStores,
+  projectId: string,
+  options: {
+    readonly mint?: (() => string) | undefined;
+    readonly now?: (() => number) | undefined;
+  } = {},
+): ProjectSessionResolution {
+  const mint = options.mint ?? (() => newId("session"));
+  const stamp = new Date((options.now ?? Date.now)()).toISOString();
+
+  let stored: Readonly<Record<string, ProjectSessionPointer>> | undefined;
+  let readProblem: string | undefined;
+  try {
+    stored = readProjectSessions(stores.projects.read());
+  } catch (cause) {
+    readProblem = `Die gespeicherten Sitzungen konnten nicht gelesen werden: ${
+      cause instanceof Error ? cause.name : "unbekannter Fehler"
+    }.`;
+  }
+
+  // The legacy pointer, read **before** the early return below and behind its own
+  // `try`. Two reasons, and the second one is a bug this comment exists because of:
+  //
+  // 1. it is only *acted on* for the sandbox project, which is the narrow adoption
+  //    rule below;
+  // 2. `backend.read()` **throws** rather than answering "unset" for a browser with no
+  //    storage at all (`lib/storage.ts`), so an unguarded read here rejects out of
+  //    `createAppRuntime` and lands the user on the boot-failure screen — for a key
+  //    that is a *migration input*, not the pointer the app runs on.
+  let legacy: string | undefined;
+  let legacyProblem: string | undefined;
+  try {
+    legacy = readLegacySessionId(stores.legacy.read());
+  } catch (cause) {
+    // Named as what it is: a pointer from **before** projects existed. It is not the one
+    // the app runs on, so the sentence must not claim the conversation is lost — only
+    // that one may be out there and unreachable.
+    legacyProblem =
+      "Die ältere gespeicherte Sitzung konnte nicht gelesen werden (" +
+      `${cause instanceof Error ? cause.name : "unbekannter Fehler"}). ` +
+      "Falls es noch eine Unterhaltung aus einer früheren Version gibt, ist sie über diesen Browser nicht erreichbar.";
+  }
+
+  const existing = stored?.[projectId];
+  if (existing !== undefined) {
+    // A legacy pointer that could not be read is worth saying out loud even though this
+    // project has its own entry: we cannot rule out a pre-project conversation that
+    // nothing points at any more. It is reported, never guessed at.
+    return {
+      sessionId: existing.sessionId,
+      restored: true,
+      adopted: false,
+      degraded: readProblem ?? legacyProblem,
+    };
+  }
+
+  // The legacy adoption, and it is deliberately narrow: **only** for the sandbox
+  // project. A `baah.session.v1` pointer names a session that predates projects, so
+  // it cannot be attributed to any folder — and attributing it to whichever folder
+  // happens to be opened first would be a guess that moves a user's conversation
+  // into an unrelated project.
+  if (legacy !== undefined && projectId === SANDBOX_PROJECT_ID) {
+    const writeProblem = writeProjectSessions(stores.projects, {
+      ...(stored ?? {}),
+      [projectId]: { sessionId: legacy, at: stamp },
+    });
+    return { sessionId: legacy, restored: true, adopted: true, degraded: writeProblem ?? readProblem ?? legacyProblem };
+  }
+
+  const sessionId = mint();
+  const writeProblem = writeProjectSessions(stores.projects, {
+    ...(stored ?? {}),
+    [projectId]: { sessionId, at: stamp },
+  });
+  return {
+    sessionId,
+    restored: false,
+    adopted: false,
+    degraded: writeProblem ?? readProblem,
+  };
+}
+
+/** Remember which session a project uses, without resolving anything. */
+export function rememberProjectSession(
+  stores: ProjectSessionStores,
+  projectId: string,
+  sessionId: string,
+  now: () => number = Date.now,
+): string | undefined {
+  let stored: Readonly<Record<string, ProjectSessionPointer>> | undefined;
+  try {
+    stored = readProjectSessions(stores.projects.read());
+  } catch (cause) {
+    return `Die gespeicherten Sitzungen konnten nicht gelesen werden: ${
+      cause instanceof Error ? cause.name : "unbekannter Fehler"
+    }.`;
+  }
+  return writeProjectSessions(stores.projects, {
+    ...(stored ?? {}),
+    [projectId]: { sessionId, at: new Date(now()).toISOString() },
+  });
+}
+
+/**
+ * Parse the project→session map out of storage.
+ *
+ * **Total, and it never throws.** A value that is not our JSON, not an object, or
+ * not a record of `{sessionId, at}` yields `undefined` — "there is nothing usable
+ * here" — because every caller of this wants exactly one more attempt at the normal
+ * path, and a thrown parse error in a click handler is a different failure than a
+ * missing pointer. Each entry is validated **on its own**: one unusable project
+ * pointer does not discard the other eleven.
+ */
+function readProjectSessions(raw: string | undefined): Readonly<Record<string, ProjectSessionPointer>> | undefined {
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+
+  const usable: Record<string, ProjectSessionPointer> = {};
+  for (const [projectId, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof value !== "object" || value === null) continue;
+    const candidate = value as { readonly sessionId?: unknown; readonly at?: unknown };
+    if (typeof candidate.sessionId !== "string") continue;
+    if (!SESSION_ID_PATTERN.test(candidate.sessionId)) continue;
+    usable[projectId] = {
+      sessionId: candidate.sessionId,
+      at: typeof candidate.at === "string" ? candidate.at : "",
+    };
+  }
+  return usable;
+}
+
+/**
+ * Write the map back, or say why it could not be written.
+ *
+ * The failure text names the operation and never the value: a `setItem` error can
+ * quote the payload, and the payload is a session id — harmless, but the rule here is
+ * uniform and the cost of following it is one line. Returns `undefined` on success.
+ */
+function writeProjectSessions(
+  backend: KeyValueBackend,
+  sessions: Readonly<Record<string, ProjectSessionPointer>>,
+): string | undefined {
+  const body = JSON.stringify(sessions);
+  // The pattern check is on the *container*, not the ids: a value that does not even
+  // look like our JSON is not ours to overwrite. It is deliberately weak — the real
+  // validation is `readProjectSessions` — because its only job is to avoid clobbering
+  // something foreign that happens to live under our key.
+  if (!PROJECT_SESSIONS_PATTERN.test(body)) {
+    return "Die gespeicherten Sitzungen konnten nicht gespeichert werden: unerwartetes Format.";
+  }
+  try {
+    backend.write(body);
+    return undefined;
+  } catch (cause) {
+    return (
+      `Die Sitzung konnte nicht gespeichert: ${cause instanceof Error ? cause.name : "unbekannter Fehler"}. ` +
+      "Nach einem Neuladen beginnt eine neue Sitzung, der Verlauf der alten bleibt zwar in der Datenbank, ist aber nicht mehr erreichbar."
+    );
+  }
+}
+
+/** The single-session pointer of the pre-project era, or `undefined`. */
+function readLegacySessionId(raw: string | undefined): string | undefined {
+  return readSessionId(raw);
+}
+
 /** What `resolveSessionId` did, so a caller can say it out loud if it must. */
 export interface SessionIdResolution {
   readonly sessionId: string;

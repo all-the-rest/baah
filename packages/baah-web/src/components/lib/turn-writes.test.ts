@@ -51,7 +51,8 @@ import { defineTool, toolPartIdOf } from "@all-the.rest/baah-core";
 import { createMemoryDatabase, type StorageDatabase, type Transcript } from "@all-the.rest/baah-storage";
 
 import { fakeRegistry, finishPart, mockModel, textParts, toolCallParts } from "../../runtime/testing.ts";
-import { createMemoryBackend, SettingsStorageError, type KeyValueBackend } from "../../lib/storage.ts";
+import { createMemoryBackend, SettingsStorageError } from "../../lib/storage.ts";
+import type { ProjectSessionStores } from "../../lib/ids.ts";
 import { createAppRuntime, type AppRuntime } from "./runtime.ts";
 import { storedMessages } from "./transcript.ts";
 
@@ -349,13 +350,20 @@ describe("a second load of the same session", () => {
   /** One app runtime over a database and a session store the test keeps. */
   async function openOver(
     database: StorageDatabase,
-    sessionStorage: KeyValueBackend,
+    projectSessions: ProjectSessionStores,
     steps: readonly (readonly unknown[])[],
   ): Promise<AppRuntime> {
     const { registry } = fakeRegistry({ model: mockModel(steps) });
     const app = await createAppRuntime({
       openDatabase: async () => database,
-      sessionStorage,
+      // **The project→session map is its own backend, and the test hands it in.**
+      // It used to be one `localStorage` value — "the session this browser talks to"
+      // — and became a map keyed by project id when projects arrived. A test that
+      // injected only the legacy backend would be injecting a store the app does not
+      // read, and the second load would mint a fresh session and pass for a reload
+      // that never happened. The legacy backend is still passed, because the sandbox
+      // project adopts from it exactly once.
+      projectSessions,
       settingsBackend: createMemoryBackend(),
       registry,
       tools: [failingRead],
@@ -375,8 +383,14 @@ describe("a second load of the same session", () => {
     // `openDatabase`, and the *same instance* is handed to both loads — which is the
     // whole point, since a fresh `Map` would model a fresh browser, not a reload.
     const database = createMemoryDatabase();
-    const sessionStorage = createMemoryBackend();
-    const first = await openOver(database, sessionStorage, oneStep);
+    // **One** set of stores, shared by both loads. A fresh `createMemoryBackend()`
+    // inside `openOver` would model a fresh browser rather than a reload, and the
+    // assertion below would then be comparing two unrelated sessions.
+    const projectSessions: ProjectSessionStores = {
+      projects: createMemoryBackend(),
+      legacy: createMemoryBackend(),
+    };
+    const first = await openOver(database, projectSessions, oneStep);
     // The engine writes the prompt itself (`AgentTurn.#persistPrompt`), so the question
     // is in the transcript with no help from the app — which is what makes this test
     // also a check that the app did **not** write it a second time.
@@ -386,9 +400,12 @@ describe("a second load of the same session", () => {
     // unconditionally" dies: `createSession` is an `INSERT … RETURNING`, so the second
     // call raises a `UNIQUE` violation and the app would show its boot-failure screen
     // on **every** reload.
-    const second = await openOver(database, sessionStorage, oneStep);
+    const second = await openOver(database, projectSessions, oneStep);
 
     expect(second.runtime.sessionId).toBe(first.runtime.sessionId);
+    // And the project is the same project — the reload must not have created a second
+    // `workspaces` row, which is what a re-minted project id would look like.
+    expect(second.project.projectId).toBe(first.project.projectId);
     const transcript = await read(second);
     const text = transcript.messages
       .flatMap((message) => message.parts)
@@ -413,7 +430,15 @@ describe("a second load of the same session", () => {
     hostile.write = () => {
       throw new SettingsStorageError("write-failed", "quota");
     };
-    const app = await openOver(createMemoryDatabase(), hostile, oneStep);
+    // The **project map** is what the app writes the pointer into, so that is the
+    // backend that has to be hostile. Making the legacy one hostile instead would
+    // leave the new path untouched and the test would pass without proving anything:
+    // the pointer would be written successfully to the map the app actually reads.
+    const app = await openOver(
+      createMemoryDatabase(),
+      { projects: hostile, legacy: createMemoryBackend() },
+      oneStep,
+    );
 
     expect(app.bootProblems).toHaveLength(1);
     expect(app.bootProblems[0]).toContain("nicht gespeichert");

@@ -33,11 +33,15 @@ import {
   INSERT_TOOL_INVOCATION_BEGUN,
   INSERT_TURN,
   INSERT_TURN_OUTCOME_MESSAGE,
+  INSERT_WORKSPACE,
   SELECT_MESSAGE,
   SELECT_MESSAGES,
   SELECT_PARTS,
   SELECT_SESSION,
   SELECT_SESSIONS,
+  SELECT_SESSIONS_BY_WORKSPACE,
+  SELECT_WORKSPACE,
+  SELECT_WORKSPACES,
   SELECT_DELTA_SEQ,
   SELECT_TOOL_CALL,
   SELECT_TRANSCRIPT_MESSAGES,
@@ -47,6 +51,7 @@ import {
   SELECT_TURN_IN_SESSION,
   SELECT_UNFINISHED_TURNS,
   UPDATE_PART_STATUS,
+  UPDATE_SESSION_WORKSPACE,
   UPDATE_TURN_HEARTBEAT,
   UPDATE_TURN_OUTCOME,
   UPSERT_PART,
@@ -82,6 +87,7 @@ import type {
   TurnOutcomeEntry,
   TurnStatus,
   UnfinishedTurn,
+  Workspace,
 } from "./types.ts";
 
 function nowIso(): string {
@@ -97,6 +103,15 @@ interface PartDeltaRow {
   createdAt: string;
 }
 
+/**
+ * The tables {@link MemoryDatabase.counts} reports on.
+ *
+ * **`workspaces` is deliberately absent.** It is stored, and the project operations
+ * read and write it, but a count of projects is not what any cascade test asks
+ * about — and `memory-coverage.test.ts` pins this key set with `toEqual` and
+ * `Object.keys`, so adding a key here would be a change to a test's expectations
+ * for no measured gain. The store carries the map; the counter does not count it.
+ */
 type Table = "sessions" | "turns" | "messages" | "parts" | "partDeltas" | "toolInvocations";
 
 interface MemoryStore {
@@ -106,6 +121,13 @@ interface MemoryStore {
   parts: Map<string, Part>;
   partDeltas: Map<string, PartDeltaRow>;
   toolInvocations: Map<string, ToolInvocation>;
+  /**
+   * Projects. Added with the project level and **not** before: until
+   * `INSERT_WORKSPACE` existed the table was declared in the schema and never
+   * written, and mirroring a table nothing writes is a second thing to keep in step
+   * for no measurable gain.
+   */
+  workspaces: Map<string, Workspace>;
 }
 
 /** What one statement produced: rows plus the `sqlite3_changes()` value. */
@@ -282,6 +304,7 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     parts: new Map(),
     partDeltas: new Map(),
     toolInvocations: new Map(),
+    workspaces: new Map(),
   };
   /** Every statement `execute()` was asked to run — see {@link MemoryDatabase.statements}. */
   const log: string[] = [];
@@ -321,6 +344,21 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     }
   };
 
+  /**
+   * Mirrors `sessions.workspace_id`'s foreign key, added by migration 5.
+   *
+   * Same argument as {@link requireTurn}: SQLite refuses a session that names a
+   * project that is not there, so this backend must refuse it too. A backend that
+   * accepted it would let a test pass against a row the real database rejects — which
+   * is the failure `Plan.md` §16.1 names as the thing that must not happen.
+   */
+  const requireWorkspace = (id: string): string => {
+    if (!store.workspaces.has(id)) {
+      throw new StorageError("sql_error", `FOREIGN KEY constraint failed: workspaces.id = ${id}`);
+    }
+    return id;
+  };
+
   /** Mirrors `ON DELETE CASCADE` from the schema, for the tables it holds. */
   const cascadeDelete = (sessionId: string): void => {
     store.sessions.delete(sessionId);
@@ -342,7 +380,7 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
   };
 
   const insertSession = (params: readonly SqlParam[]): ExecutionResult => {
-    const [id, title, status, model, systemPrompt, metadata, createdAt, updatedAt, archivedAt] =
+    const [id, title, status, model, systemPrompt, metadata, createdAt, updatedAt, archivedAt, workspaceId] =
       params;
     if (typeof id !== "string") throw new StorageError("sql_error", "sessions.id must be a string.");
     if (store.sessions.has(id)) {
@@ -379,9 +417,66 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
       createdAt: typeof createdAt === "string" ? createdAt : nowIso(),
       updatedAt: typeof updatedAt === "string" ? updatedAt : nowIso(),
       archivedAt: status === "archived" ? archivedTimestamp : null,
+      // `requireWorkspace` first: SQLite enforces this foreign key with
+      // `PRAGMA foreign_keys=ON`, and a session that names a project that is not
+      // there is a row the two backends would disagree about — the exact defect
+      // `requireTurn` exists for.
+      workspaceId: typeof workspaceId === "string" ? requireWorkspace(workspaceId) : null,
     };
     store.sessions.set(id, session);
     return { rows: [session], changes: 1 };
+  };
+
+  /**
+   * Mirrors `workspaces.kind`'s `CHECK`, and `INSERT_WORKSPACE`'s upsert.
+   *
+   * **The upsert is the part that matters.** A second open of the same folder is a
+   * normal state — it is what every second boot of a project is — and this backend
+   * must return the existing row rather than raise, or `backend-parity` would go red
+   * on the one path a user takes daily. `created_at` is preserved on a repeat call,
+   * which is what `INSERT_WORKSPACE`'s `SET` list does by omitting it.
+   */
+  const upsertWorkspace = (params: readonly SqlParam[]): ExecutionResult => {
+    const [id, name, kind, rootHandleId, metadata, createdAt, lastOpenedAt] = params;
+    if (typeof id !== "string") throw new StorageError("sql_error", "workspaces.id must be a string.");
+    if (kind !== "opfs" && kind !== "directory") {
+      throw new StorageError(
+        "sql_error",
+        `CHECK constraint failed: workspaces.kind = ${JSON.stringify(kind)} ` +
+          "is not in ('opfs', 'directory')",
+      );
+    }
+    if (typeof name !== "string") throw new StorageError("sql_error", "workspaces.name must be a string.");
+    const existing = store.workspaces.get(id);
+    const row: Workspace = {
+      id,
+      name,
+      kind,
+      rootHandleId: typeof rootHandleId === "string" ? rootHandleId : null,
+      metadata: typeof metadata === "string" ? metadata : null,
+      // The first write's timestamp survives a re-open, exactly as the SQL's `SET`
+      // list implies by not naming the column.
+      createdAt: existing?.createdAt ?? (typeof createdAt === "string" ? createdAt : nowIso()),
+      lastOpenedAt: typeof lastOpenedAt === "string" ? lastOpenedAt : nowIso(),
+    };
+    store.workspaces.set(id, row);
+    return { rows: [row], changes: 1 };
+  };
+
+  /** Mirrors `UPDATE sessions SET workspace_id = ? WHERE id = ? RETURNING`. */
+  const updateSessionWorkspace = (params: readonly SqlParam[]): ExecutionResult => {
+    const [workspaceId, sessionId] = params;
+    const session = typeof sessionId === "string" ? store.sessions.get(sessionId) : undefined;
+    // A zero-row update is how SQLite reports "no such row", and the operations
+    // layer turns it into a refusal. Returning empty here is what makes the two
+    // backends answer the same way for a session id that does not exist.
+    if (session === undefined) return { rows: [], changes: 0 };
+    const attached: Session = {
+      ...session,
+      workspaceId: typeof workspaceId === "string" ? requireWorkspace(workspaceId) : null,
+    };
+    store.sessions.set(session.id, attached);
+    return { rows: [attached], changes: 1 };
   };
 
   /**
@@ -1010,6 +1105,8 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     log.push(statement);
 
     if (statement === canonical(INSERT_SESSION)) return insertSession(params);
+    if (statement === canonical(INSERT_WORKSPACE)) return upsertWorkspace(params);
+    if (statement === canonical(UPDATE_SESSION_WORKSPACE)) return updateSessionWorkspace(params);
     if (statement === canonical(INSERT_MESSAGE)) return insertMessage(params);
     if (statement === canonical(INSERT_PART)) return insertPart(true, params);
     if (statement === canonical(UPSERT_PART)) return insertPart(false, params);
@@ -1033,6 +1130,40 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
       const rows = [...store.sessions.values()].sort(
         (a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.createdAt.localeCompare(a.createdAt),
       );
+      return { rows, changes: 0 };
+    }
+
+    if (statement === canonical(SELECT_SESSIONS_BY_WORKSPACE)) {
+      const workspaceId = params[0];
+      // `=== workspaceId` and not a truthiness or a `??`: a detached session's
+      // `null` must not match a nullish parameter, which is exactly how SQLite's
+      // `WHERE workspace_id = ?` behaves, and how the two backends stay in step.
+      const rows = [...store.sessions.values()]
+        .filter((session) => typeof workspaceId === "string" && session.workspaceId === workspaceId)
+        .sort(
+          (a, b) =>
+            b.updatedAt.localeCompare(a.updatedAt) ||
+            b.createdAt.localeCompare(a.createdAt) ||
+            a.id.localeCompare(b.id),
+        );
+      return { rows, changes: 0 };
+    }
+
+    if (statement === canonical(SELECT_WORKSPACE)) {
+      const id = params[0];
+      const row = typeof id === "string" ? store.workspaces.get(id) : undefined;
+      return { rows: row === undefined ? [] : [row], changes: 0 };
+    }
+
+    if (statement === canonical(SELECT_WORKSPACES)) {
+      const rows = [...store.workspaces.values()].sort((a, b) => {
+        // SQLite sorts NULL **first** ascending, i.e. **last** descending — and a
+        // project that was recorded but never re-opened has `last_opened_at` NULL
+        // only if a caller bound it that way. `""` is the stand-in that reproduces
+        // SQLite's placement, and a bare `localeCompare` on `null` would throw.
+        const byOpened = (b.lastOpenedAt ?? "").localeCompare(a.lastOpenedAt ?? "");
+        return byOpened || b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id);
+      });
       return { rows, changes: 0 };
     }
 
@@ -1141,6 +1272,7 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     parts: new Map(store.parts),
     partDeltas: new Map(store.partDeltas),
     toolInvocations: new Map(store.toolInvocations),
+    workspaces: new Map(store.workspaces),
   });
 
   const restore = (from: MemoryStore): void => {
@@ -1150,6 +1282,7 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
     store.parts = from.parts;
     store.partDeltas = from.partDeltas;
     store.toolInvocations = from.toolInvocations;
+    store.workspaces = from.workspaces;
   };
 
   const engine: StorageEngine = {
@@ -1203,8 +1336,14 @@ export function createMemoryDatabase(filename = "memory://baah"): MemoryDatabase
 
     createSession: (input) => operations.createSession(input),
     getSession: (id) => operations.getSession(id),
-    listSessions: () => operations.listSessions(),
+    listSessions: (input) => operations.listSessions(input),
     deleteSession: (id) => operations.deleteSession(id),
+    attachSessionToWorkspace: (sessionId, workspaceId) =>
+      operations.attachSessionToWorkspace(sessionId, workspaceId),
+
+    createWorkspace: (input) => operations.createWorkspace(input),
+    getWorkspace: (id) => operations.getWorkspace(id),
+    listWorkspaces: () => operations.listWorkspaces(),
 
     appendMessage: (input) => operations.appendMessage(input),
     getMessage: (id) => operations.getMessage(id),

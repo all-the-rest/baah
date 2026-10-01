@@ -39,7 +39,7 @@ import { SettingsPanel } from "./SettingsPanel.tsx";
 import { TodoSidebar } from "./TodoSidebar.tsx";
 import { Transcript } from "./Transcript.tsx";
 import { WorkspaceModeBadge, WorkspacePanel } from "./WorkspacePanel.tsx";
-import type { AppRuntime } from "./lib/runtime.ts";
+import type { AppRuntime, ProjectTarget } from "./lib/runtime.ts";
 import { applyAgentEvent, EMPTY_LIVE_TURN, type LiveTurn } from "./lib/transcript.ts";
 import { bootNotice, turnBanner } from "./lib/turn-view.ts";
 import { isConfigured, type WizardState } from "./lib/onboarding.ts";
@@ -53,7 +53,23 @@ export interface AppShellProps {
   readonly initialScreen?: Screen;
 }
 
-export function AppShell({ app, initialScreen }: AppShellProps) {
+export function AppShell({ app: initialApp, initialScreen }: AppShellProps) {
+  /**
+   * The live app, which a project switch **replaces**.
+   *
+   * `app` arrives as a prop built once by `App.tsx`, and for the whole life of this
+   * component it used to be that one object. It cannot be: opening a different project
+   * has to change which conversation is on screen, and the conversation is bound into
+   * the runtime, the tool set and the store decorator at construction. So the prop is
+   * the *initial* app and the state is the current one.
+   *
+   * A state and not a ref, and that is load-bearing: `useRuntimeState(runtime)` and
+   * `useLiveTurn(runtime)` subscribe by identity, so a replaced runtime has to reach
+   * them through a re-render. A ref would have swapped the object without ever
+   * re-subscribing, and the transcript would have kept showing the old conversation —
+   * the same visible bug, one layer further up.
+   */
+  const [app, setApp] = useState<AppRuntime>(initialApp);
   const { runtime, settings, questions, todos } = app;
   const state = useRuntimeState(runtime);
   const live = useLiveTurn(runtime);
@@ -97,7 +113,44 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
   const pickerAvailable = isDirectoryPickerAvailable();
 
   /**
-   * Pick a folder, and swap the workspace the runtime holds.
+   * Move the whole app to a project, and re-read the transcript that belongs to it.
+   *
+   * **This is what makes the folder switch visible.** `openProjectFolder` used to
+   * call `app.workspace.swap(...)` and stop there: the files changed, the
+   * conversation did not, so opening project B showed project A's history. The
+   * conversation is bound into the runtime, the tools and the store decorator, so it
+   * takes a new `AppRuntime` — see `AppRuntime.switchProject`.
+   *
+   * The transcript is read **after** the swap and only then set, and it is cleared
+   * first. Rendering the previous project's messages for the duration of an `await`
+   * is the same bug one frame later, and a user who watches it happen will have seen
+   * the wrong conversation twice.
+   */
+  const adoptProject = useCallback(
+    async (target: ProjectTarget): Promise<void> => {
+      setLiveError(undefined);
+      setRead(undefined);
+      const result = await app.switchProject(target);
+      if (!mounted.current) return;
+      if (result.kind !== "switched") {
+        setLiveError(result.reason);
+        return;
+      }
+      const next = result.app;
+      setApp(next);
+      // The new app has a new runtime and therefore a new session; reading through
+      // it is what puts the right conversation on screen. A failed read is rendered
+      // as the union's own `failed` variant, so "could not read" and "nothing there"
+      // stay apart.
+      const transcript = await next.runtime.readTranscript();
+      if (!mounted.current) return;
+      setRead(transcript);
+    },
+    [app],
+  );
+
+  /**
+   * Pick a folder, and switch the app to the project it identifies.
    *
    * **This is the user gesture.** `requestPermission` is only legal inside it,
    * which is why the call is not wrapped in a timer, a `useEffect` or an
@@ -105,9 +158,13 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
    * the browser throws `SecurityError` (or, worse, prompts for something the
    * user did not ask for).
    *
-   * The swap happens only on `connected`, so a refused or abandoned pick leaves
-   * the sandbox in place rather than pointing the runtime at a folder the browser
-   * will not let us touch.
+   * The switch happens only on `connected`, so a refused or abandoned pick leaves
+   * the current project in place rather than pointing the app at a folder the
+   * browser will not let us touch.
+   *
+   * `pick()` resolves the project's own id from `.baah/project.json` — two folders
+   * with the same name are two projects, because the name is a label and not an
+   * identity.
    */
   const openProjectFolder = useCallback((): void => {
     setLiveError(undefined);
@@ -115,9 +172,10 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
       .pick()
       .then((next) => {
         if (!mounted.current) return;
-        if (next.kind === "connected") {
-          app.workspace.swap(next.workspace);
-        }
+        if (next.kind !== "connected") return;
+        const identity = app.projectFolder.project();
+        if (identity === undefined) return;
+        void adoptProject({ identity });
       })
       .catch((cause: unknown) => {
         // Class name only, and never the message: a picker failure message can
@@ -129,7 +187,7 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
           );
         }
       });
-  }, [app]);
+  }, [adoptProject, app]);
 
   /**
    * ## The sidebar is one thing with two shapes, not two sidebars
@@ -477,6 +535,13 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
           // read. The wizard keeps its own step, which is the whole point of a
           // wizard — the shell deciding which screen to show must not change while
           // the user is walking through one.
+          //
+          // **And the conversation is switched separately, and only once the wizard
+          // is done.** A wizard that had already shown project B's transcript on its
+          // way to the project-B step would be a leak of the previous project's
+          // history into a screen the user has not finished. `onReleaseFolder` is
+          // therefore followed by an explicit `adoptProject({ identity: undefined })`
+          // from the caller, which is the one place that knows the wizard is finished.
           app.projectFolder.release().catch((cause: unknown) => {
             if (mounted.current) {
               setLiveError(
@@ -492,7 +557,9 @@ export function AppShell({ app, initialScreen }: AppShellProps) {
           try {
             const next = await app.projectFolder.pick();
             if (next.kind === "connected") {
-              app.workspace.swap(next.workspace);
+              const identity = app.projectFolder.project();
+              if (identity === undefined) return false;
+              await adoptProject({ identity });
               return true;
             }
             if (mounted.current) {

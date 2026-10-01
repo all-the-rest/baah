@@ -59,6 +59,53 @@ const IMPLEMENTED: {
     run: (db) => db.deleteSession("s1"),
   },
   {
+    name: "SELECT_SESSIONS_BY_WORKSPACE",
+    statement: sql.SELECT_SESSIONS_BY_WORKSPACE,
+    // The seeded session carries no project, so a project-scoped read would return
+    // nothing and prove nothing. Seeding a project and an attached session is the point
+    // — `? IS NULL` would pass this row for the wrong reason.
+    needsSeed: false,
+    run: async (db) => {
+      await db.createWorkspace({ id: "w1", name: "api", kind: "directory" });
+      await db.createSession({ id: "s-w", title: "t", workspaceId: "w1" });
+      return db.listSessions({ workspaceId: "w1" });
+    },
+  },
+  {
+    name: "UPDATE_SESSION_WORKSPACE",
+    statement: sql.UPDATE_SESSION_WORKSPACE,
+    needsSeed: false,
+    run: async (db) => {
+      await db.createWorkspace({ id: "w1", name: "api", kind: "directory" });
+      await db.createSession({ id: "s-attach", title: "t" });
+      return db.attachSessionToWorkspace("s-attach", "w1");
+    },
+  },
+  {
+    name: "INSERT_WORKSPACE",
+    statement: sql.INSERT_WORKSPACE,
+    needsSeed: false,
+    run: (db) => db.createWorkspace({ id: "w1", name: "api", kind: "directory" }),
+  },
+  {
+    name: "SELECT_WORKSPACE",
+    statement: sql.SELECT_WORKSPACE,
+    needsSeed: false,
+    run: async (db) => {
+      await db.createWorkspace({ id: "w1", name: "api", kind: "directory" });
+      return db.getWorkspace("w1");
+    },
+  },
+  {
+    name: "SELECT_WORKSPACES",
+    statement: sql.SELECT_WORKSPACES,
+    needsSeed: false,
+    run: async (db) => {
+      await db.createWorkspace({ id: "w1", name: "api", kind: "directory" });
+      return db.listWorkspaces();
+    },
+  },
+  {
     name: "INSERT_MESSAGE",
     statement: sql.INSERT_MESSAGE,
     // The message needs a session (a foreign key), but not a message.
@@ -339,6 +386,8 @@ const NOT_A_STATEMENT = new Set([
   "toolCallKeyParams",
   "turnOutcomeMessageParams",
   "turnOutcomeParams",
+  "workspaceParams",
+  "sessionWorkspaceParams",
 ]);
 
 /**
@@ -355,6 +404,7 @@ const NOT_A_STATEMENT_STRING = new Set([
   "TURN_COLUMNS",
   "TOOL_INVOCATION_COLUMNS",
   "TOOL_CALL_KEY_PREDICATE",
+  "WORKSPACE_COLUMNS",
 ]);
 
 function statementExports(): string[] {

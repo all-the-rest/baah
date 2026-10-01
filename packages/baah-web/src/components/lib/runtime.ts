@@ -68,13 +68,22 @@ import {
 } from "@all-the.rest/baah-core";
 import type { StorageDatabase } from "@all-the.rest/baah-storage";
 
-import { newId, resolveSessionId, SESSION_ID_KEY } from "../../lib/ids.ts";
+import {
+  newId,
+  PROJECT_SESSIONS_KEY,
+  resolveProjectSession,
+  SANDBOX_PROJECT_ID,
+  SESSION_ID_KEY,
+  type ProjectSessionStores,
+} from "../../lib/ids.ts";
 import {
   createProjectFolderController,
   createIndexedDbHandleStore,
   type ProjectFolderController,
   type ProjectFolderHandleStore,
+  type ProjectIdentity,
 } from "../../lib/project-folder.ts";
+import type { ResolveProjectIdOptions } from "@all-the.rest/baah-core/workspace/file-system-access";
 import { createSettingsStore, type SettingsStore } from "../../lib/settings-store.ts";
 import { createWebStorageBackend, type KeyValueBackend } from "../../lib/storage.ts";
 import {
@@ -199,6 +208,47 @@ export interface AppRuntimeOptions {
    * folder gets the sandbox, always.**
    */
   readonly restoreFolder?: boolean | undefined;
+  /**
+   * Where the project→session pointers live, and where the pre-project single
+   * pointer still is.
+   *
+   * Injected for the same reason as {@link AppRuntimeOptions.sessionStorage} — a test
+   * needs a `KeyValueBackend` it can inspect, and the interesting property here is
+   * **two projects keeping two pointers**, which is unobservable without one.
+   */
+  readonly projectSessions?: ProjectSessionStores | undefined;
+  /** How `.baah/project.json` is read and written. See `lib/project-folder.ts`. */
+  readonly projectId?: ResolveProjectIdOptions | undefined;
+  /** The title a fresh conversation gets. Defaults to the constant `"Sitzung"`. */
+  readonly sessionTitle?: string | undefined;
+  /**
+   * Which project this is — **asserted by the caller, not detected**.
+   *
+   * Exists for {@link AppRuntime.switchProject}, which knows the project and must not
+   * re-derive it: the folder controller it would have to ask belongs to the *old* app,
+   * and asking it would race the click that caused the switch. Naming the project is
+   * also what makes the whole thing testable — a browser-free test can say "this is
+   * project X" without a `FileSystemDirectoryHandle` anywhere.
+   *
+   * Omit it and the project is detected: the stored folder's identity, or the sandbox.
+   */
+  readonly project?: ProjectClaim | undefined;
+}
+
+/**
+ * "This is project X", with what is known about it.
+ *
+ * Deliberately **not** `ProjectIdentity`: that one carries a `workspace`, and a caller
+ * asserting a project may be switching *to* it and has already passed the workspace
+ * separately. Two types for one concept would be two things to keep in step.
+ */
+export interface ProjectClaim {
+  readonly projectId: string;
+  readonly name: string;
+  readonly kind: "directory" | "opfs";
+  /** Defaults to `true`. `false` means "not persisted; this will not be here tomorrow". */
+  readonly stable?: boolean | undefined;
+  readonly problem?: string | undefined;
 }
 
 export interface AppRuntime {
@@ -267,7 +317,77 @@ export interface AppRuntime {
   /** `false` when a tool package failed to load. Said, not swallowed. */
   readonly toolsComplete: boolean;
   readonly missingTools: readonly string[];
+  /**
+   * The project this runtime is currently bound to.
+   *
+   * A value, not a getter, and that is the difference this block exists to close:
+   * before it, the folder could change while `sessionId` did not, so the app wrote
+   * project B's conversation into project A's session. {@link AppRuntime.switchProject}
+   * is the only thing that may change either, and it returns a **new** `AppRuntime`
+   * rather than mutating this one.
+   */
+  readonly project: ProjectBinding;
+  /**
+   * Move to another project: a new conversation, and a runtime bound to it.
+   *
+   * ## Why it returns a new object instead of mutating
+   *
+   * `createRuntime` captures `sessionId` in its closure, and the seam objects built
+   * for it — the tool set (`loadAppTools` binds the `todo` tool to a `sessionId`) and
+   * the `withTranscriptRows` decorator — are session-scoped too. So switching projects
+   * means rebuilding **those**, and rebuilding them in place would leave a React tree
+   * subscribed to an object whose identity no longer matches its contents.
+   *
+   * The one thing that is **not** rebuilt is the database. `opfs-sahpool` allows
+   * exactly one connection per origin (`client.ts`), and a second `openDatabase()`
+   * would refuse with `database_owned_by_another_context` — so this reuses the open
+   * handle rather than opening one. That is also why the previous design's
+   * "rebuild the whole runtime on pick" alternative was not available
+   * (`lib/swappable-workspace.ts`'s header).
+   *
+   * ## What it refuses
+   *
+   * A turn in flight. Abandoning one would leave `turns.status = 'streaming'` with a
+   * heartbeat nobody renews, and the next boot of that project would report an
+   * interrupted turn the user never interrupted. The refusal is returned, not thrown,
+   * because the caller is a click handler that has to render it.
+   */
+  switchProject(next: ProjectTarget): Promise<ProjectSwitchResult>;
 }
+
+/** Which project a runtime is bound to, and how sure we are about it. */
+export interface ProjectBinding {
+  /** The stable project id — a `.baah/project.json` id, or {@link SANDBOX_PROJECT_ID}. */
+  readonly projectId: string;
+  /** Display name. The folder's own name, or the sandbox. */
+  readonly name: string;
+  readonly kind: "directory" | "opfs";
+  /** `false` when the id is not persisted and will differ on the next run. */
+  readonly stable: boolean;
+  /**
+   * Why the id is not stable, when it is not — and `undefined` when it is.
+   *
+   * Carried on the binding rather than only in `bootProblems`, because a UI that
+   * renders the current project has to be able to say "this one will not be here
+   * tomorrow" **at the project**, not only once in a boot banner the user has
+   * already scrolled past.
+   */
+  readonly problem: string | undefined;
+  /** The conversation this runtime writes into. */
+  readonly sessionId: string;
+}
+
+/** What {@link AppRuntime.switchProject} was asked to move to. */
+export interface ProjectTarget {
+  /** `undefined` means the browser's own sandbox — the fallback workspace. */
+  readonly identity?: ProjectIdentity | undefined;
+}
+
+/** Why a {@link AppRuntime.switchProject} did or did not happen. */
+export type ProjectSwitchResult =
+  | { readonly kind: "switched"; readonly app: AppRuntime }
+  | { readonly kind: "refused"; readonly reason: string }
+  | { readonly kind: "failed"; readonly reason: string };
 
 /**
  * The real database: SQLite-WASM in a worker, `opfs-sahpool` VFS, OPFS file.
@@ -302,6 +422,164 @@ async function openRealDatabase(storage: StorageModule): Promise<StorageDatabase
 }
 
 /**
+ * The project a boot ended up in, before a conversation is chosen.
+ *
+ * A separate type from {@link ProjectBinding} because that one carries the
+ * `sessionId`, which does not exist yet at this point in the function. Merging them
+ * would mean a `ProjectBinding` with an empty `sessionId` floating around, and an
+ * empty string is a value that later reads as a real one.
+ */
+type ResolvedProject = Omit<ProjectBinding, "sessionId">;
+
+/** The browser's own sandbox, as a project. There is exactly one per origin. */
+function sandboxIdentity(): ResolvedProject {
+  return {
+    projectId: SANDBOX_PROJECT_ID,
+    name: "Sandbox",
+    kind: "opfs",
+    stable: true,
+    problem: undefined,
+  };
+}
+
+/**
+ * Which project a boot is in, in one place and with one precedence.
+ *
+ * `options.project` wins, because a caller that states the project is stating a fact it
+ * already has — and re-deriving it would mean asking a folder controller that belongs
+ * to a *previous* runtime. Otherwise the detected folder, otherwise the sandbox.
+ *
+ * Written as a chain rather than three `if`s so that "the sandbox" is the **default**
+ * and not a branch somebody can forget: a project the app cannot name is the sandbox,
+ * and the sandbox is a real project with a real `workspaces` row, not a special case
+ * that has to be handled everywhere else.
+ */
+function resolveProject(
+  options: AppRuntimeOptions,
+  detected: ProjectIdentity | undefined,
+): ResolvedProject {
+  const claimed = options.project;
+  if (claimed !== undefined) {
+    return {
+      projectId: claimed.projectId,
+      name: claimed.name,
+      kind: claimed.kind,
+      stable: claimed.stable ?? true,
+      problem: claimed.problem,
+    };
+  }
+  if (detected !== undefined) {
+    return {
+      projectId: detected.projectId,
+      name: detected.name,
+      // A detected identity always came from a `FileSystemDirectoryHandle`.
+      kind: "directory",
+      stable: detected.stable,
+      problem: detected.problem,
+    };
+  }
+  return sandboxIdentity();
+}
+
+/**
+ * Re-attach a stored folder and report which project we ended up in.
+ *
+ * **`queryPermission` only, no picker, no `requestPermission`** — see
+ * `lib/project-folder.ts` for why that distinction is the whole feature.
+ *
+ * Every failure is caught and turned into a problem line. `AGENTS.md` §5: no silent
+ * catch — and here it is not tidiness. An IndexedDB that refuses (a private window, a
+ * blocked context, a browser that dropped the entry) would otherwise reject out of
+ * `createAppRuntime` and land the user on the boot-failure screen, which says "the app
+ * could not start" when in fact everything works and only the folder is gone.
+ */
+async function readBootFolder(
+  projectFolder: ProjectFolderController,
+  options: AppRuntimeOptions,
+  workspace: SwappableWorkspace,
+): Promise<{ readonly identity: ProjectIdentity | undefined; readonly problems: readonly string[] }> {
+  if (options.restoreFolder === false || options.workspace !== undefined) {
+    return { identity: undefined, problems: [] };
+  }
+  const problems: string[] = [];
+  try {
+    const restored = await projectFolder.restore();
+    if (restored.kind === "connected") {
+      workspace.swap(restored.workspace);
+    } else if (restored.kind === "needs-gesture") {
+      // **No project identity here, and that is the honest answer.** The folder is
+      // selected but not readable, so `.baah/project.json` cannot be read and the app
+      // must not invent an id — a guessed one would create a *second* project the next
+      // time the grant comes back, and the user's conversation would be split in two.
+      problems.push(
+        `Der Ordner „${restored.label}" ist ausgewählt, aber der Browser hat die Freigabe nach dem ` +
+          "Neuladen zurückgesetzt. Drücke „Ordner verbinden“, um sie erneut zu erteilen — bis dahin " +
+          "läuft die App in der Sandbox.",
+      );
+    }
+    // `denied` and `unsupported` produce no problem line on purpose: the panel already
+    // has a state to render for each, and a second copy of the same sentence in two
+    // places is one more thing to keep in step.
+  } catch (cause) {
+    problems.push(
+      "Der gespeicherte Projektordner konnte nicht wiederhergestellt werden " +
+        `(${cause instanceof Error ? cause.name : "unbekannter Fehler"}). Die App läuft im Sandbox-Workspace.`,
+    );
+  }
+  return { identity: projectFolder.project(), problems };
+}
+
+/**
+ * Record the project, and make sure the conversation exists inside it.
+ *
+ * **Two writes, in this order, and the order is the argument.** The project row comes
+ * first because `sessions.workspace_id` is a foreign key into it — a session naming a
+ * project that is not there is refused by both backends. And `createWorkspace` is an
+ * **upsert** (`INSERT_WORKSPACE`), so calling it on every open is the normal path, not
+ * a mistake to be avoided by reading first.
+ *
+ * The session is created **with no message**, and that is the measurement that made
+ * this a two-line function rather than a design question. `messages.session_id` is
+ * `NOT NULL`, so a project with no conversation would have nowhere to put its first
+ * message — but nothing about binding a message to a session needs machinery: every
+ * write takes its `sessionId` from the engine's own option, never from the message.
+ * Verified on both backends in `test/projects.test.ts`.
+ */
+async function ensureSessionForProject(
+  database: StorageDatabase,
+  input: {
+    readonly sessionId: string;
+    readonly title: string;
+    readonly projectId: string;
+    readonly projectName: string;
+    readonly projectKind: "directory" | "opfs";
+  },
+): Promise<void> {
+  // The upsert, every time. `INSERT_WORKSPACE` carries `ON CONFLICT (id)`, so this
+  // is the normal path for a second and every later open of a project — not a
+  // mistake to be avoided by reading first, which is what `createSession` needs and
+  // this does not.
+  await database.createWorkspace({
+    id: input.projectId,
+    name: input.projectName,
+    kind: input.projectKind,
+  });
+  const existing = await database.getSession(input.sessionId);
+  if (existing !== null) {
+    // The row is there and the pointer is right. Re-binding would touch nothing
+    // useful, and a session attached to a *different* project is left alone: the
+    // pointer map is the authority on which session a project uses, and second-
+    // guessing it here would move a conversation between projects.
+    return;
+  }
+  await database.createSession({
+    id: input.sessionId,
+    title: input.title,
+    workspaceId: input.projectId,
+  });
+}
+
+/**
  * Build the app's runtime.
  *
  * `sessionId` is **remembered, not minted per document**, and that is the difference
@@ -318,44 +596,12 @@ export async function createAppRuntime(options: AppRuntimeOptions = {}): Promise
       ? await openRealDatabase(storage)
       : await options.openDatabase(storage);
   const sessionStorage = options.sessionStorage ?? createWebStorageBackend({ key: SESSION_ID_KEY });
-  const session =
-    options.sessionId === undefined
-      ? resolveSessionId(sessionStorage, { mint: () => newId("session") })
-      : { sessionId: options.sessionId, restored: true, degraded: undefined };
-  const sessionId = session.sessionId;
-
-  /**
-   * A session must exist before anything is written to it: `flushDelta` and
-   * `finishTurn` both enforce the foreign key, and a store with no row for this id
-   * refuses the first delta with a `sql_error` that reads like a broken database
-   * rather than a missing one-liner.
-   *
-   * **And it must not be created twice.** `createSession` is a plain
-   * `INSERT … RETURNING` (`packages/baah-storage/src/sql.ts`, `INSERT_SESSION`) —
-   * not an upsert — so a second call for the same id raises a `UNIQUE` violation.
-   * The moment the session id is remembered across reloads, "create it" and "it is
-   * already there" are the same situation on the second load, and an unconditional
-   * create would turn every reload into a boot failure. Read first, write second.
-   */
-  if ((await database.getSession(sessionId)) === null) {
-    await database.createSession({ id: sessionId, title: "Sitzung" });
-  }
-
-  // The decorator, and what is left of it. The engine creates the **turn** row and
-  // the **user's** message row itself (`AgentTurn.#persistPrompt`); nobody creates the
-  // **assistant's**, and `parts.message_id → messages.id` is a real foreign key.
-  // Measured — a plain turn refuses with `FOREIGN KEY constraint failed: messages.id
-  // = …`. See `lib/turn-store.ts` for the whole argument, for what replaced the tool
-  // part buffer that used to live here, and for the memo that keeps the user's row
-  // from being manufactured a second time.
-  const store = withTranscriptRows(storage.createTurnStore(database), {
-    writer: database,
-    sessionId,
-  });
-  const reader = storage.createTranscriptReader(database);
-  const settings = createSettingsStore({
-    backend: options.settingsBackend ?? createWebStorageBackend(),
-  });
+  const projectSessions =
+    options.projectSessions ??
+    ({
+      projects: createWebStorageBackend({ key: PROJECT_SESSIONS_KEY }),
+      legacy: sessionStorage,
+    } satisfies ProjectSessionStores);
 
   /**
    * The workspace, and the folder controller that can replace it.
@@ -385,6 +631,70 @@ export async function createAppRuntime(options: AppRuntimeOptions = {}): Promise
   const workspace = createSwappableWorkspace(fallback);
   const projectFolder = createProjectFolderController({
     store: options.folderStore ?? createIndexedDbHandleStore(),
+    ...(options.projectId === undefined ? {} : { projectId: options.projectId }),
+  });
+
+  /**
+   * Which project are we in? **The folder first, the session second.**
+   *
+   * The order is the fix. `sessionId` used to be resolved at the very top of this
+   * function, before the folder was even looked at, and then never revisited — so
+   * every project on the machine shared one conversation, and picking a second folder
+   * changed the files but not the history. Resolving the project first means the
+   * session is a property of the project rather than of the browser.
+   */
+  const bootFolder = await readBootFolder(projectFolder, options, workspace);
+  const project: ResolvedProject = resolveProject(options, bootFolder.identity);
+
+  const session =
+    options.sessionId === undefined
+      ? resolveProjectSession(projectSessions, project.projectId, { mint: () => newId("session") })
+      : { sessionId: options.sessionId, restored: true, adopted: false, degraded: undefined };
+  const sessionId = session.sessionId;
+
+  /**
+   * A session must exist before anything is written to it: `flushDelta` and
+   * `finishTurn` both enforce the foreign key, and a store with no row for this id
+   * refuses the first delta with a `sql_error` that reads like a broken database
+   * rather than a missing one-liner.
+   *
+   * **And it must not be created twice.** `createSession` is a plain
+   * `INSERT … RETURNING` (`packages/baah-storage/src/sql.ts`, `INSERT_SESSION`) —
+   * not an upsert — so a second call for the same id raises a `UNIQUE` violation.
+   * The moment the session id is remembered across reloads, "create it" and "it is
+   * already there" are the same situation on the second load, and an unconditional
+   * create would turn every reload into a boot failure. Read first, write second.
+   *
+   * **It is created with no message, and that is not a placeholder.** A brand-new
+   * project has no conversation yet, and `messages.session_id` is `NOT NULL` — so
+   * there would be nowhere to write the first message if the session had to be born
+   * from one. The binding to the first message needs no machinery at all: every write
+   * takes its `sessionId` from the engine's own option, never from the message, so the
+   * empty session simply receives it. Measured on both backends before this was
+   * written; see `test/projects.test.ts` → "an empty conversation".
+   */
+  await ensureSessionForProject(database, {
+    sessionId,
+    title: options.sessionTitle ?? "Sitzung",
+    projectId: project.projectId,
+    projectName: project.name,
+    projectKind: project.kind,
+  });
+
+  // The decorator, and what is left of it. The engine creates the **turn** row and
+  // the **user's** message row itself (`AgentTurn.#persistPrompt`); nobody creates the
+  // **assistant's**, and `parts.message_id → messages.id` is a real foreign key.
+  // Measured — a plain turn refuses with `FOREIGN KEY constraint failed: messages.id
+  // = …`. See `lib/turn-store.ts` for the whole argument, for what replaced the tool
+  // part buffer that used to live here, and for the memo that keeps the user's row
+  // from being manufactured a second time.
+  const store = withTranscriptRows(storage.createTurnStore(database), {
+    writer: database,
+    sessionId,
+  });
+  const reader = storage.createTranscriptReader(database);
+  const settings = createSettingsStore({
+    backend: options.settingsBackend ?? createWebStorageBackend(),
   });
 
   const questions = createQuestionChannelState();
@@ -421,46 +731,37 @@ export async function createAppRuntime(options: AppRuntimeOptions = {}): Promise
    * Everything the user has to be told out loud, assembled **before** the folder
    * is looked at — because looking can produce one more.
    */
-  const bootProblems: string[] = session.degraded === undefined ? [] : [session.degraded];
+  const bootProblems: string[] = [];
+  if (session.degraded !== undefined) bootProblems.push(session.degraded);
+  bootProblems.push(...bootFolder.problems);
+  if (project.problem !== undefined) bootProblems.push(project.problem);
 
   /**
-   * Re-attach a folder the user picked in an earlier session.
+   * The options a project switch carries over.
    *
-   * `queryPermission` only, no picker, no `requestPermission` — see
-   * `lib/project-folder.ts` for why that distinction is the whole feature. A
-   * granted handle **is** swapped in here, which is what makes the folder survive
-   * a reload; everything else leaves the sandbox in place and is reported.
+   * **Only the ones that describe the *browser*, not the project.** The session,
+   * the workspace, the tools and the folder store are all per-project or per-session
+   * and are re-derived by the callee — carrying them would be carrying the bug.
    *
-   * Every failure is caught and turned into a boot problem. `AGENTS.md` §5: no
-   * silent catch — and here it is not tidiness. An IndexedDB that refuses (a
-   * private window, a blocked third-party context, a browser that dropped the
-   * entry) would otherwise reject out of `createAppRuntime` and land the user on
-   * the boot-failure screen, which says "the app could not start" when in fact
-   * everything works and only the folder is gone.
+   * Conditional spreads rather than `x: options.x`, because
+   * `exactOptionalPropertyTypes` makes an explicit `undefined` a different type from
+   * an omitted key, and a spread of `{ tools: undefined }` is the former. The
+   * alternative — dropping `exactOptionalPropertyTypes` for this file — would be a
+   * much larger change than the three spreads it replaces.
    */
-  if (options.restoreFolder !== false && options.workspace === undefined) {
-    try {
-      const restored = await projectFolder.restore();
-      if (restored.kind === "connected") {
-        workspace.swap(restored.workspace);
-      } else if (restored.kind === "needs-gesture") {
-        bootProblems.push(
-          `Der Ordner „${restored.label}" ist ausgewählt, aber der Browser hat die Freigabe nach dem ` +
-            "Neuladen zurückgesetzt. Drücke „Ordner verbinden“, um sie erneut zu erteilen.",
-        );
-      }
-      // `denied` and `unsupported` produce no problem line on purpose: the panel
-      // already has a state to render for each, and a second copy of the same
-      // sentence in two places is one more thing to keep in step.
-    } catch (cause) {
-      bootProblems.push(
-        "Der gespeicherte Projektordner konnte nicht wiederhergestellt werden " +
-          `(${cause instanceof Error ? cause.name : "unbekannter Fehler"}). Die App läuft im Sandbox-Workspace.`,
-      );
-    }
-  }
+  const carriedOptions: AppRuntimeOptions = {
+    storage,
+    projectSessions,
+    sessionStorage,
+    ...(options.settingsBackend === undefined ? {} : { settingsBackend: options.settingsBackend }),
+    ...(options.registry === undefined ? {} : { registry: options.registry }),
+    ...(options.tools === undefined ? {} : { tools: options.tools }),
+    ...(options.folderStore === undefined ? {} : { folderStore: options.folderStore }),
+    ...(options.projectId === undefined ? {} : { projectId: options.projectId }),
+    ...(options.sessionTitle === undefined ? {} : { sessionTitle: options.sessionTitle }),
+  };
 
-  return {
+  const app: AppRuntime = {
     runtime,
     settings,
     questions,
@@ -500,7 +801,84 @@ export async function createAppRuntime(options: AppRuntimeOptions = {}): Promise
     // (`TurnStore.upsertPart`, awaited, on the seam) and the write names the message
     // the part belongs to, so there is no buffer, no second copy of the row, and no
     // rule about `output-available` versus `output-error` in this package at all.
+    project: { ...project, sessionId },
+
+    /**
+     * Move to another project. A **new** `AppRuntime`, sharing this one's database.
+     *
+     * ## Why the seam objects are rebuilt rather than repointed
+     *
+     * Three things in here are bound to a `sessionId` at construction: the engine
+     * (`createRuntime` captured one in its closure), the `todo` tool
+     * (`loadAppTools` passes it to `createTodoTool`), and the `withTranscriptRows`
+     * decorator. Reusing any of them would keep writing into the **old**
+     * conversation — which is precisely the bug being fixed, one layer down, and it
+     * would look like a fix that did not work rather than like a broken seam.
+     *
+     * ## Why the database is *not* reopened
+     *
+     * `opfs-sahpool` allows exactly one connection per origin, so a second
+     * `openDatabase()` throws `database_owned_by_another_context`
+     * (`client.ts`). `createAppRuntime` is therefore re-entered with `openDatabase`
+     * handing back the handle this app already has. That is the only way two projects
+     * can share one database, and it is why "just swap the workspace" could never have
+     * been enough: the workspace is not what carries the conversation.
+     *
+     * ## Why the folder controller is not carried over
+     *
+     * The new runtime gets `restoreFolder: false` and a **fresh** controller, and the
+     * caller keeps the old one. Two controllers over one IndexedDB record would be
+     * two sources for the same fact, and the new one would re-read the handle the
+     * click that caused the switch has just replaced. The caller (`AppShell`) owns
+     * the controller and is the one that knows what the user actually picked.
+     */
+    async switchProject(next: ProjectTarget): Promise<ProjectSwitchResult> {
+      if (runtime.getState().status !== "idle") {
+        return {
+          kind: "refused",
+          reason:
+            "Während eines laufenden Turns kann nicht das Projekt gewechselt werden — der Turn würde " +
+            "mitten im Schreiben abgerissen. Stoppe ihn zuerst.",
+        };
+      }
+      const target = next.identity;
+      if (target !== undefined && target.projectId === project.projectId) {
+        // A repeated click on the same folder is not an error: the caller is handed
+        // the app it already had, so nothing is rebuilt underneath React.
+        return { kind: "switched", app };
+      }
+      try {
+        const switched = await createAppRuntime({
+          ...carriedOptions,
+          openDatabase: () => Promise.resolve(database),
+          workspace: target?.workspace ?? createMemoryWorkspace(defaultSandboxFiles()),
+          restoreFolder: false,
+          // The project is **named**, not re-detected: the controller that could detect
+          // it belongs to the app being replaced, and asking it would race this very
+          // click. `undefined` is the sandbox, which is a project with a real row.
+          project:
+            target === undefined
+              ? { projectId: SANDBOX_PROJECT_ID, name: "Sandbox", kind: "opfs" }
+              : {
+                  projectId: target.projectId,
+                  name: target.name,
+                  kind: "directory",
+                  stable: target.stable,
+                  problem: target.problem,
+                },
+        });
+        return { kind: "switched", app: switched };
+      } catch (cause: unknown) {
+        return {
+          kind: "failed",
+          reason:
+            "Das Projekt konnte nicht gewechselt werden: " +
+            `${cause instanceof Error ? cause.name : "unbekannter Fehler"}.`,
+        };
+      }
+    },
   };
+  return app;
 }
 
 /**

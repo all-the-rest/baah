@@ -30,6 +30,7 @@ import {
   INSERT_TOOL_INVOCATION_BEGUN,
   INSERT_TURN,
   INSERT_TURN_OUTCOME_MESSAGE,
+  INSERT_WORKSPACE,
   SEARCH_SQL_ALL_SESSIONS,
   SEARCH_SQL_BY_SESSION,
   SELECT_DELTA_SEQ,
@@ -38,6 +39,7 @@ import {
   SELECT_PARTS,
   SELECT_SESSION,
   SELECT_SESSIONS,
+  SELECT_SESSIONS_BY_WORKSPACE,
   SELECT_TOOL_CALL,
   SELECT_TRANSCRIPT_MESSAGES,
   SELECT_TRANSCRIPT_MESSAGES_FOR_TURN,
@@ -45,7 +47,10 @@ import {
   SELECT_TRANSCRIPT_PARTS_FOR_TURN,
   SELECT_TURN_IN_SESSION,
   SELECT_UNFINISHED_TURNS,
+  SELECT_WORKSPACE,
+  SELECT_WORKSPACES,
   UPDATE_PART_STATUS,
+  UPDATE_SESSION_WORKSPACE,
   UPDATE_TURN_HEARTBEAT,
   UPDATE_TURN_OUTCOME,
   UPSERT_PART,
@@ -53,10 +58,12 @@ import {
   messageParams,
   partParams,
   sessionParams,
+  sessionWorkspaceParams,
   toolCallKeyParams,
   turnOutcomeMessageParams,
   turnOutcomeParams,
   turnParams,
+  workspaceParams,
 } from "./sql.ts";
 import {
   messageRowSchema,
@@ -67,6 +74,7 @@ import {
   toolCallRowSchema,
   turnRowSchema,
   unfinishedTurnRowSchema,
+  workspaceRowSchema,
 } from "./protocol.ts";
 import type {
   BeginToolCallInput,
@@ -95,6 +103,9 @@ import type {
   TurnInput,
   TurnOutcomeEntry,
   UnfinishedTurn,
+  Workspace,
+  WorkspaceInput,
+  WorkspaceKind,
 } from "./types.ts";
 
 /** Outcome of one statement inside a transaction. */
@@ -215,6 +226,26 @@ export function requireSessionStatus(status: SessionInput["status"]): SessionSta
 }
 
 /**
+ * `workspaces.kind` is the same shape of rule as `sessions.status`, and it is
+ * enforced here for the same measured reason: SQLite reports the `CHECK` violation
+ * as `sql_error`, so the in-memory backend has to report exactly that rather than
+ * write a kind the caller did not ask for.
+ *
+ * An unknown kind is an error and never a coercion — "coerce to `opfs`" would turn a
+ * project folder into a claim that its data lives in the browser sandbox, which is
+ * the one thing a user must never be told falsely.
+ */
+export function requireWorkspaceKind(kind: WorkspaceInput["kind"]): WorkspaceKind {
+  if (kind === "opfs" || kind === "directory") return kind;
+  throw new StorageError(
+    "sql_error",
+    `CHECK constraint failed: workspaces.kind = ${JSON.stringify(kind)} ` +
+      "is not in ('opfs', 'directory')",
+    { kind: String(kind) },
+  );
+}
+
+/**
  * How much of a recorded tool output the `result_preview` column keeps.
  *
  * The preview exists for a UI row; `output` holds the exact value and is what a
@@ -319,8 +350,12 @@ async function many<S extends z.ZodType>(
 export interface StorageOperations {
   createSession(input: SessionInput): Promise<Session>;
   getSession(id: string): Promise<Session | null>;
-  listSessions(): Promise<Session[]>;
+  listSessions(input?: { readonly workspaceId?: string | undefined }): Promise<Session[]>;
   deleteSession(id: string): Promise<void>;
+  attachSessionToWorkspace(sessionId: string, workspaceId: string | null): Promise<void>;
+  createWorkspace(input: WorkspaceInput): Promise<Workspace>;
+  getWorkspace(id: string): Promise<Workspace | null>;
+  listWorkspaces(): Promise<Workspace[]>;
   appendMessage(input: MessageInput): Promise<Message>;
   getMessage(id: string): Promise<Message | null>;
   listMessages(sessionId: string): Promise<Message[]>;
@@ -367,14 +402,59 @@ export function createStorageOperations(engine: StorageEngine): StorageOperation
       return narrow(sessionRowSchema, row, "getSession");
     },
 
-    async listSessions() {
-      return many(engine, SELECT_SESSIONS, [], sessionRowSchema, "listSessions");
+    async listSessions(input = {}) {
+      // Two statements rather than one with `? IS NULL`, because the project-scoped
+      // read is the one with the index and it must be free to use it as written.
+      return input.workspaceId === undefined
+        ? many(engine, SELECT_SESSIONS, [], sessionRowSchema, "listSessions")
+        : many(
+            engine,
+            SELECT_SESSIONS_BY_WORKSPACE,
+            [input.workspaceId],
+            sessionRowSchema,
+            "listSessions[workspaceId]",
+          );
     },
 
     async deleteSession(id) {
       // Relies on `PRAGMA foreign_keys=ON`; the in-memory engine replicates the
       // same cascades explicitly (see factory.ts).
       await engine.run(DELETE_SESSION, [id]);
+    },
+
+    async attachSessionToWorkspace(sessionId, workspaceId) {
+      // `single`, not `run`: a zero-row `UPDATE … RETURNING` means the caller's
+      // session id does not exist, and that is a fact the caller must be able to see
+      // rather than a silent success. `getSession` first would be the read-then-write
+      // this file avoids everywhere else.
+      await single(
+        engine,
+        UPDATE_SESSION_WORKSPACE,
+        sessionWorkspaceParams(sessionId, workspaceId),
+        sessionRowSchema,
+        "attachSessionToWorkspace",
+      );
+    },
+
+    async createWorkspace(input) {
+      const kind = requireWorkspaceKind(input.kind);
+      return single(
+        engine,
+        INSERT_WORKSPACE,
+        workspaceParams({ ...input, kind }, nowIso()),
+        workspaceRowSchema,
+        "createWorkspace",
+      );
+    },
+
+    async getWorkspace(id) {
+      const row = await firstRow(engine, SELECT_WORKSPACE, [id]);
+      if (row === undefined) return null;
+      return narrow(workspaceRowSchema, row, "getWorkspace");
+    },
+
+    async listWorkspaces() {
+      return many(engine, SELECT_WORKSPACES, [], workspaceRowSchema, "listWorkspaces");
     },
 
     async appendMessage(input) {

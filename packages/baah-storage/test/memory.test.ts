@@ -69,6 +69,10 @@ describe("sessions", () => {
       createdAt: created.createdAt,
       updatedAt: created.updatedAt,
       archivedAt: null,
+      // Migration 5's column. `null` and not a made-up project: a session created
+      // without one belongs to no project, and the truthful value is what makes a
+      // project-scoped read honest about that.
+      workspaceId: null,
     });
     expect(await db.getSession("s1")).toEqual(created);
   });

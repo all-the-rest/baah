@@ -215,6 +215,16 @@ export interface Session {
   createdAt: string;
   updatedAt: string;
   archivedAt: string | null;
+  /**
+   * The project this conversation belongs to, or `null`.
+   *
+   * `null` is a real, reachable state and not a placeholder: it is what every
+   * session written before migration 5 carries, and it is what
+   * `ON DELETE SET NULL` leaves behind when a project is removed — the
+   * conversation survives, and a project-scoped query no longer finds it. Both
+   * facts are stated at `STEP_SESSION_WORKSPACE` in `schema.ts`.
+   */
+  workspaceId: string | null;
 }
 
 export interface Turn {
@@ -331,6 +341,26 @@ export interface Workspace {
   lastOpenedAt: string | null;
 }
 
+/**
+ * What the caller knows about a project when it opens one.
+ *
+ * `id` is the **stable project id** and the caller is expected to have read it from
+ * the folder's own `.baah/project.json` rather than derived it from the folder
+ * name. Two folders called `api` are two projects; a name-derived id would make
+ * them one string.
+ */
+export interface WorkspaceInput {
+  id: string;
+  /** The folder's own name — a **display** label, never an identity. */
+  name: string;
+  kind: WorkspaceKind;
+  /** Reference into the sidecar IndexedDB. The handle itself is not storable here. */
+  rootHandleId?: string | null;
+  metadata?: string | null;
+  createdAt?: string;
+  lastOpenedAt?: string | null;
+}
+
 export interface FileHandleRow {
   id: string;
   workspaceId: string;
@@ -355,6 +385,21 @@ export interface Setting {
 export interface SessionInput {
   id: string;
   title?: string;
+  /**
+   * The project to attach this conversation to on insert, or `null` for none.
+   *
+   * **Bound on the INSERT, not written afterwards by the caller.** Two reasons,
+   * and the second is the one that decides it:
+   *
+   * 1. One statement, so there is no window in which the conversation exists
+   *    without a project — and a project-scoped read in that window would not
+   *    find it, which is the failure mode a detached session already has.
+   * 2. A session created at boot may not know its project yet: after a cold
+   *    start the folder's grant has lapsed, so `.baah/project.json` cannot be
+   *    read and the project id is genuinely unknown. That case uses
+   *    {@link StorageOperations.attachSessionToWorkspace} once the id is known.
+   */
+  workspaceId?: string | null;
   /**
    * `Plan.md` §6.1 allows exactly `active` and `archived`; anything else is
    * rejected as a `sql_error` (the CHECK violation SQLite would raise) rather
@@ -673,9 +718,56 @@ export interface StorageDatabase {
 
   createSession(input: SessionInput): Promise<Session>;
   getSession(id: string): Promise<Session | null>;
-  listSessions(): Promise<Session[]>;
+  /**
+   * Every conversation, newest first — or only the ones of **one project**.
+   *
+   * The narrowing is a parameter rather than a second method for the same reason
+   * the transcript read is one method with an optional key: two methods would be
+   * two names for one question, and the second one is always the first one plus a
+   * `WHERE`. With `exactOptionalPropertyTypes` an omitted `workspaceId` and an
+   * explicit `undefined` are different types, so a caller that has a possibly-absent
+   * id spreads it conditionally.
+   *
+   * A session with `workspaceId === null` is **not** in any project's list. That is
+   * the documented cost of `ON DELETE SET NULL` (`STEP_SESSION_WORKSPACE`), not an
+   * oversight here.
+   */
+  listSessions(input?: { readonly workspaceId?: string | undefined }): Promise<Session[]>;
   /** Cascades to turns, messages, parts, deltas, invocations, approvals, todos. */
   deleteSession(id: string): Promise<void>;
+
+  /**
+   * Attach a conversation to a project, or detach it with `null`.
+   *
+   * The counterpart of {@link SessionInput.workspaceId} for the case where the
+   * project id was not known at insert time — a boot where the folder's grant has
+   * lapsed cannot read `.baah/project.json`, so the session is created first and
+   * bound once the user presses the button again.
+   *
+   * Detaching is an explicit `null` and not a delete, because a conversation the
+   * user can no longer reach is a different, destructive fact.
+   */
+  attachSessionToWorkspace(sessionId: string, workspaceId: string | null): Promise<void>;
+
+  /* ---- projects ---------------------------------------------------- */
+
+  /**
+   * Record a project, or refresh the one that is already there.
+   *
+   * **An upsert, not a plain insert** — the one deliberate difference from
+   * {@link createSession}, and the reason is the same one that put
+   * `ON CONFLICT (id)` on `INSERT_MESSAGE`: opening the same folder a second time
+   * is a **normal state**, not a rejection. A plain `INSERT … RETURNING` would turn
+   * the second boot on a project into a `UNIQUE` violation.
+   *
+   * What a second call **does not** change: `createdAt` is the first write's, so
+   * "when did this project appear" stays a fact. `lastOpenedAt` moves, because
+   * "when was it last used" is the question that index exists for.
+   */
+  createWorkspace(input: WorkspaceInput): Promise<Workspace>;
+  getWorkspace(id: string): Promise<Workspace | null>;
+  /** Every project, most recently opened first. */
+  listWorkspaces(): Promise<Workspace[]>;
 
   appendMessage(input: MessageInput): Promise<Message>;
   getMessage(id: string): Promise<Message | null>;
