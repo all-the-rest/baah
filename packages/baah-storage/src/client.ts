@@ -408,6 +408,94 @@ let active: WorkerStorageDatabase | null = null;
  * see the construction site below. `UNVERIFIED` used to stand here, describing a
  * fallback that nothing took and no browser could have run.
  */
+/**
+ * Whether the browser has agreed to keep this origin's storage.
+ *
+ * - `unknown`   nothing asked yet (or the ask is still in flight)
+ * - `granted`   `navigator.storage.persisted()` or `.persist()` says yes: the browser
+ *               will not clear OPFS or Local Storage under storage pressure
+ * - `denied`    asked and refused. **Not an error** — it is the browser's answer, and
+ *               it means best-effort storage, so the app has to behave as if a reload
+ *               can lose data.
+ * - `unavailable`  no StorageManager at all: a test environment, or a browser without
+ *               the Storage API. Not a failure either.
+ */
+export type PersistenceState = "unknown" | "granted" | "denied" | "unavailable";
+
+let persistence: PersistenceState = "unknown";
+
+/** The current answer, for the UI to show. Never throws, never blocks. */
+export function persistenceState(): PersistenceState {
+  return persistence;
+}
+
+/**
+ * Ask the browser to make this origin's storage **persistent**.
+ *
+ * ## Why this is here and why it was missing
+ *
+ * `Plan.md` §1136 grounds `storage.persist()` in two real facts: Safari deletes
+ * script-created data after seven days without interaction, and OPFS is
+ * best-effort by default. Until now that call existed in exactly one place —
+ * `baah-core/src/workspace/opfs.ts` — and **that function is never called by the
+ * app**. So the protection sat on a path nobody walked while the thing it protects,
+ * the session database, asked for nothing.
+ *
+ * ## Why it is not the critical path
+ *
+ * It is asked **after** `database.open()` resolved, so a slow or prompting
+ * `persist()` cannot delay a usable database. A prompt during app start would be
+ * the wrong moment to show one; this way the app is already running when it appears.
+ *
+ * ## Why the answer is recorded rather than thrown
+ *
+ * `denied` is a legitimate answer, not a failure. A caller that treats it as an
+ * exception will either crash a perfectly working app or, worse, wrap the ask in a
+ * `catch` and lose the state — which is precisely how the protection went missing
+ * in the first place. `AGENTS.md` §5 wants errors the user must see turned into
+ * typed events; this is a **fact about the environment**, surfaced as a value.
+ */
+let persistenceRequest: Promise<PersistenceState> | undefined;
+
+function askForPersistence(): Promise<PersistenceState> {
+  if (persistenceRequest !== undefined) return persistenceRequest;
+
+  persistenceRequest = (async () => {
+    // The property access is INSIDE the try. It was outside in the first version,
+    // and a `navigator` whose `storage` getter throws then took the whole open down
+    // with it - a hostile or partial global should not be able to do that, and the
+    // test that pins it is `survives a navigator that throws on property access`.
+    try {
+      const manager = (globalThis.navigator as Navigator | undefined)?.storage;
+      if (manager === undefined || typeof manager.persisted !== "function") {
+        persistence = "unavailable";
+        return persistence;
+      }
+      if (await manager.persisted()) {
+        persistence = "granted";
+        return persistence;
+      }
+      persistence = (await manager.persist()) ? "granted" : "denied";
+    } catch {
+      // A rejected `persist()` is the browser declining, not a bug in here. Recorded
+      // as `denied` so the UI can tell the user their history is best-effort.
+      persistence = "denied";
+    }
+    return persistence;
+  })();
+
+  return persistenceRequest;
+}
+
+/**
+ * Resolves once the answer is in. **Not** awaited by `openDatabase()` - see the note
+ * there - so this is how a caller waits for the state without having made the state a
+ * precondition for opening the database.
+ */
+export function persistenceSettled(): Promise<PersistenceState> {
+  return persistenceRequest ?? Promise.resolve(persistence);
+}
+
 export async function openDatabase(
   options: OpenDatabaseOptions = {},
 ): Promise<WorkerStorageDatabase> {
@@ -463,6 +551,27 @@ export async function openDatabase(
     throw error;
   }
 
+  // Started after the open and deliberately NOT awaited. The first version awaited it,
+  // and that contradicted its own stated reason: a `persist()` that prompts would then
+  // sit on the path between "database is open" and "caller has the database", which is
+  // the worst moment for a permission dialog. A caller that needs the answer awaits
+  // `persistenceSettled()`.
+  // The handler is not decoration. Every path inside `askForPersistence` is inside a
+  // `try`, so it cannot reject — and that is exactly why `void promise` is the wrong
+  // spelling: a reader cannot see the internal `try` from the call site, and if a
+  // future refactor moved a line out of it, the rejection would be **unhandled and
+  // silent**. The repo's own `no-bare-void` gate caught exactly this, and it was
+  // right: a discarded promise with no handler is an unhandled rejection, not a
+  // no-op.
+  //
+  // The handler records rather than swallows. If the ask ever fails for a reason the
+  // inner `try` does not cover, the honest answer for the UI is that protection is NOT
+  // in place — not `unknown`, which reads as "no answer yet" and would leave a user
+  // being told nothing at all.
+  void askForPersistence().catch(() => {
+    persistence = "denied";
+  });
+
   return database;
 }
 
@@ -472,6 +581,24 @@ export async function closeDatabase(): Promise<void> {
   if (database === null) return;
   active = null;
   await database.close();
+  // The persistence answer is forgotten with the database, and this is a semantic
+  // decision, not a convenience. Cached for the lifetime of the tab, a `denied` from
+  // one session is never re-asked in the next - and persistence is not the only thing
+  // that changes: a user who later installs the PWA, or reaches Chrome's engagement
+  // thresholds, would be told "denied" forever, by a value nobody re-checked.
+  //
+  // The cost is one `persisted()` call per open sequence, which does not prompt.
+  // `persist()` - the call that can - is only reached when `persisted()` says false,
+  // so the prompt-per-cold-start worry is handled at the right place rather than by
+  // caching a value that goes stale. Whether repeated denials produce repeated prompts
+  // is **not** measured here; AGENTS.md §2b says that is a manual gate, and guessing
+  // it would be the same fault as the caching itself.
+  persistenceRequest = undefined;
+  // The **state** too, not just the promise. Resetting only the promise leaves the
+  // previous answer visible - which is the more dangerous half: a caller reads
+  // `denied` from a database that is not even the one that was denied, and the UI
+  // tells a user their history is best-effort on the strength of a stale value.
+  persistence = "unknown";
 }
 
 /**
