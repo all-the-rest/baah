@@ -21,6 +21,15 @@ import type { RuntimeState } from "../../runtime/index.ts";
 
 const stringer = (value: unknown): string => JSON.stringify(value);
 
+/**
+ * The session the fixtures below belong to.
+ *
+ * Every `AgentEvent` names one, so a fixture that omitted it would not typecheck —
+ * which is the property under test elsewhere, and here it is just the price of
+ * writing an event literal at all.
+ */
+const SESSION = "s";
+
 function stallReport(overrides: Partial<StallReport> = {}): StallReport {
   return {
     sessionId: "s",
@@ -57,7 +66,7 @@ function stateWith(overrides: Partial<RuntimeState> = {}): RuntimeState {
 
 describe("turn-stopped is the user's decision, not a timeout", () => {
   it("says so in words, and names who stopped", () => {
-    const view = stopView({ type: "turn-stopped", stage: "attempt" });
+    const view = stopView({ type: "turn-stopped", stage: "attempt", sessionId: SESSION });
     // "Du hast abgebrochen" is the claim. A message that only said "beendet" would
     // leave the user wondering whether the provider died.
     expect(view.message).toContain("Du hast den Turn abgebrochen");
@@ -68,8 +77,8 @@ describe("turn-stopped is the user's decision, not a timeout", () => {
   it("distinguishes the approval-resume leg from the attempt leg", () => {
     // The loop emits `turn-stopped` in two places. A user who cancelled an approval
     // card should not read "you stopped the attempt".
-    const resume = stopView({ type: "turn-stopped", stage: "approval-resume" });
-    const attempt = stopView({ type: "turn-stopped", stage: "attempt" });
+    const resume = stopView({ type: "turn-stopped", stage: "approval-resume", sessionId: SESSION });
+    const attempt = stopView({ type: "turn-stopped", stage: "attempt", sessionId: SESSION });
     expect(resume.stage).toBe("approval-resume");
     expect(resume.message).not.toBe(attempt.message);
     expect(resume.message).toContain("Freigabe-Karte");
@@ -79,7 +88,7 @@ describe("turn-stopped is the user's decision, not a timeout", () => {
     // `Plan.md` §5.4: the provider may still be generating and those tokens are
     // billed either way. A stop button that does not say so invites the belief
     // that pressing it saved something.
-    expect(stopView({ type: "turn-stopped", stage: "attempt" }).message).toContain("abrechnen");
+    expect(stopView({ type: "turn-stopped", stage: "attempt", sessionId: SESSION }).message).toContain("abrechnen");
   });
 
   it("wins over a classification in the banner", () => {
@@ -172,7 +181,7 @@ describe("config-error / missing_api_key points at the key", () => {
 
 describe("a tool call with an unknown outcome is neither success nor failure", () => {
   const view = unknownOutcomeView(
-    { type: "tool-outcome-unknown", toolCallId: "c1", toolName: "write", input: { path: "a.txt" } },
+    { type: "tool-outcome-unknown", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, sessionId: SESSION },
     stringer,
   );
 
@@ -206,12 +215,14 @@ describe("a storage-warning is a warning, not a turn failure", () => {
       type: "storage-warning",
       operation: "heartbeat",
       attempt: 1,
+      sessionId: SESSION,
       message: "database_closed",
     });
     const record = storageWarningView({
       type: "storage-warning",
       operation: "record-tool-call",
       attempt: 1,
+      sessionId: SESSION,
       toolCallId: "c1",
       toolName: "write",
       message: "sql_error",

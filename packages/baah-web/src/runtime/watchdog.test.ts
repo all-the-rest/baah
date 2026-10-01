@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { AgentEvent } from "@all-the.rest/baah-core";
+import type { AgentEvent, AgentEventBody } from "@all-the.rest/baah-core";
 
 import { StallWatchdog, type StallReport } from "./watchdog.ts";
 
@@ -77,8 +77,20 @@ function setup(options: { readonly timeoutMs?: number } = {}): {
   return { watchdog, clock, reports, feed };
 }
 
-/** The events the loop emits, built with only the fields the watchdog reads. */
+/**
+ * The events the loop emits, built with only the fields the watchdog reads.
+ *
+ * `sessionId` is added by the wrapper below rather than typed into each arm, and
+ * that is not laziness: sixteen literals naming a session is sixteen chances to
+ * name the wrong one, and the watchdog does not read the field — what this file
+ * needs is "an event of this type exists". One place stamps it.
+ */
 function event(type: AgentEvent["type"]): AgentEvent {
+  return { ...body(type), sessionId: "s1" };
+}
+
+/** The event's own content, without the session every event carries. */
+function body(type: AgentEvent["type"]): AgentEventBody {
   switch (type) {
     case "attempt-started":
       return { type, attempt: 1, total: 3, retryAfterMs: 0 };

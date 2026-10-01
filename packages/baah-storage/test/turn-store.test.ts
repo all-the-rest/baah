@@ -1487,19 +1487,37 @@ async function dataOf(part: Part): Promise<Record<string, unknown> | undefined> 
   }
 }
 
-/** The four tool events, as the engine emits them. */
+/**
+ * The four tool events, as the engine emits them.
+ *
+ * Every one carries `sessionId`, because every `AgentEvent` does — and these
+ * fixtures feed `TurnStore.upsertPart`, whose input names the session **twice**
+ * (once as `input.sessionId`, once as `input.event.sessionId`). The adapter
+ * writes the event's, so the fixture's session has to be a session that exists:
+ * `s1` is the one `bothBackends()` creates, and `m1` is its message.
+ *
+ * They are the *same* value here on purpose. The disagreement between the two is
+ * a separate, deliberate case further down — a fixture that already disagreed
+ * would make every other assertion in this file ambiguous, and `parts.session_id`
+ * is `NOT NULL REFERENCES sessions(id)`, so a wrong session would surface as a
+ * foreign-key error rather than as the misfiled row under test.
+ */
+const FIXTURE_SESSION = "s1";
+
 const TOOL_EVENTS = {
   call: {
     type: "tool-call",
     toolCallId: "c1",
     toolName: "read",
     input: { path: "src/app.ts" },
+    sessionId: FIXTURE_SESSION,
   },
   failure: {
     type: "tool-result",
     toolCallId: "c1",
     toolName: "read",
     output: { ok: false, error: "ENOENT: no such file or directory" },
+    sessionId: FIXTURE_SESSION,
   },
   unknown: {
     type: "tool-result",
@@ -1512,12 +1530,14 @@ const TOOL_EVENTS = {
       toolName: "write",
       error: "This call began but never reported a result.",
     },
+    sessionId: FIXTURE_SESSION,
   },
   denied: {
     type: "tool-output-denied",
     toolCallId: "c1",
     toolName: "write",
     reason: undefined,
+    sessionId: FIXTURE_SESSION,
   },
 } as const satisfies Record<string, ToolPartEvent>;
 
@@ -1707,34 +1727,46 @@ describe("upsertPart writes the row the app's reader reads", () => {
 
   it("a message of ANOTHER session is not refused — measured, and named", async () => {
     /**
-     * **A finding, pinned rather than asserted away.**
+     * **A finding about the schema, and it is still true — but the seam no longer
+     * walks into it.**
      *
      * `parts` carries two *independent* foreign keys (`schema.ts`):
      * `message_id REFERENCES messages(id)` and
      * `session_id REFERENCES sessions(id)`. Nothing ties them to each other, so a
      * write naming a message of `s1` and a session of `s2` satisfies both and
-     * lands. Measured on both backends below, and the memory engine behaves the
+     * lands. Measured below on both backends, and the memory engine behaves the
      * same way — so this is the schema's shape, not a divergence.
      *
-     * The engine cannot reach it: `upsertPart`'s `sessionId` and `messageId` come
-     * from the same closure (`AgentTurnOptions.sessionId` and the attempt's
-     * minted `messageId`) that wrote both rows, so there is no call site that
-     * could pair them wrongly. It is recorded because the *obvious* test here —
-     * "a cross-session part is refused" — is **false**, and the next reader would
-     * otherwise write it, find it green on a fake, and ship a claim the database
-     * does not enforce.
+     * **What changed is who can reach it.** This test used to drive it through
+     * `upsertPart`, and the row landed under the argument's session. The adapter
+     * now writes the *event's* session (`turn-store.ts`, `upsertPart`), and the
+     * event is stamped at the engine's one emit sink from the same
+     * `AgentLoopOptions.sessionId` closure that minted the message id — so
+     * passing a foreign `input.sessionId` no longer moves anything. The case is
+     * therefore driven here through `database.upsertPart`, the write underneath,
+     * which is the honest place to show that the *database* has no such
+     * constraint.
      *
-     * Closing it properly means a constraint the schema does not have — a
-     * composite `messages (id, session_id)` reference, which is a migration and
-     * therefore a rebuild (`§16.1`'s "Parkplatz-Tabelle" trap). Not done here,
-     * named instead.
+     * It is kept rather than deleted because the obvious next test — "a
+     * cross-session part is refused" — is **still false**, and a reader who writes
+     * it will find it green on a fake and ship a claim the database does not
+     * enforce. Closing it properly needs a composite `messages (id, session_id)`
+     * reference, which is a migration and therefore a rebuild (`§16.1`'s
+     * "Parkplatz-Tabelle" trap). Not done here, named instead.
      */
     const results = await onBoth(async (backend) => {
       const outcome = await settled(
-        storeOn(backend).upsertPart({
-          sessionId: "s2",
+        backend.db.upsertPart({
+          id: "part-c1",
           messageId: "m1",
-          event: TOOL_EVENTS.call,
+          // `m1` belongs to `s1`; `s2` is a different, real session.
+          sessionId: "s2",
+          type: "tool",
+          contentText: "read src/app.ts",
+          data: "{}",
+          status: "completed",
+          createdAt: T1,
+          updatedAt: T1,
         }),
       );
       const parts = await backend.db.listParts("m1");
@@ -1752,6 +1784,36 @@ describe("upsertPart writes the row the app's reader reads", () => {
       expect(results[backend].resolved, backend).toBe(true);
       expect(results[backend].rows, backend).toBe(1);
       expect(results[backend].sessionIds, backend).toEqual(["s2"]);
+    }
+  });
+
+  it("…but the store itself can no longer be walked into it", async () => {
+    /**
+     * The half that changed, and the reason the test above was re-pointed rather
+     * than removed.
+     *
+     * Same disagreement as the finding — the argument says `s2`, the message
+     * belongs to `s1` — but driven the way the engine drives it. The row lands
+     * under `s1`, because the adapter writes the event's session and the event is
+     * the engine's own. So the schema's missing constraint is still missing, and
+     * the seam in front of it no longer depends on it.
+     */
+    const results = await onBoth(async (backend) => {
+      await storeOn(backend).upsertPart({
+        sessionId: "s2",
+        messageId: "m1",
+        event: TOOL_EVENTS.call,
+      });
+      const parts = await backend.db.listParts("m1");
+      return {
+        rows: parts.filter((row) => row.id === "part-c1").length,
+        sessionIds: parts.filter((row) => row.id === "part-c1").map((row) => row.sessionId),
+      };
+    });
+
+    for (const backend of ["memory", "sql"] as const) {
+      expect(results[backend].rows, backend).toBe(1);
+      expect(results[backend].sessionIds, backend).toEqual(["s1"]);
     }
   });
 
@@ -2711,5 +2773,108 @@ describe("the two backends answer identically", () => {
     // The guard: the session is part of the write's key, not a lookup that
     // happens afterwards.
     expect(one(INSERT_TURN_OUTCOME_MESSAGE)).toContain("WHERE t.id = ? AND t.session_id = ?");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 7 — the store follows the event, not the instruction                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `TurnStore.upsertPart` is the **only** seam where an event value becomes a store
+ * write, and therefore the only place where "which session does this belong to?"
+ * can be answered from two sources that are allowed to disagree.
+ *
+ * ## The shape of the divergence
+ *
+ * The engine emits every tool event twice over to the adapter today: once as
+ * `input.event` (stamped with the session at the engine's single emit sink) and
+ * once as `input.sessionId` (the seam's argument, threaded from the same
+ * `AgentLoopOptions.sessionId`). They are the same string by construction, so
+ * **every other test in this file passes with either one being written** — which
+ * is exactly why the choice has to be pinned rather than left to reading.
+ *
+ * The test builds the disagreement deliberately: the argument names `s1`, the
+ * event names `s2`. Both sessions exist (`bothBackends()` creates them), and the
+ * part's message belongs to `s1` — so the *only* thing that decides where the row
+ * is filed is which of the two strings the adapter writes.
+ *
+ * ## Why the event wins
+ *
+ * `input.sessionId` is an instruction: whoever calls `upsertPart` writes it, and
+ * nothing verifies it. `input.event.sessionId` is what the event **says**, and the
+ * same string went to the subscriber in `runtime/index.ts` — the fold that is
+ * drawing the card right now. A part filed under the instruction's session while
+ * the event names another is a tool card in the wrong conversation, and no later
+ * read would report the disagreement: the row exists, its `message_id` resolves,
+ * and the transcript renders it confidently.
+ *
+ * So the direction is the conservative one for the *reader*: the row lands where
+ * the event said, and the instruction that disagrees is the thing that is wrong.
+ */
+describe("upsertPart files the row under the EVENT's session, not the argument's", () => {
+  it("an argument naming another session does not move the part", async () => {
+    const results = await onBoth(async (backend) => {
+      const store = storeOn(backend);
+      // The disagreement: the instruction says `s1`, the evidence says `s2`.
+      const event: ToolPartEvent = { ...TOOL_EVENTS.call, sessionId: "s2" };
+      await store.upsertPart({ sessionId: "s1", messageId: "m1", event });
+
+      const parts = await backend.db.listParts("m1");
+      const part = parts.find((row) => row.id === "part-c1");
+      return { rows: parts.length, sessionId: part?.sessionId ?? null };
+    });
+
+    expect(results.memory).toEqual({ rows: 1, sessionId: "s2" });
+    expect(results.sql).toEqual(results.memory);
+  });
+
+  it("and the row is invisible to the session the instruction named", async () => {
+    /**
+     * The consequence, measured through the **public read** rather than the
+     * column: the point is not that `session_id` says `s2`, it is that a
+     * transcript read of `s1` — which owns `m1` — does not show the tool part.
+     *
+     * A column assertion would pass against a row that is filed correctly *and*
+     * still somehow listed in both places; `listParts(messageId)` is scoped by
+     * the message, so this is the read an app actually performs, and it is the
+     * read that must not leak across the boundary.
+     */
+    const results = await onBoth(async (backend) => {
+      const store = storeOn(backend);
+      const event: ToolPartEvent = { ...TOOL_EVENTS.call, sessionId: "s2" };
+      await store.upsertPart({ sessionId: "s1", messageId: "m1", event });
+
+      const parts = await backend.db.listParts("m1");
+      const sessions = parts.map((row) => row.sessionId);
+      return {
+        // Every part of `m1` names `s2`, so nothing here is filed under `s1`.
+        distinctSessions: [...new Set(sessions)].toSorted(),
+        hasS1: sessions.includes("s1"),
+        state: (await dataOf(parts.find((row) => row.id === "part-c1") as Part))?.["state"],
+      };
+    });
+
+    expect(results.memory).toEqual({ distinctSessions: ["s2"], hasS1: false, state: "input-available" });
+    expect(results.sql).toEqual(results.memory);
+  });
+
+  it("when the two agree, the behaviour is the plain one — this is not a special case", async () => {
+    /**
+     * The control, and it is what makes the two tests above meaningful: an
+     * adapter that ignored the event entirely and always wrote some hard-coded
+     * session would also pass them, if that session happened to be `s2`. So the
+     * agreeing case is asserted too — same call, `sessionId` on both sides, and
+     * the row lands where both of them say.
+     */
+    const results = await onBoth(async (backend) => {
+      const store = storeOn(backend);
+      await store.upsertPart({ sessionId: "s1", messageId: "m1", event: TOOL_EVENTS.call });
+      const parts = await backend.db.listParts("m1");
+      return { sessionId: parts.find((row) => row.id === "part-c1")?.sessionId ?? null };
+    });
+
+    expect(results.memory).toEqual({ sessionId: "s1" });
+    expect(results.sql).toEqual(results.memory);
   });
 });

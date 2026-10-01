@@ -92,7 +92,7 @@ describe("RuntimeEventBus", () => {
     // A UI switches on `kind`, so a name appearing twice across kinds would make a
     // narrow type check useless.
     const events: RuntimeEvent[] = [
-      { kind: "agent", event: { type: "turn-finished", outcome: "succeeded", attempts: 1 } },
+      { kind: "agent", event: { type: "turn-finished", outcome: "succeeded", attempts: 1, sessionId: "s" } },
       { kind: "boot", report: { sessionId: "s", recovered: [], untouched: [], staleAfterMs: 30_000, checkedAt: "" } },
       { kind: "stall", report: { sessionId: "s", turnId: "t", phase: "idle", timeoutMs: 1, silentForMs: 1, lastEventType: undefined } },
       { kind: "turn-settled", turnId: "t", result: { outcome: "succeeded", attempts: 1, text: "", classification: { kind: "success" }, attemptLog: [], openApprovals: [], messages: [], hitStepLimit: false, unknownOutcomes: [] } },

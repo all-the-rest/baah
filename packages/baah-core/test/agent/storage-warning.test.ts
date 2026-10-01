@@ -265,7 +265,7 @@ async function runTurn(options: {
     tools: TOOLS,
     workspace: createMemoryWorkspace(),
     cwd: ".",
-    sessionId: "s1",
+    sessionId: SESSION,
     turnId: "t1",
     store: options.store,
     approval: resolver,
@@ -278,6 +278,15 @@ async function runTurn(options: {
   const result = await turn.run("hi");
   return { events, outcome: result.outcome, text: result.text };
 }
+
+/**
+ * The session the turns below run under.
+ *
+ * Named because the `storage-warning` assertions are whole-object `toEqual`s: an
+ * event that did not carry its session would make them pass, and "the events name
+ * their session" is a property this file should be able to see.
+ */
+const SESSION = "s1";
 
 function warnings(events: readonly AgentEvent[]) {
   return events.filter(
@@ -310,17 +319,22 @@ describe("a heartbeat that cannot be written is a typed event", () => {
 
     expect(store.heartbeatCalls).toBeGreaterThan(0);
     const heartbeatWarnings = warnings(events).filter((event) => event.operation === "heartbeat");
+    // `sessionId` is on every event and is spelled out here rather than omitted:
+    // this assertion is `toEqual` on the whole object, so leaving it out would
+    // pin the *absence* of the very field the event is required to carry.
     expect(heartbeatWarnings).toEqual([
       {
         type: "storage-warning",
         operation: "heartbeat",
         attempt: 1,
+        sessionId: SESSION,
         message: "StorageError",
       },
       {
         type: "storage-warning",
         operation: "heartbeat",
         attempt: 1,
+        sessionId: SESSION,
         message: "StorageError",
       },
     ]);
@@ -446,6 +460,7 @@ describe("a tool call that cannot be recorded is the same kind of event", () => 
       type: "storage-warning",
       operation: "record-tool-call",
       attempt: 1,
+      sessionId: SESSION,
       toolCallId: "c1",
       toolName: "echo",
       message: "StorageError",

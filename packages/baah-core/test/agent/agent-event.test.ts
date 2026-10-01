@@ -25,6 +25,20 @@
  * direction: a hand-written constructor that forgets a field the union requires
  * *is* caught, but a union that quietly loses one is not, and only a real turn
  * shows what actually goes out on the wire.
+ *
+ * ## What `sessionId` changed, and what it did not
+ *
+ * `sessionId` is intersected onto the whole union rather than repeated on its
+ * sixteen members, and stamped in **one** place — the `#emit` sink in
+ * `AgentTurn`'s constructor. So the 33 `emit(…)` sites name only the event's
+ * content, and a `tsc` probe confirms a bare `AgentEventBody` is not assignable to
+ * `AgentEvent` (so the split cannot be bypassed by accident).
+ *
+ * The property that is worth a *runtime* test is the **value**, not the key: an
+ * engine that stamped a constant, or the turn id, or a neighbouring session, would
+ * typecheck perfectly and pass a key-set audit. That is the mutation below —
+ * `"always-the-same"` in the sink — and the reason the audit asserts
+ * `event.sessionId === "s1"` on every event rather than only counting keys.
  */
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -44,8 +58,21 @@ import { createMockModel, finish, toolCall, type MockStreamPart } from "./mock-m
 /* The type-level half                                                 */
 /* ------------------------------------------------------------------ */
 
-/** The payload of one event variant, with the `type` discriminator removed. */
-type PayloadOf<T extends AgentEvent["type"]> = Omit<Extract<AgentEvent, { type: T }>, "type">;
+/**
+ * The payload of one event variant, with the two fields that are **not** the
+ * variant's own content removed.
+ *
+ * `type` is the discriminator. `sessionId` is intersected onto the whole union
+ * (`AgentEvent = AgentEventBody & { sessionId }`) and is therefore on every
+ * member while belonging to none of them — so it has to be omitted for a payload
+ * comparison to mean "this variant's own fields". It is asserted separately,
+ * further down, because "omitted everywhere" and "present everywhere" are both
+ * easy to say and only one of them is true.
+ */
+type PayloadOf<T extends AgentEvent["type"]> = Omit<
+  Extract<AgentEvent, { type: T }>,
+  "type" | "sessionId"
+>;
 
 /**
  * The keys an intersection member has, as a *type* — so a field dropped from
@@ -203,26 +230,34 @@ async function eventsOf(
   return events;
 }
 
-/** The keys the union declares for one event type, written out by hand. */
+/**
+ * The keys the union declares for one event type, written out by hand.
+ *
+ * `sessionId` is on **every** row, and its absence from a row is a failure of
+ * this table rather than of the engine: the audit compares the keys a real turn
+ * produces against these lists, so a variant missing it here would make the
+ * engine's correct output look wrong. It is spelled out sixteen times on purpose
+ * — that is the property the table is now checking.
+ */
 const DECLARED_KEYS: Record<AgentEvent["type"], readonly string[]> = {
-  "attempt-started": ["attempt", "total", "retryAfterMs"],
-  "text-delta": ["messageId", "text"],
-  "reasoning-delta": ["messageId", "text"],
-  "tool-call": ["input", "toolCallId", "toolName"],
-  "tool-result": ["output", "toolCallId", "toolName"],
-  "tool-error": ["error", "toolCallId", "toolName"],
-  "tool-output-denied": ["reason", "toolCallId", "toolName"],
-  "tool-outcome-unknown": ["input", "toolCallId", "toolName"],
+  "attempt-started": ["attempt", "sessionId", "total", "retryAfterMs"],
+  "text-delta": ["messageId", "sessionId", "text"],
+  "reasoning-delta": ["messageId", "sessionId", "text"],
+  "tool-call": ["input", "sessionId", "toolCallId", "toolName"],
+  "tool-result": ["output", "sessionId", "toolCallId", "toolName"],
+  "tool-error": ["error", "sessionId", "toolCallId", "toolName"],
+  "tool-output-denied": ["reason", "sessionId", "toolCallId", "toolName"],
+  "tool-outcome-unknown": ["input", "sessionId", "toolCallId", "toolName"],
   // Five, not four. `input` is the one the union was missing.
-  "approval-requested": ["approvalId", "input", "reason", "toolCallId", "toolName"],
-  "approval-answered": ["approvalId", "approved"],
-  "step-end": ["finishReason", "stepNumber", "text", "toolCallCount"],
-  "attempt-failed": ["attempt", "classification"],
-  waiting: ["reason", "retryAfterMs"],
-  "turn-stopped": ["stage"],
-  "turn-finished": ["attempts", "outcome"],
-  error: ["classification", "error"],
-  "storage-warning": ["attempt", "message", "operation"],
+  "approval-requested": ["approvalId", "input", "reason", "sessionId", "toolCallId", "toolName"],
+  "approval-answered": ["approvalId", "approved", "sessionId"],
+  "step-end": ["finishReason", "sessionId", "stepNumber", "text", "toolCallCount"],
+  "attempt-failed": ["attempt", "classification", "sessionId"],
+  waiting: ["reason", "retryAfterMs", "sessionId"],
+  "turn-stopped": ["sessionId", "stage"],
+  "turn-finished": ["attempts", "outcome", "sessionId"],
+  error: ["classification", "error", "sessionId"],
+  "storage-warning": ["attempt", "message", "operation", "sessionId"],
 };
 
 describe("AgentEvent — what actually goes out on the wire", () => {
@@ -247,6 +282,14 @@ describe("AgentEvent — what actually goes out on the wire", () => {
     const seen = new Set<AgentEvent["type"]>();
     for (const event of events) {
       seen.add(event.type);
+      // The **value**, not just the key. The key audit above would pass for an
+      // engine that stamped a constant, a wrong session, or the turn id — the
+      // field's presence says nothing about it naming the right conversation, and
+      // a wrong session is the one failure here that is invisible: the transcript
+      // renders, the tool part is written, and the row is in somebody else's
+      // conversation. Measured as a mutation: stamping `"always-the-same"` here
+      // leaves every other assertion in this file green.
+      expect(event.sessionId, `event "${event.type}" names its session`).toBe("s1");
       const declared = DECLARED_KEYS[event.type];
       expect(declared, `no declared key set for "${event.type}"`).toBeDefined();
       // `type` is the discriminator, present on both sides by construction.

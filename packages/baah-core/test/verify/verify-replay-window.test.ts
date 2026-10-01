@@ -273,7 +273,18 @@ describe("C4 · a crash between beginToolCall and recordToolCall", () => {
     await second.turn.run("go again");
 
     const events = second.events.filter((event) => event.type === "tool-outcome-unknown");
-    expect(events).toEqual([{ type: "tool-outcome-unknown", toolCallId: "c1", toolName: "echo", input: { value: "x" } }]);
+    expect(events).toEqual([
+      {
+        type: "tool-outcome-unknown",
+        toolCallId: "c1",
+        toolName: "echo",
+        input: { value: "x" },
+        // Named rather than omitted: this is the session whose store lost the
+        // record, and the event is the only thing the user sees. An event that
+        // did not carry it would satisfy this assertion too.
+        sessionId: "s1",
+      },
+    ]);
   });
 
   it("FIXED: `getToolCall` is scoped to a session, an attempt and an occurrence", async () => {

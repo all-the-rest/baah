@@ -17,6 +17,7 @@ import {
   STEP_CORE_TABLES,
   STEP_FULL_TEXT_INDEX,
   STEP_INDEXES,
+  STEP_SESSION_WORKSPACE,
   STEP_TOOL_CALL_IDENTITY,
 } from "./schema.ts";
 import type { SqlValue } from "./types.ts";
@@ -58,6 +59,17 @@ export interface MigrationResult {
  * Step 3 is separated from step 1 so a database can be inspected (or repaired)
  * even if the FTS5 virtual table cannot be created.
  *
+ * Step 5 is the first step whose statements are **neither** `IF NOT EXISTS` nor
+ * a rebuild: a plain `ALTER TABLE … ADD COLUMN` plus one index. It is here as its
+ * own version precisely because it is irreversible in the other direction — no
+ * `IF NOT EXISTS` spelling exists for `ADD COLUMN` (a second one is refused with
+ * `duplicate column name`, measured) — so its idempotency comes from
+ * `schema_migrations` alone, exactly like step 4. The column is nullable with no
+ * default, which is both what SQLite requires for a `REFERENCES` clause and the
+ * truthful value for every session that predates the project level. The reasoning
+ * is at `STEP_SESSION_WORKSPACE` in `schema.ts`, including why this step needs
+ * **no** park table and step 4 does.
+ *
  * Step 4 is the first **rebuild** rather than a plain `CREATE … IF NOT
  * EXISTS`: it replaces `tool_invocations` so that `status` can become
  * `begun | done` and so that the four-part call key can carry a real `UNIQUE`
@@ -78,6 +90,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 2, name: "full_text_index", statements: STEP_FULL_TEXT_INDEX },
   { version: 3, name: "query_indexes", statements: STEP_INDEXES },
   { version: 4, name: "tool_call_identity", statements: STEP_TOOL_CALL_IDENTITY },
+  { version: 5, name: "session_workspace", statements: STEP_SESSION_WORKSPACE },
 ];
 
 /** Newest version the code knows about. */

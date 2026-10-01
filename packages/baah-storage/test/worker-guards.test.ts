@@ -17,6 +17,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { Sqlite3Static } from "@sqlite.org/sqlite-wasm";
 
 import { StorageError } from "../src/errors.ts";
+import { LATEST_SCHEMA_VERSION } from "../src/migrations.ts";
 import { createStorageWorker } from "../src/worker.ts";
 import { INSERT_SESSION, SELECT_SESSIONS } from "../src/sql.ts";
 import type { RpcRequest } from "../src/protocol.ts";
@@ -78,7 +79,11 @@ describe("the open path", () => {
     expect(response.result).toMatchObject({
       filename: "/baah.sqlite3",
       vfsName: "opfs-sahpool",
-      schemaVersion: 4,
+      // The worker's answer is whatever `applyMigrations` reached, so this
+      // tracks the migration list rather than a literal — a hard-coded `4` went
+      // stale the moment step 5 was appended and failed here for a reason that
+      // had nothing to do with the open path this test is about.
+      schemaVersion: LATEST_SCHEMA_VERSION,
     });
 
     // The pragmas ran on the real connection, in the order `PRAGMAS` fixes.

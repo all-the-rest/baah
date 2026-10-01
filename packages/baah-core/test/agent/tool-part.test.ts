@@ -82,29 +82,42 @@ const UNKNOWN = {
   guidance: "Do not repeat it blindly. Check the current state first.",
 };
 
+/**
+ * The session every fixture below belongs to.
+ *
+ * `ToolPartEvent` carries `sessionId` because every `AgentEvent` does, and a
+ * fixture that omitted it would not typecheck — which is the point: a fixture
+ * cannot claim to be an engine event while naming no session.
+ */
+const SESSION = "s-fixture";
+
 const call = (input: unknown = { path: "a.ts" }): ToolPartEvent => ({
   type: "tool-call",
   toolCallId: "c1",
   toolName: "read",
   input,
+  sessionId: SESSION,
 });
 const result = (output: unknown): ToolPartEvent => ({
   type: "tool-result",
   toolCallId: "c1",
   toolName: "read",
   output,
+  sessionId: SESSION,
 });
 const errored = (message = "the SDK caught a rejection"): ToolPartEvent => ({
   type: "tool-error",
   toolCallId: "c1",
   toolName: "read",
   error: message,
+  sessionId: SESSION,
 });
 const denied = (): ToolPartEvent => ({
   type: "tool-output-denied",
   toolCallId: "c1",
   toolName: "write",
   reason: undefined,
+  sessionId: SESSION,
 });
 
 /** The state and the `errorText` of a written part, and nothing else. */
@@ -214,6 +227,7 @@ describe("the outcome-unknown envelope is not a failure", () => {
       toolCallId: "c1",
       toolName: "write",
       input: { path: "a.ts" },
+      sessionId: SESSION,
     };
     // The check is the *assignment* below, and it is a compile error rather than
     // a runtime branch nobody exercises. A fifth `ToolPartEvent` member would

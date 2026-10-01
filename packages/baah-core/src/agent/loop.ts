@@ -135,13 +135,43 @@ import type { Workspace } from "../workspace.ts";
 /* ------------------------------------------------------------------ */
 
 /**
- * Everything the user must see, as data.
+ * Everything the user must see, as data, **without** the session it belongs to.
+ *
+ * ## Why this is a separate type instead of a field on each member
+ *
+ * `sessionId` is **not** repeated on the sixteen arms of the union below. It is
+ * intersected onto the whole thing as {@link AgentEvent}, and the reason is
+ * measurable rather than stylistic: an event is produced at **33 call sites**
+ * (`emit(` in this file), and all of them reach one sink — `#emit`, assigned
+ * exactly once, in the constructor. Writing the field at the sink is therefore a
+ * **one-line** change; writing it at each of the 33 sites would be 33 chances to
+ * forget one, and a forgotten `sessionId` is not a compile error, it is a row in
+ * the wrong session.
+ *
+ * The type split is what makes the sink honest in the other direction: a bare
+ * {@link AgentEventBody} is **not** assignable to {@link AgentEvent}, so an
+ * emitter cannot pass one on by accident, and `sessionId` cannot be optional on
+ * a member without the compiler saying so. Measured, not asserted — see the
+ * `tsc` probe in the block report.
+ *
+ * ## What this buys, stated as the property it turns into a fact
+ *
+ * The store already received a `sessionId` as an argument on every call
+ * (`TurnStore.flushDelta`, `…appendMessage`, …), taken from the same
+ * `AgentLoopOptions.sessionId` closure. That was **structurally** safe and
+ * **not** checkable: nothing anywhere compared what a consumer saw on an event
+ * against what the store was handed, so a divergence would have been invisible.
+ * With the session on the event, `TurnStore.upsertPart` — the one seam where an
+ * event value *becomes* a store write — carries the same fact twice, once as an
+ * instruction (`input.sessionId`) and once as evidence (`input.event.sessionId`),
+ * and the adapter can be shown to follow the evidence. That is the whole change:
+ * a claim became a comparison.
  *
  * The `attempt` number is on the failure and the start events rather than being
  * inferred, because Plan.md §5.4 insists the attempts are visible: a silent
  * retry is unhelpful precisely when the failure is hard to diagnose.
  */
-export type AgentEvent =
+export type AgentEventBody =
   | { type: "attempt-started"; attempt: number; total: number; retryAfterMs: number }
   | { type: "text-delta"; text: string; messageId: string }
   | { type: "reasoning-delta"; text: string; messageId: string }
@@ -249,6 +279,16 @@ export type AgentEvent =
       toolName: string;
       message: string;
     };
+
+/**
+ * What a consumer of {@link AgentTurn} receives: the event, plus the session it
+ * belongs to.
+ *
+ * `sessionId` is **required**, and that is the load-bearing half. Optional would
+ * mean every existing consumer keeps compiling while the guarantee quietly does
+ * not exist — which is the failure this type exists to remove.
+ */
+export type AgentEvent = AgentEventBody & { readonly sessionId: string };
 
 export type TurnOutcome = "succeeded" | "failed" | "interrupted" | "waiting" | "awaiting-approval";
 
@@ -466,6 +506,28 @@ export interface TurnStore {
    * Upsert, keyed on a `partId` **derived** from the `toolCallId`: the same call
    * is reported three times (call, result, and again on a replay), and three
    * minted ids would be three rows for one call.
+   *
+   * ## `sessionId` and `event.sessionId` are the same fact named twice, on purpose
+   *
+   * This is the **only** method on this seam whose input embeds an
+   * {@link AgentEvent}, and therefore the only place where the turn's session
+   * arrives both as an instruction (`input.sessionId`, from
+   * {@link AgentLoopOptions.sessionId}) and as evidence
+   * (`input.event.sessionId`, stamped at the emit sink). They are one string.
+   *
+   * They are left as two fields rather than collapsed, because the collapse would
+   * remove the only *checkable* statement in the program that a store write and an
+   * event belong to the same conversation. An implementation that reads the event
+   * is right by construction; one that reads the argument is right only while
+   * nobody disagrees with it — and nothing can disagree today, which is precisely
+   * why the difference is untested unless a test builds it.
+   *
+   * `packages/baah-storage`'s adapter reads the **event** and says why at the
+   * method; `turn-store.test.ts` builds the disagreement (argument `s1`, event
+   * `s2`) and asserts the row lands under `s2`. The engine cannot produce that
+   * divergence — both names come from one field — and that is the point: the
+   * seam is defended against a caller that could, which is a caller outside this
+   * file.
    */
   upsertPart(input: { sessionId: string; messageId: string; event: ToolPartEvent }): Promise<void>;
   /**
@@ -595,6 +657,21 @@ export interface AgentLoopOptions {
   tools: readonly AnyToolDefinition[];
   workspace: Workspace;
   cwd: string;
+  /**
+   * The session this turn belongs to.
+   *
+   * **The single source of the session for the whole turn**, and now the only
+   * one: it is what every `store.*` call passes as its `sessionId` argument
+   * *and* what every {@link AgentEvent} carries, stamped at the emit sink in the
+   * constructor. Nothing else in `AgentTurn` may invent a session, and the
+   * signature is deliberately a plain `string` rather than something narrower —
+   * a branded type would have made the value checkable but not *consistent*,
+   * and consistency is the property that was missing.
+   *
+   * The consumers that would break if this and the event's session disagreed are
+   * named at {@link TurnStore.upsertPart}: the tool part is the one write whose
+   * value comes from an event, so it is the one place the two can be compared.
+   */
   sessionId: string;
   turnId: string;
   store: TurnStore;
@@ -901,7 +978,32 @@ export function staticAgentSettings(): {
  */
 export class AgentTurn {
   readonly #options: AgentLoopOptions;
-  readonly #emit: (event: AgentEvent) => void;
+  /**
+   * The one place a session becomes an event.
+   *
+   * Takes an {@link AgentEventBody}, not an {@link AgentEvent}: the 33 `emit(…)`
+   * sites below name the event's *content* and nothing else, and this is where
+   * `sessionId` is attached. Every event therefore carries the session of the
+   * turn that produced it, and there is no call site at which that could be
+   * forgotten — the type would refuse the call.
+   *
+   * ## It **returns** the stamped event, and that is the second half of the fix
+   *
+   * The four `tool-call` / `tool-result` / `tool-error` / `tool-output-denied`
+   * branches each wrote their payload **twice**: once as `emit({ … })` for the
+   * consumer and once as a hand-repeated literal handed to `upsertToolPart`, the
+   * store write. Two literals for one event, and nothing tying them together —
+   * so a field could be added to one and not the other, and both would typecheck.
+   * That is the same "two sources for one fact" this type exists to remove, one
+   * level below.
+   *
+   * Returning the stamped event makes it **one**: `upsertToolPart(emit({ … }))`
+   * hands the store the exact object the consumer was given, session included.
+   * A test can then assert identity (`toBe`) instead of equality, and a store
+   * that were built from a *different* session than the event it claims to record
+   * becomes a runtime fact rather than a reading of the source.
+   */
+  readonly #emit: <TBody extends AgentEventBody>(event: TBody) => TBody & { readonly sessionId: string };
   readonly #controller = new AbortController();
   readonly #sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   readonly #random: () => number;
@@ -917,7 +1019,18 @@ export class AgentTurn {
 
   constructor(options: AgentLoopOptions) {
     this.#options = options;
-    this.#emit = options.onEvent;
+    /**
+     * The session is bound **here**, once, and nowhere else.
+     *
+     * `options.sessionId` is the same value every `store.*` call below passes as
+     * its `sessionId` argument, so the event and the write cannot disagree — and
+     * if that ever changes, it changes in this one line rather than in 33.
+     */
+    this.#emit = <TBody extends AgentEventBody>(event: TBody): TBody & { readonly sessionId: string } => {
+      const stamped = { ...event, sessionId: options.sessionId };
+      options.onEvent(stamped);
+      return stamped;
+    };
     this.#sleep = options.sleep ?? defaultSleep;
     this.#random = options.random ?? Math.random;
     if (options.abortSignal !== undefined) {
@@ -1893,18 +2006,16 @@ export class AgentTurn {
             const entry = { name: part.toolName, part: toolCallPart(part) };
             toolParts.set(part.toolCallId, entry);
             parts.push(entry.part as UIMessage["parts"][number]);
-            emit({
-              type: "tool-call",
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              input: part.input,
-            });
-            await upsertToolPart({
-              type: "tool-call",
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              input: part.input,
-            });
+            // One literal, two consumers: the store is handed the exact object
+            // the subscriber saw, session included.
+            await upsertToolPart(
+              emit({
+                type: "tool-call",
+                toolCallId: part.toolCallId,
+                toolName: part.toolName,
+                input: part.input,
+              }),
+            );
             break;
           }
 
@@ -1913,22 +2024,21 @@ export class AgentTurn {
             if (entry !== undefined) {
               Object.assign(entry.part, { state: "output-available", output: part.output });
             }
-            emit({
-              type: "tool-result",
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              output: part.output,
-            });
             // The row, and the point of the whole method: `part.output` is the
             // *value*, and a value of `{ ok: false, error }` is a failure the
             // nominal `output-available` does not admit. Persisted raw, that state
             // would survive every reload.
-            await upsertToolPart({
-              type: "tool-result",
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              output: part.output,
-            });
+            //
+            // Emitted once and the **returned** event stored — see `#emit`. The
+            // comment about the value belongs to the write, so it sits with it.
+            await upsertToolPart(
+              emit({
+                type: "tool-result",
+                toolCallId: part.toolCallId,
+                toolName: part.toolName,
+                output: part.output,
+              }),
+            );
             // Recorded at once, not at turn end: a crash mid-turn must not lose
             // the fact that the tool ran, or a replay would run it again. The
             // key is the *same* one the short-circuit will look the call up
@@ -1973,22 +2083,18 @@ export class AgentTurn {
             if (entry !== undefined) {
               Object.assign(entry.part, { state: "output-error", errorText: String(part.error) });
             }
-            emit({
-              type: "tool-error",
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              error: String(part.error),
-            });
             // Practically unreachable (`createSdkTool` converts every throw into
             // a result), and written anyway: the SDK's own catch is the one path
             // that would reach it, and a card that never learned about a failure
             // is worse than a redundant write.
-            await upsertToolPart({
-              type: "tool-error",
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              error: String(part.error),
-            });
+            await upsertToolPart(
+              emit({
+                type: "tool-error",
+                toolCallId: part.toolCallId,
+                toolName: part.toolName,
+                error: String(part.error),
+              }),
+            );
             /**
              * No `recordToolCall` here, and that is a fact about reachability
              * rather than an oversight.
@@ -2015,21 +2121,17 @@ export class AgentTurn {
             }
             // A denial, not an error: the model reads the refusal and routes
             // around it instead of retrying a malfunction (§7.6).
-            emit({
-              type: "tool-output-denied",
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              reason: undefined,
-            });
             // `output-denied` and not `output-error`, and the value here is
             // `undefined` so the derivation cannot promote it: a refusal is a
             // legitimate answer the model routes around (§7.6).
-            await upsertToolPart({
-              type: "tool-output-denied",
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              reason: undefined,
-            });
+            await upsertToolPart(
+              emit({
+                type: "tool-output-denied",
+                toolCallId: part.toolCallId,
+                toolName: part.toolName,
+                reason: undefined,
+              }),
+            );
             break;
           }
 

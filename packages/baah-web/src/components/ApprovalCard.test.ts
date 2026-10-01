@@ -24,10 +24,19 @@ import { approvalViewFromState } from "./ApprovalCard.tsx";
 import { foldAgentEvents, EMPTY_LIVE_TURN, type LiveTurn } from "./lib/transcript.ts";
 import type { RuntimeState } from "../runtime/index.ts";
 
+/**
+ * The session the approval events below belong to.
+ *
+ * Every `AgentEvent` carries one, so a fixture that left it out would not compile.
+ * It matches {@link snapshot}'s, which is what makes the pair a coherent fixture
+ * rather than two unrelated strings.
+ */
+const SESSION = "s1";
+
 /** The snapshot, with only what the card reads filled in. */
 function snapshot(messages: readonly UIMessage[]): RuntimeState {
   return {
-    sessionId: "s1",
+    sessionId: SESSION,
     turnId: "t1",
     status: "idle",
     attempt: 1,
@@ -70,7 +79,7 @@ const pending: UIMessage[] = [
 
 /** A turn folded up to the pause — no `tool-call` event ever arrived. */
 const paused: LiveTurn = foldAgentEvents([
-  { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", input: { path: ".env" }, reason: "Secrets?" },
+  { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", input: { path: ".env" }, sessionId: SESSION, reason: "Secrets?" },
 ]);
 
 describe("approvalViewFromState", () => {
@@ -126,7 +135,7 @@ describe("approvalViewFromState", () => {
     expect(read?.risk).toBe("read-secret");
 
     const writing = foldAgentEvents([
-      { type: "approval-requested", approvalId: "ap2", toolCallId: "c2", toolName: "write", input: { path: "a.txt" }, reason: undefined },
+      { type: "approval-requested", approvalId: "ap2", toolCallId: "c2", toolName: "write", input: { path: "a.txt" }, sessionId: SESSION, reason: undefined },
     ]);
     const write = approvalViewFromState(writing, snapshot([]));
     expect(write?.risk).toBe("file-write");
@@ -137,8 +146,8 @@ describe("approvalViewFromState", () => {
     // Two cards at once would need two answers to be correct at the same moment, and
     // §7.5's `reject` sweeps the rest anyway — so the card answers the oldest.
     const two = foldAgentEvents([
-      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", input: { path: ".env" }, reason: undefined },
-      { type: "approval-requested", approvalId: "ap2", toolCallId: "c2", toolName: "read", input: { path: ".env.local" }, reason: undefined },
+      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", input: { path: ".env" }, sessionId: SESSION, reason: undefined },
+      { type: "approval-requested", approvalId: "ap2", toolCallId: "c2", toolName: "read", input: { path: ".env.local" }, sessionId: SESSION, reason: undefined },
     ]);
     expect(approvalViewFromState(two, snapshot(pending))?.approvalId).toBe("ap1");
   });

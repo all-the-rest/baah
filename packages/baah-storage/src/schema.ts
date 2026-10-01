@@ -399,12 +399,78 @@ export const STEP_TOOL_CALL_IDENTITY: readonly string[] = [
      ON tool_invocations (session_id, attempt, tool_call_id, occurrence);`,
 ];
 
+/**
+ * Migration 5: the session names the project it belongs to.
+ *
+ * `sessions.workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL`.
+ *
+ * ## Why an `ALTER TABLE … ADD COLUMN` and not a rebuild
+ *
+ * Every other migration in this file that had to change a table's *shape* had to
+ * park its children's foreign keys first (see {@link STEP_TOOL_CALL_IDENTITY} and
+ * "Why the child references are parked first" — `DROP TABLE` fires
+ * `ON DELETE CASCADE`, and `PRAGMA defer_foreign_keys` defers the check, not the
+ * cascade). **This one does not need any of that**, and the difference is worth
+ * stating rather than leaving to a reader who assumes the pattern applies:
+ *
+ * | | rebuild (`CREATE` → copy → `DROP` → `RENAME`) | `ADD COLUMN` |
+ * |---|---|---|
+ * | does the parent table get dropped | yes | **no** |
+ * | do children's cascades fire | yes | **no** |
+ * | can existing rows be copied | they must be | **there are none to copy** |
+ * | `seq` / `created_at` preserved | by hand, per column | **untouched** |
+ *
+ * `sessions` is the **parent** of seven tables, not a child, and the new
+ * reference points *out* of it (`workspaces` already exists from step 1). So the
+ * park pattern does not apply — and adopting it here would have meant parking
+ * `turns`, `messages`, `parts`, `part_deltas`, `tool_invocations`, `approvals`
+ * and `todos` for no reason at all, which is exactly the kind of mechanical
+ * ritual that makes a schema file unreadable.
+ *
+ * ## `ADD COLUMN` with a `REFERENCES` clause, and the one rule that comes with it
+ *
+ * SQLite permits `ADD COLUMN … REFERENCES …` **only when the new column's default
+ * is NULL** (it cannot validate existing rows against a constraint it did not
+ * check when they were written). A nullable column with no default satisfies that
+ * exactly, and it is the right shape here regardless: **every session written
+ * before this migration predates the project level**, so `NULL` is the truthful
+ * value for all of them — "this conversation does not belong to a project" rather
+ * than a made-up one. A `NOT NULL` column would have had to invent a workspace row
+ * per historical session.
+ *
+ * ## `ON DELETE SET NULL`, and why not `CASCADE`
+ *
+ * Deleting a project must not delete its conversations. `CASCADE` would: a user
+ * removing a folder reference from the app would lose the transcript of every
+ * session in it, and `messages`, `parts`, `tool_invocations` and `approvals`
+ * would go with them by their own cascades. `SET NULL` detaches the session and
+ * keeps it — measured, not assumed: with `PRAGMA foreign_keys=ON`, deleting the
+ * referenced `workspaces` row leaves `sessions.workspace_id` NULL and the session
+ * row intact.
+ *
+ * The cost is stated rather than hidden: a detached session is **invisible to a
+ * project-scoped query**, because it no longer has a project. That is why the
+ * write path (which does not exist yet — `workspaces` is still never inserted
+ * into) must not delete a `workspaces` row to mean "this project has no
+ * conversations". The two facts are different and this constraint keeps them
+ * apart.
+ */
+export const STEP_SESSION_WORKSPACE: readonly string[] = [
+  `ALTER TABLE sessions ADD COLUMN workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL;`,
+  // The project-scoped read this column exists for: "the conversations of this
+  // project, newest first". Without it every such read is a full scan of
+  // `sessions` — and, more importantly, the query would have no index to *not*
+  // use, which is the difference between a plan someone chose and a default.
+  `CREATE INDEX IF NOT EXISTS idx_sessions_workspace_id ON sessions (workspace_id, updated_at DESC);`,
+];
+
 /** Every DDL statement of the schema, in dependency order. */
 export const SCHEMA_STATEMENTS: readonly string[] = [
   ...STEP_CORE_TABLES,
   ...STEP_FULL_TEXT_INDEX,
   ...STEP_INDEXES,
   ...STEP_TOOL_CALL_IDENTITY,
+  ...STEP_SESSION_WORKSPACE,
 ];
 
 /** Table names of §6.1 plus the delta log. Used by the schema test. */

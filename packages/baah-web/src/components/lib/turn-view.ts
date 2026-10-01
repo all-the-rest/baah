@@ -50,7 +50,12 @@ export interface TurnBanner {
  */
 export function turnBanner(state: RuntimeState, stall: StallReport | undefined, live?: LiveTurn): TurnBanner {
   const stopped = live?.stopped === true && live.stopStage !== undefined
-    ? stopView({ type: "turn-stopped", stage: live.stopStage })
+    // `state.sessionId`, and not a literal: `stopView` takes an `AgentEvent`, and
+    // every event names the session it belongs to. The value is the runtime's own
+    // — the same one the engine stamped on the event `live.stopStage` came out of
+    // — so this reconstructs the event rather than inventing a session for it.
+    // An empty string would typecheck and be a lie the banner cannot see.
+    ? stopView({ type: "turn-stopped", stage: live.stopStage, sessionId: state.sessionId })
     : undefined;
 
   const failure = state.classification === undefined ? undefined : failureView(state.classification);

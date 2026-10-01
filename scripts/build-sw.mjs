@@ -27,6 +27,7 @@
  */
 
 import { readdirSync, statSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { join, relative, resolve, sep } from "node:path";
 
 /**
@@ -51,7 +52,16 @@ function parseDist(argv) {
   if (flag !== -1 && argv[flag + 1] !== undefined) return resolve(process.cwd(), argv[flag + 1]);
   const inline = argv.find((a) => a.startsWith("--dist="));
   if (inline !== undefined) return resolve(process.cwd(), inline.slice("--dist=".length));
-  return resolve(process.cwd(), "packages/baah-web/dist");
+  // **From this file's own location, never from `process.cwd()`.** That was the
+  // second version of this line's bug, and it was found by an agent, not by me:
+  // pnpm runs a package script with cwd set to THAT PACKAGE, so
+  // `resolve(cwd, "packages/baah-web/dist")` resolved to
+  // `packages/baah-web/packages/baah-web/dist` and `pnpm --filter … build` failed.
+  //
+  // The distinction that matters: `pnpm build` from the root has cwd = the root, and
+  // `pnpm --filter <pkg> build` has cwd = the package. **A build script that reads cwd
+  // is correct in exactly one of those, and I only ever exercised that one.**
+  return resolve(fileURLToPath(new URL("../packages/baah-web/dist", import.meta.url)));
 }
 
 const DIST = parseDist(process.argv.slice(2));

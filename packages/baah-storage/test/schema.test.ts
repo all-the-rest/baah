@@ -18,6 +18,7 @@ import {
   STEP_CORE_TABLES,
   STEP_FULL_TEXT_INDEX,
   STEP_INDEXES,
+  STEP_SESSION_WORKSPACE,
   STEP_TOOL_CALL_IDENTITY,
   TABLE_NAMES,
   TOOL_INVOCATIONS_TABLE,
@@ -146,25 +147,41 @@ describe("tables", () => {
   });
 
   it("is idempotent — every creating statement is IF NOT EXISTS", () => {
-    // Everything except the four statements of the rebuild step, which cannot
-    // carry it: a `DROP TABLE`, an `ALTER … RENAME` and the two that surround
-    // the copy. They are protected by the transaction `applyMigrations()` runs
-    // each step in, which `migrations.test.ts` and the real-SQLite parity test
-    // both measure. Claiming idempotency that does not exist would be worse
-    // than naming the exception.
-    const REBUILD_STATEMENTS = STEP_TOOL_CALL_IDENTITY;
+    // Everything except the two steps that cannot carry it, and the reasons are
+    // different, which is why they are two named groups rather than one:
+    //
+    // - **the rebuild step**: a `DROP TABLE`, an `ALTER … RENAME` and the two
+    //   statements that surround the copy. None of them can be spelled
+    //   `IF NOT EXISTS`.
+    // - **`sessions.workspace_id`**: an `ADD COLUMN`. SQLite has no such
+    //   spelling, and measures that by refusing a second one
+    //   (`duplicate column name`) — so the *same* transaction protects it, for a
+    //   different reason.
+    //
+    // Both are protected by the transaction `applyMigrations()` runs each step
+    // in, which `migrations.test.ts` and the real-SQLite parity test both
+    // measure. Claiming idempotency that does not exist would be worse than
+    // naming the exception.
+    const NOT_IDEMPOTENT_BY_STATEMENT = [...STEP_TOOL_CALL_IDENTITY, ...STEP_SESSION_WORKSPACE];
     for (const statement of SCHEMA_STATEMENTS) {
-      if (REBUILD_STATEMENTS.includes(statement)) continue;
+      if (NOT_IDEMPOTENT_BY_STATEMENT.includes(statement)) continue;
       expect(statement).toMatch(/IF NOT EXISTS/i);
     }
-    // The exception is exactly the rebuild. Five of its thirteen statements
-    // create or drop something named (`CREATE TABLE` ×2, `DROP … IF EXISTS`
-    // ×2, the three re-created/new indexes) and carry `IF NOT EXISTS`; the
-    // other eight are the `PRAGMA`, the three `UPDATE`s, the two copies and
-    // the `RENAME`, none of which can.
-    const creating = REBUILD_STATEMENTS.filter((statement) => /IF NOT EXISTS/i.test(statement));
+    // The `ADD COLUMN` is the one statement in step 5 that cannot be, and its
+    // sibling index **can** — so the exception is one statement, not the step.
+    const step5WithoutGuard = STEP_SESSION_WORKSPACE.filter(
+      (statement) => !/IF NOT EXISTS/i.test(statement),
+    );
+    expect(step5WithoutGuard).toHaveLength(1);
+    expect(step5WithoutGuard[0]).toMatch(/ADD COLUMN/i);
+    // The rebuild's own split, asserted so the numbers below stay honest: five of
+    // its thirteen statements create or drop something named (`CREATE TABLE` ×2,
+    // `DROP … IF EXISTS` ×2, the three re-created/new indexes) and carry
+    // `IF NOT EXISTS`; the other eight are the `PRAGMA`, the three `UPDATE`s, the
+    // two copies and the `RENAME`, none of which can.
+    const creating = STEP_TOOL_CALL_IDENTITY.filter((statement) => /IF NOT EXISTS/i.test(statement));
     expect(creating).toHaveLength(5);
-    expect(REBUILD_STATEMENTS.filter((statement) => !/IF NOT EXISTS/i.test(statement)))
+    expect(STEP_TOOL_CALL_IDENTITY.filter((statement) => !/IF NOT EXISTS/i.test(statement)))
       .toHaveLength(8);
   });
 
@@ -399,6 +416,25 @@ describe("indexes", () => {
     const statement = STEP_INDEXES.find((entry) => entry.includes("idx_parts_session_seq"));
     expect(statement).toContain("ON parts (session_id, seq)");
   });
+
+  it("indexes the session's workspace, because that is the read the column is for", () => {
+    /**
+     * The project-scoped query: "the conversations of this project, newest
+     * first". Without the index every such read is a full scan of `sessions`.
+     *
+     * The index is in `STEP_SESSION_WORKSPACE` rather than `STEP_INDEXES` because
+     * it cannot exist before the column does — so the duplicate-check loop above,
+     * which walks `STEP_INDEXES`, does not see it. That is worth asserting
+     * explicitly: an index nobody checks is an index nobody maintains.
+     */
+    const statement = STEP_SESSION_WORKSPACE.find((entry) =>
+      entry.includes("idx_sessions_workspace_id"),
+    );
+    expect(statement).toBeDefined();
+    expect(statement).toContain("ON sessions (workspace_id, updated_at DESC)");
+    // …and it duplicates no `UNIQUE` constraint, like every other index here.
+    expect(statement).not.toMatch(/UNIQUE/i);
+  });
 });
 
 describe("step order", () => {
@@ -430,5 +466,30 @@ describe("step order", () => {
     expect(core.indexOf("sessions")).toBeLessThan(core.indexOf("turns"));
     expect(core.indexOf("turns")).toBeLessThan(core.indexOf("messages"));
     expect(core.indexOf("messages")).toBeLessThan(core.indexOf("parts"));
+  });
+
+  it("runs step 5 after `workspaces` exists, because it references it", () => {
+    /**
+     * The only ordering constraint step 5 has, and it is a real one: the
+     * `REFERENCES workspaces(id)` clause names a table that step 1 creates. An
+     * `ADD COLUMN` with a dangling reference would be accepted by SQLite and only
+     * fail later, on the first write that used it — so the ordering is asserted
+     * here rather than discovered in a user's transcript.
+     *
+     * The reverse direction is also fixed, and that is the one worth stating: the
+     * reference points **out of** `sessions`, so step 5 does not depend on any
+     * table that references `sessions`. It therefore needs no park table — the
+     * thing step 4 has and this step has none of.
+     */
+    const createsWorkspaces = SCHEMA_STATEMENTS.findIndex((statement) =>
+      createdTable(statement) === "workspaces",
+    );
+    const addColumn = SCHEMA_STATEMENTS.findIndex((statement) => /ADD COLUMN/i.test(statement));
+    expect(createsWorkspaces).toBeGreaterThanOrEqual(0);
+    expect(addColumn).toBeGreaterThan(createsWorkspaces);
+    // And the step is last, so a database at version 4 gets exactly this.
+    expect(SCHEMA_STATEMENTS.slice(-STEP_SESSION_WORKSPACE.length)).toEqual(
+      [...STEP_SESSION_WORKSPACE],
+    );
   });
 });

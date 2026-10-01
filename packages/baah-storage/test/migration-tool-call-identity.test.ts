@@ -105,10 +105,16 @@ describe("migration 4 brings an old tool_invocations forward", () => {
     const result = applyMigrations(host, () => T0);
 
     expect(result.version).toBe(LATEST_SCHEMA_VERSION);
+    // **Not a literal `4`**, and this file used to assert one: the rebuild moved
+    // from being the last step to being the second-to-last when
+    // `sessions.workspace_id` was appended, so "the install ran to the end" is
+    // `LATEST_SCHEMA_VERSION` and nothing else. A hard-coded version here failed
+    // for a reason that had nothing to do with the rebuild.
+    //
+    // The rebuild's *own* version is asserted in the next test, by name — the
+    // point of this one is the shape of the table, not which migration wrote it.
     expect(readSchemaVersion(host)).toBe(LATEST_SCHEMA_VERSION);
-    // The staging name is gone; the table is under its real name again.
     expect(columnsOf(host, "tool_invocations")).toContain("tool_call_id");
-    expect(readSchemaVersion(host)).toBe(4);
     const staging = rowsOf(
       host,
       "SELECT name FROM sqlite_master WHERE type='table' AND name='tool_invocations_v4'",
@@ -122,8 +128,17 @@ describe("migration 4 brings an old tool_invocations forward", () => {
     applyMigrations(host, () => T0);
 
     const versions = rowsOf(host, "SELECT version FROM schema_migrations ORDER BY version");
-    expect(versions.map((row) => row["version"])).toEqual([1, 2, 3, 4]);
-    expect(host.selectObjects("PRAGMA user_version")).toEqual([{ user_version: 4 }]);
+    // Every step, in order, by **version** — and the rebuild is named rather than
+    // numbered, because it is no longer the last step (appending
+    // `sessions.workspace_id` moved it) and a literal `4` here was a claim about
+    // a fact that had changed. The point of the transaction claim is that it holds
+    // for *each* step including the two that cannot be spelled idempotently.
+    expect(versions.map((row) => row["version"])).toEqual(MIGRATIONS.map((entry) => entry.version));
+    expect(MIGRATIONS.map((entry) => entry.name)).toContain("tool_call_identity");
+    expect(readSchemaVersion(host)).toBe(LATEST_SCHEMA_VERSION);
+    expect(host.selectObjects("PRAGMA user_version")).toEqual([
+      { user_version: LATEST_SCHEMA_VERSION },
+    ]);
   });
 
   it("keeps the rows, and maps only `completed` to done", () => {
@@ -305,7 +320,9 @@ describe("migration 4 brings an old tool_invocations forward", () => {
     );
     // The bookkeeping table gained nothing, which is the other half: a
     // duplicated rebuild would be invisible except through this row count.
-    expect(rowsOf(host, "SELECT version FROM schema_migrations")).toHaveLength(4);
+    expect(rowsOf(host, "SELECT version FROM schema_migrations")).toHaveLength(
+      MIGRATIONS.length,
+    );
   });
 
   it("the recorded row is the only thing that says a migration ran", () => {

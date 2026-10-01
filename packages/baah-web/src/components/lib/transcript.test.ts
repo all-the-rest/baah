@@ -27,7 +27,7 @@ import type { TranscriptRead } from "../../runtime/index.ts";
 
 function transcript(overrides: Partial<Transcript> = {}): Transcript {
   return {
-    sessionId: "s",
+    sessionId: SESSION,
     turnId: null,
     messages: [],
     truncated: false,
@@ -35,6 +35,17 @@ function transcript(overrides: Partial<Transcript> = {}): Transcript {
     ...overrides,
   };
 }
+
+/**
+ * The session every engine event below belongs to.
+ *
+ * Named once because `AgentEvent` requires a `sessionId` on **every** member: a
+ * fold fixture that omitted it would not compile, and 26 repetitions of the same
+ * string is 26 chances to name the wrong one. The fold itself does not read the
+ * field — what the fixtures here exercise is the *shape* of the fold, and the
+ * session is the engine's, carried through untouched.
+ */
+const SESSION = "s";
 
 /**
  * A stored message, typed as the port's own `TranscriptMessage`.
@@ -70,8 +81,8 @@ describe("the live fold", () => {
     // appends both deltas to one `text` buffer, so the snapshot cannot be the
     // source for a live transcript — the fold has to do better than the buffer.
     const live = foldAgentEvents([
-      { type: "text-delta", text: "Antwort", messageId: "m" },
-      { type: "reasoning-delta", text: "Denke", messageId: "m" },
+      { type: "text-delta", text: "Antwort", messageId: "m", sessionId: SESSION },
+      { type: "reasoning-delta", text: "Denke", messageId: "m", sessionId: SESSION },
     ]);
     expect(live.text["m"]).toBe("Antwort");
     expect(live.reasoning["m"]).toBe("Denke");
@@ -80,7 +91,7 @@ describe("the live fold", () => {
   });
 
   it("marks a part in flight while it streams and keeps its text", () => {
-    const live = foldAgentEvents([{ type: "text-delta", text: "halb", messageId: "m" }]);
+    const live = foldAgentEvents([{ type: "text-delta", text: "halb", messageId: "m", sessionId: SESSION }]);
     const [part] = liveParts(live);
     if (part?.kind !== "text") throw new Error("expected a text part");
     // `Plan.md` §16.1: a live part comes back with its text, at most one flush
@@ -94,10 +105,10 @@ describe("the live fold", () => {
     // never merged forward. Merging would show the user text the model never
     // finished — and would make a 200-but-failed response undiagnosable.
     const live = foldAgentEvents([
-      { type: "attempt-started", attempt: 1, total: 3, retryAfterMs: 0 },
-      { type: "text-delta", text: "Versuch eins", messageId: "m1" },
-      { type: "attempt-started", attempt: 2, total: 3, retryAfterMs: 2_000 },
-      { type: "text-delta", text: "Versuch zwei", messageId: "m2" },
+      { type: "attempt-started", attempt: 1, total: 3, retryAfterMs: 0, sessionId: SESSION },
+      { type: "text-delta", text: "Versuch eins", messageId: "m1", sessionId: SESSION },
+      { type: "attempt-started", attempt: 2, total: 3, retryAfterMs: 2_000, sessionId: SESSION },
+      { type: "text-delta", text: "Versuch zwei", messageId: "m2", sessionId: SESSION },
     ]);
     expect(Object.values(live.text)).toEqual(["Versuch zwei"]);
     expect(live.attempt).toBe(2);
@@ -108,8 +119,8 @@ describe("the live fold", () => {
     // The text survives a stop — it is the user's work and `Plan.md` §5.4 keeps it
     // visible. A stop must not clear it, and it is not an error state.
     const live = foldAgentEvents([
-      { type: "text-delta", text: "teiltext", messageId: "m" },
-      { type: "turn-stopped", stage: "attempt" },
+      { type: "text-delta", text: "teiltext", messageId: "m", sessionId: SESSION },
+      { type: "turn-stopped", stage: "attempt", sessionId: SESSION },
     ]);
     expect(live.stopped).toBe(true);
     expect(live.stopStage).toBe("attempt");
@@ -118,10 +129,10 @@ describe("the live fold", () => {
 
   it("tracks a tool through call → approval → result", () => {
     const live = foldAgentEvents([
-      { type: "tool-call", toolCallId: "c1", toolName: "write", input: { path: "a.txt" } },
-      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, reason: "Schreiben?" },
-      { type: "approval-answered", approvalId: "ap1", approved: true },
-      { type: "tool-result", toolCallId: "c1", toolName: "write", output: "geschrieben" },
+      { type: "tool-call", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, sessionId: SESSION },
+      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, reason: "Schreiben?", sessionId: SESSION },
+      { type: "approval-answered", approvalId: "ap1", approved: true, sessionId: SESSION },
+      { type: "tool-result", toolCallId: "c1", toolName: "write", output: "geschrieben", sessionId: SESSION },
     ]);
     const tool = live.tools[0];
     expect(tool?.state).toBe("output-available");
@@ -136,7 +147,7 @@ describe("the live fold", () => {
     // risk class — so the placeholder would make a secret read look like an unknown
     // one.
     const live = foldAgentEvents([
-      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", input: { path: ".env" }, reason: "Secrets?" },
+      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "read", input: { path: ".env" }, reason: "Secrets?", sessionId: SESSION },
     ]);
     expect(live.tools[0]?.toolName).toBe("read");
     // And the `toolCallId` is on the open entry, because that is what
@@ -146,10 +157,10 @@ describe("the live fold", () => {
 
   it("closes an open approval when it is answered", () => {
     const live = foldAgentEvents([
-      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, reason: undefined },
+      { type: "approval-requested", approvalId: "ap1", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, reason: undefined, sessionId: SESSION },
     ]);
     expect(live.openApprovals).toHaveLength(1);
-    const answered = applyAgentEvent(live, { type: "approval-answered", approvalId: "ap1", approved: false });
+    const answered = applyAgentEvent(live, { type: "approval-answered", approvalId: "ap1", approved: false, sessionId: SESSION });
     expect(answered.openApprovals).toHaveLength(0);
     // A rejection is `output-denied`, not `output-error` — `Plan.md` §7.6: the
     // model reads the refusal and routes around it.
@@ -160,8 +171,8 @@ describe("the live fold", () => {
     // `Plan.md` §5.1: the engine ran it again and reported it as failed, both of
     // which are lies the model would act on. Its own list is the point.
     const live = foldAgentEvents([
-      { type: "tool-call", toolCallId: "c1", toolName: "write", input: { path: "a.txt" } },
-      { type: "tool-outcome-unknown", toolCallId: "c1", toolName: "write", input: { path: "a.txt" } },
+      { type: "tool-call", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, sessionId: SESSION },
+      { type: "tool-outcome-unknown", toolCallId: "c1", toolName: "write", input: { path: "a.txt" }, sessionId: SESSION },
     ]);
     expect(live.unknownOutcomes).toHaveLength(1);
     expect(live.tools[0]?.state).toBe("input-available");
@@ -169,7 +180,7 @@ describe("the live fold", () => {
 
   it("collects a storage warning as a warning", () => {
     const live = foldAgentEvents([
-      { type: "storage-warning", operation: "heartbeat", attempt: 1, message: "database_closed" },
+      { type: "storage-warning", operation: "heartbeat", attempt: 1, message: "database_closed", sessionId: SESSION },
     ]);
     expect(live.storageWarnings).toHaveLength(1);
     expect(live.storageWarnings[0]?.operation).toBe("heartbeat");
@@ -177,16 +188,16 @@ describe("the live fold", () => {
 
   it("counts the step from the engine's own event", () => {
     const live = foldAgentEvents([
-      { type: "step-end", stepNumber: 0, text: "", toolCallCount: 0, finishReason: "stop" },
+      { type: "step-end", stepNumber: 0, text: "", toolCallCount: 0, finishReason: "stop", sessionId: SESSION },
     ]);
     expect(live.step).toBe(1);
   });
 
   it("keeps two calls to the same tool apart by order and id", () => {
     const live = foldAgentEvents([
-      { type: "tool-call", toolCallId: "c1", toolName: "read", input: { path: "a" } },
-      { type: "tool-call", toolCallId: "c2", toolName: "read", input: { path: "b" } },
-      { type: "tool-result", toolCallId: "c1", toolName: "read", output: "A" },
+      { type: "tool-call", toolCallId: "c1", toolName: "read", input: { path: "a" }, sessionId: SESSION },
+      { type: "tool-call", toolCallId: "c2", toolName: "read", input: { path: "b" }, sessionId: SESSION },
+      { type: "tool-result", toolCallId: "c1", toolName: "read", output: "A", sessionId: SESSION },
     ]);
     expect(live.tools.map((tool) => tool.toolCallId)).toEqual(["c1", "c2"]);
     expect(live.tools[0]?.output).toBe("A");
@@ -397,7 +408,7 @@ describe("a failed read is not an empty conversation", () => {
   it("shows the live turn even when the read failed", () => {
     // A running turn is the user's work in progress; a failed read must not hide it
     // behind an error panel.
-    const live = foldAgentEvents([{ type: "text-delta", text: "läuft", messageId: "m" }]);
+    const live = foldAgentEvents([{ type: "text-delta", text: "läuft", messageId: "m", sessionId: SESSION }]);
     const model = transcriptModel({ read: failed, live });
     expect(model.live).toBe(true);
     expect(model.entries).toHaveLength(1);
@@ -424,9 +435,9 @@ describe("the fold is a pure reducer", () => {
   it("does not mutate the state it is given", () => {
     // A mutating reducer would make `applyAgentEvent` unusable from
     // `setState(prev => …)`, and the bug would only appear as a stale render.
-    const before: LiveTurn = foldAgentEvents([{ type: "text-delta", text: "a", messageId: "m" }]);
+    const before: LiveTurn = foldAgentEvents([{ type: "text-delta", text: "a", messageId: "m", sessionId: SESSION }]);
     const snapshot = JSON.stringify(before);
-    applyAgentEvent(before, { type: "text-delta", text: "b", messageId: "m" });
+    applyAgentEvent(before, { type: "text-delta", text: "b", messageId: "m", sessionId: SESSION });
     expect(JSON.stringify(before)).toBe(snapshot);
   });
 });

@@ -158,7 +158,39 @@ interface AppendMessageInput {
   updatedAt: string;
 }
 
-/** The `upsertPart` input, spelled out for the same reason. */
+/**
+ * The `upsertPart` input, spelled out for the same reason.
+ *
+ * ## `sessionId` here and `sessionId` on `event` are two names for one fact, and
+ * ## this adapter reads the **event**
+ *
+ * Core's `TurnStore.upsertPart` declares both: `input.sessionId` (the seam's own
+ * argument, threaded from the same `AgentLoopOptions.sessionId` closure as every
+ * other store call) and `input.event.sessionId` (stamped onto the event at the
+ * engine's single emit sink). They are the same value by construction — so
+ * writing either one produces the same row, and choosing one is free.
+ *
+ * It is not free, because **the two can be made to disagree**, and only one of the
+ * two answers is evidence:
+ *
+ * - `input.sessionId` is an *instruction*. Whoever calls `upsertPart` writes it,
+ *   and nothing checks it.
+ * - `input.event.sessionId` is what the event **says**. It is the same string the
+ *   subscriber in `runtime/index.ts` was handed, and the string the part is
+ *   recorded under in the transcript the user reads.
+ *
+ * A part filed under the instruction's session while the event names another one
+ * is a tool card in the wrong conversation: the delta stream, the tool part and
+ * the transcript would disagree, and nothing in the system would say so. So the
+ * event wins. `turn-store.test.ts` builds exactly that divergence and asserts the
+ * row lands under the event's session — which is the test that makes this a
+ * decision rather than a coincidence.
+ *
+ * The `sessionId` field stays in the interface because core's contract has it
+ * (`AGENTS.md` §4 forbids core from pointing at this package, so the shapes cannot
+ * be shared) and because removing it from the store's input would be a breaking
+ * change to a released seam. It is simply not the value this adapter writes.
+ */
 interface UpsertPartInput {
   sessionId: string;
   messageId: string;
@@ -346,7 +378,12 @@ export function createTurnStore(
       await database.upsertPart({
         id: content.partId,
         messageId: input.messageId,
-        sessionId: input.sessionId,
+        // **The event's session, not the argument's.** See the note on
+        // {@link UpsertPartInput}: the two are the same value today, and this is
+        // the line that keeps it that way when they are not. The event is the
+        // evidence — it is what the subscriber was handed — while the argument is
+        // an instruction nobody checked.
+        sessionId: input.event.sessionId,
         type: "tool",
         contentText: content.contentText,
         data,
