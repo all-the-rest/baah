@@ -509,7 +509,29 @@ Zeile legen.**
 - Kleine, thematische Commits; ein Commit = eine logische Änderung.
 - `main` bleibt lauffähig (# = pnpm typecheck && pnpm testgrün).
 - `node_modules/`, `dist/`, Testartefakte sind gitignored — nie committen.
-- Kein `git push` ohne ausdrückliche Anweisung des Nutzers.
+- **Regelmäßig pushen**, nicht am Ende einer Sitzung sammeln. Der Nutzer hat das
+  ausdrücklich so entschieden (2026-10-01), nachdem **15 Commits** und ein **21 Commits
+  großer** Rückstand entstanden waren.
+
+  **Warum das eine Regel und keine Höflichkeit ist:** die CI läuft erst mit dem Push.
+  15 grüne Commits, die niemand gesehen hat, sind **kein** Befund, sondern eine Behauptung
+  — und in dieser Sitzung ist die CI zum ersten Mal überhaupt gelaufen, weil 35 Commits
+  liegen geblieben waren. **Ein grüner lokaler Lauf ohne Push ist ein halber Lauf.**
+
+  **Vor** jedem Push, weil `--frozen-lockfile` in dieser Sitzung schon einmal gescheitert
+  ist (`ERR_PNPM_FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE`):
+
+  ```bash
+  git status --short pnpm-lock.yaml   # muss LEER sein
+  pnpm install --frozen-lockfile      # muss durchlaufen
+  ```
+
+  *Lokal grün sagt nichts:* der Fehler fällt nur dort auf, wo der Lockfile unvollständig
+  ist — lokal war er es nicht, weil die Arbeitskopie die vollständige war.
+
+- ⚠️ **`git push --force` bleibt untersagt**, auch auf einem eigenen Branch. Ein Push, der
+  Commits überschreibt, ist nicht rücknehmbar, und die 15 Commits dieser Sitzung sind
+  genau die Sorte Historie, die nicht verloren gehen darf.
 
 ## 9. Umgang mit Unsicherheit
 

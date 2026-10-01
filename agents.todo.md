@@ -2017,3 +2017,117 @@ Code geschlossen — der Workspace nimmt nur `handle.name`); ob der Grant **jede
 erlischt (Repo-Angabe, zitiert); ob zwei Sessions in einer Datenbank funktionieren (kein
 gemessener Pfad, weil `listSessions` unbenutzt ist); was ein zweiter Tab dem Nutzer zeigt.
 **Keine Tests ausgeführt** — `pnpm check` lief hier nicht.
+
+---
+
+# ÜBERGABE — Stand 2026-10-01, Ende der Arbeitssitzung
+
+**Alles gemessen, nichts behauptet.** Jede Zahl unten ist aus einem Lauf, kein Ziel.
+**Uncommittet bleibt nur die Doku**; `6e041d8` ist der letzte Commit, `origin/main` steht
+auf `340d5f5`, **15 Commits sind nicht gepusht**.
+
+## Gemessener Stand
+
+```text
+pnpm check          rc=0   1966 Unit-Tests in 13 Paketen   0 Typfehler
+pnpm e2e            rc=0   44/44        (Port 4173 vorher bestätigt FREI)
+test:screenshots    rc=0   46/46        118 PNGs, 25 States
+check:browser-only  rc=0   88 Sources · keine Serverform · 5/5 Fähigkeiten
+```
+
+⚠️ **Die Port-Prüfung ist nicht optional.** `reuseExistingServer: !CI` ist lokal wahr, und
+ein übrig gebliebener Server lässt den Build **ganz überspringen**. Ich bin **zweimal**
+hineingelaufen und habe „44/44" gemessen, **ohne dass ein Build stattfand**.
+
+## Was gebaut ist
+
+| Block | Zustand |
+|---|---|
+| Welle 0–1 | erledigt, verifiziert |
+| Welle 2 | läuft durch |
+| Welle 3 — E2E | 44/44, davon 2 als Timing-Bugs behoben |
+| Welle 3 — Screenshot-Harness | 25 States, 118 PNGs, Manifest-matrixgeprüft |
+| Welle 3 — **UI-Verifikation** | **4 von 118 Bildern gelesen. Nicht abgeschlossen.** |
+| Welle 3 — Mobil-Layout (`U1`) | behoben, am Bild verifiziert (0 px → 390 px Spalte) |
+| **PWA** | Manifest, 4 generierte Icons, Service Worker mit Precache — **installierbar und offline** |
+| **Browser-only-Gate** | 7. Gate, zwei Hälften, Selbsttest 39, echte Mutationen |
+| **Projekt-/Konversationsmodell** | Ordner = Projekt, Session = Konversation, Ordnerwechsel wechselt beides |
+
+## Was **nicht** gebaut ist
+
+| Block | Aufwand | Notiz |
+|---|---|---|
+| **W4: `shell`, `git`, `task`/Subagent, `skill`, Service-Worker-Infrastruktur** | hoch | **null gebaut.** `packages/baah-tools/` hat 10 Pakete; `shell`/`git`/`task` existieren nicht. Braucht `just-bash` bzw. `isomorphic-git` → Lockfile-Anfassung. |
+| **Block P: Anthropic-Endpunkte + Modellliste** | hoch | deine Anforderung vom 2026-09-30, **0 gebaut**. Analyse liegt in diesem File. |
+| **Kontrastprüfung (K1–K5)** | mittel | Entwurf steht (§ „Kontrastprüfung"). `ui-review` §11 hat den Entwurf schon — **übernehmen, nicht erfinden.** Ein Zustand fehlt: `searchTruncated` existiert nicht im Satz. |
+| **Transcript-Export** (`Plan.md` §17.6 Block 4) | mittel | `createTranscriptReader` existiert. **Voraussetzung** dafür, dass ein Browser-Speicher je eine Wahrheitsquelle sein darf. |
+| **Zwei-Schichten-Ablage** (`Plan.md` §17.3) | hoch | das eigentliche Zielbau |
+| **`parts.session_id`** (`Plan.md` §20) | **gefährlich** | **kein Refactor, sondern offene Frage** — die Spalte ist tragend. |
+| **`chat-question` überlappt die Statusleiste um 16 px** | mittel | bei **390 und 1280** identisch, viewport-unabhängig. Jetzt behoben werden **darf** — der parallele Agent ist durch. |
+| **W-Liste aufräumen** | niedrig | **114 offene Punkte**, viele erledigt ohne Abhaken. Die Liste ist als Arbeitsauftrag **nicht mehr benutzbar**. |
+
+## Gates, die **kein** Quelltext-Gate schließen kann
+
+1. **Die Ordner-Interaktion ist nie in einem Browser gelaufen.** Kein `showDirectoryPicker`,
+   kein echtes `createWritable`, kein Beweis, dass eine Freigabe einen Kaltstart übersteht.
+   Betrifft **B3** und das Projektmodell — das größte offene Gate.
+2. Ob `beforeinstallprompt` feuert, ob `display: standalone` greift, ob der Start-URL-Scope
+   auflöst — auf einem echten Gerät.
+3. „Website-Daten löschen", Deinstallation, Gerätewechsel: **was überlebt, ist nicht
+   gemessen.** Gemessen sind nur die Speicherorte.
+4. `storage.persist()` in einem echten Browser.
+5. Ein zweiter Tab gegen `opfs-sahpool` — der Code markiert das selbst als `UNVERIFIED`.
+6. Ob `.baah/project.json` einen **Rechnerwechsel** übersteht: eine Aussage über das
+   Dateisystem, nicht über diesen Code.
+
+## Meine eigenen Fehler aus dieser Sitzung — **nicht wiederholen**
+
+| # | Fehler | War es ein Fehler |
+|---|---|---|
+| 1 | „Wurzel-Nachrichten-ID identifiziert die Konversation" — als **Nutzeraussage** formuliert | **falsch**, von einem Analyse-Agenten widerlegt. Ich hatte aus zwei richtigen Aussagen eine falsche Schlussfolgerung gemacht. |
+| 2 | Grep nach `AND session_id`, die Abfrage sagt `AND p.session_id` | **falsch** — nicht „nichts gefunden", sondern **das Falsche gefunden**, und das ergibt eine Zahl |
+| 3 | `build-sw.mjs` löste gegen `process.cwd()` auf | brach `pnpm --filter … build` |
+| 4 | `build-sw.mjs` mit **positionalem** Argument | ließ `pnpm e2e` gar nicht starten |
+| 5 | `void askForPersistence()` | vom **eigenen** `no-bare-void`-Gate gefangen |
+| 6 | `KNOWN_UNSATISFIED` geleert, Tests stehen gelassen | Tests waren an **Live-Daten** gekoppelt |
+| 7 | `EXPECTED_TITLE` nicht mit `<title>` mitgezogen | Wächter verglich seit zwei Commits ins Leere |
+| 8 | `make-icons.mjs` meldete `favicon.svg`, ohne es aufzurufen | Meldung ohne Tat |
+| 9 | Endlosschleifen-Sampler ⇒ `wait` hängt ⇒ Timeout | Messgerät, das aussieht wie eine Messung |
+| 10 | `grep -c` beendet sich mit 1 bei null Treffern ⇒ `&&`-Kette brach | Verifikation lief nie |
+| 11 | „`queryPermission`: 0 Treffer" | **14 Treffer** — die Schlussfolgerung trug, die Zahl nicht |
+| 12 | **zweimal** „44/44" mit übernommenem Server gemessen | **H2**, selbst dokumentiert, selbst hineingelaufen |
+| 13 | `no-foreign-error-text` u. a. Gates blind für **String-Inhalte** | Gate **vollständig blind** für `node:fs` — hätte sich als Deckung ausgewiesen |
+
+**Muster:** dreimal eine Vermutung als Tatsache ausgegeben; zweimal eine Zahl
+übernommen, die falsch war; einmal ein Werkzeug benutzt, das aussah wie eine Messung und
+keine war. **Und neunmal hat es ein Gate, ein Subagent oder ein Nachmessen gefangen** —
+nicht ich.
+
+## Reihenfolge, wenn es weitergeht
+
+1. **Push** — 15 Commits liegen lokal, `origin/main` ist 21 Commits zurück.
+2. **Offene Gates abarbeiten**, vor allem Gate 1: ein Browserlauf gegen die gebaute App,
+   Ordner öffnen, Reload, prüfen.
+3. **`chat-question` 16 px** (klein, sichtbar, jetzt fällig) und **`U9`** (ein Klick im
+   Manifest).
+4. **Die restlichen 114 Bilder lesen.** `chat-question` hat stundenlang im Satz gelegen.
+5. **W-Liste aufräumen** — abhaken, was erledigt ist, Zahlen korrigieren.
+6. **W4** (`shell`, `git`, `task`) — der größte offene Umfang.
+7. **Block P** — deine Anforderung: Anthropic-förmige Endpunkte + Modellliste von beiden.
+
+## Was ich einem Nachfolger mitgeben möchte
+
+> **Ein Breitenwert von 0 und ein umgebrochenes Wort pro Zeile sind dieselbe Ursache, aber
+> nicht derselbe Schweregrad.** Wer eine Layout-Messung in Prosa übersetzt, verliert die
+> Schwere, weil die Zahl nüchtern aussieht.
+
+> **Ein Gate, das nur verbietet, ist halb ein Gate.** Löscht man die Persistenz, läuft es
+> grün durch, weil nichts Verbotenes importiert wurde. Die zweite Hälfte — „diese
+> Fähigkeiten müssen benutzt werden" — ist die, die die Anforderung trägt.
+
+> **Ein Komponenten-Peak sagt nichts darüber, ob eine Grenze überschritten wird.** Chromium
+> 1189 → 657 MB gemessen, und es kauft auf diesem Host **keinen** KB Luft: 99,999 % gegen
+> 99,93 % von 5120 MB.
+
+> **Ein Gate, das bei *Abwesenheit* lügt, wird genauso ignoriert wie eines, das bei
+> *Verstößen* lügt** — es fällt nur nicht auf, weil nichts rot wird.

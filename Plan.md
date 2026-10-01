@@ -2339,3 +2339,52 @@ Fehler, der erst beim Suchen auffällt.
 > **Beim Refactor ist die gefährlichste Spalte nicht die unbenutzte, sondern die, die
 > aussieht wie eine.** Sie hat einen Index, sie hat Tests, sie hat eine Query — nur eben
 > keine, die man beim ersten Grep sieht.
+
+---
+
+## 21. Auflösung der offenen Frage aus §19.5, und der Stand des Modells
+
+Ergänzt am 2026-10-01. §19.5 hatte die „leere Session" als **Entscheidung für den
+Nutzer** offengelassen. Sie ist es nicht, und sie war **zwei Zeilen** — gemessen, bevor
+gebaut wurde, auf **beiden** Backends:
+
+```text
+createSession({ id, title: "" })   →  readTranscript: messages 0, truncated false, limit 50
+appendMessage(erste Nachricht)     →  [["m1", 0]]          seq startet bei 0
+listSessions()                     →  sieht die Session ohne jede Nachricht
+```
+
+**Der Grund, warum es kostenlos ist:** `messages.session_id` kommt bei **jedem**
+Schreibvorgang aus der Engine-Option, **nie aus der Nachricht**. Es gibt also keinen
+Bindungsschritt, den man bräuchte. §19.5s Sorge folgte aus der falschen Lesart aus §18.1
+und war **unbegründet**.
+
+### Und der Block, der die Frage überhaupt gestellt hat
+
+| | |
+|---|---|
+| Projektidentität | `<ordner>/.baah/project.json`, `id` ist **required**, `` `local:${name}` `` ist **weg** |
+| Zwei Ordner | zwei Projekte, **auch bei gleichem Namen**; Konversationen wandern nicht |
+| `workspaces` | war eine **leere** Tabelle (0 INSERTs im ganzen Repo), jetzt sechs Operationen |
+| `sessions.workspace_id` | Migration 5, `ON DELETE SET NULL`, Index; jetzt **gesetzt** |
+| Ordnerwechsel | wechselt Session **und** liest das Transcript neu — der sichtbare Fehler ist behoben |
+| Fremde Marker-Datei | **nie überschrieben**, gemeldet, Projekt als `unstable` markiert |
+
+### Was ausdrücklich **nicht** getan wurde, und warum
+
+- **`switchProject` gibt eine neue `AppRuntime` zurück**, weil `runtime/index.ts` eine
+  `sessionId` in einer Closure hält. Der Datenbank-**Zustand** wird geteilt, nicht die
+  Runtime. Akzeptiert: ein anderes Projekt **ist** eine andere Konversation, und ein
+  Remount kostet UI-Zustand, der zu diesem Workspace gehört.
+- **Der Legacy-Read (`baah.session.v1`) bleibt vor dem Early-Return.** Ihm wurde
+  vorgeschlagen, ihn hinter den Return zu ziehen: das kauft **einen** Read eines meist
+  nicht vorhandenen Schlüssels und **verändert**, wie oft eine **wahre** Warnung
+  erscheint — ein vor-Projekt-Gespräch kann unerreichbar sein, und das muss gesagt werden,
+  solange es nicht ausgeschlossen ist. **Eine Verhaltensänderung im Kostüm eines
+  Aufräumens ist kein Aufräumen.**
+
+### Und die Frage, die jetzt offen ist — aber **anders** als §18.5
+
+`parts.session_id` ist **kein** Refactor-Ziel (§20). Sie ist tragend:
+`searchSql(bySession)` filtert darauf, und `idx_parts_session_seq` ist dafür gebaut. Die
+drei möglichen Richtungen stehen in §20 — und **keine** davon ist umgesetzt.
