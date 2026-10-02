@@ -977,7 +977,7 @@ Nicht geraten, sondern **gemessen** — Preflight und Response-Header (§14.4):
 | **Groq**, **xAI**, **Mistral**, **Cerebras**, **Together**, **DeepSeek** | ✅ | ✅ `*` | ✅ ja |
 | **Vercel AI Gateway** | ✅ | ✅ `*` | ✅ ja (siehe Vorbehalt) |
 | **OpenCode Zen** | ❌ | ❌ kein ACAO | ⛔ **nicht möglich** |
-| **models.dev** (Modellkatalog) | — | — | ✅ ja |
+| ~~**models.dev** (Modellkatalog)~~ | — | — | **gestrichen 2026-10-02** — nicht eingezogen; `/v1/models` des jeweiligen Anbieters liefert die Liste, und das ist der einzige Endpunkt mit ACAO (§14.4) |
 | Beliebige OpenAI-kompatible `baseURL` | betreiberabhängig | — | ❓ **zur Laufzeit prüfen** |
 
 **OpenAI ist der Sonderfall — und ich hatte das zuerst zu optimistisch
@@ -1102,7 +1102,7 @@ Ein Subagent bekommt **nur** den relevanten `Plan.md`-Ausschnitt plus
 | 5 | `grep`/`glob` ohne natives ripgrep: welche Perf bei ≥10k Dateien? | ⏳ C — Sucharchitektur offen |
 | 6 | Wie weit trägt ein WASM-Node/WebContainer als Shell-Ersatz? | ⏳ C |
 | 7 | Exakter Tool-Katalog + Loop-Semantik des Vorbilds | ⏳ A |
-| 8 | Modellkatalog-Quelle und Preis-Anzeige (`@opencode-ai/models`?) | ✅ `@opencode-ai/models` (models.dev, CORS `*`, Offline-Snapshot) (§14.4) |
+| 8 | Modellkatalog-Quelle und Preis-Anzeige (`@opencode-ai/models`?) | ✅ **`/v1/models`** statt `@opencode-ai/models` — die Bundle-Quelle ist gestrichen, der einzige CORS-erlaubte Endpunkt liefert die Liste (§14.4, korrigiert 2026-10-02) |
 | 9 | Multi-Tab: ein Writer via `navigator.locks` reicht das, oder braucht es `wa-sqlite OPFSCoopSyncVFS`? | ⏳ Phase 1 |
 | 10 | Wie erkennt die App „dieser Workspace ist zu groß für einen Walk"? (Byte-/Datei-Budget) | ⏳ Phase 2 |
 
@@ -1312,14 +1312,47 @@ Ablehnung als `tool-output-denied`. **Aber:** ohne Server gibt es keinen
 Signierer — `experimental_toolApprovalSecret` ist bedeutungslos. HITL ist hier
 eine UX-Leitplanke, keine Sicherheitskontrolle.
 
-**Modellkatalog:** `@opencode-ai/models` (models.dev) — `Models.make({ baseUrl })`
-mit `.providers()` / `.models()` / `.catalog()`, plus ein Offline-Snapshot unter
-`@opencode-ai/models/snapshot` (≤ ~24 h alt). CORS `*` ist gemessen. Das SDK
-selbst kann **keine** Modelle auflisten — es gibt nur `model(id)`-Fabriken.
+**Modellkatalog:** `@opencode-ai/models` (models.dev) — **als Quelle gestrichen, 2026-10-02.**
 
-**Keine offiziellen Chat-Komponenten.** Alles über `message.parts` selbst
-rendern (daisyUI hat passende `chat`/`chat-bubble`-Klassen). `@ai-sdk/rsc` ist
-RSC-only und wird **nicht** verwendet.
+> ⚠️ **Die Begründung dieses Absatzes war falsch, und sie hat eine Behauptung über das SDK
+> erzeugt, die es nicht gibt.** Korrigiert nach Block P (`1803ec4`).
+
+**Was wirklich gilt — und nur das:**
+
+- **Der SDK kann Modelle *nicht* auflisten.** Es gibt `model(id)`-Fabriken, und sonst nichts.
+  **Das ist richtig** und bleibt.
+- **Aber es stand als Begründung für etwas anderes.** Der Satz las sich als *„deshalb
+  brauchen wir models.dev"*. **Es braucht ihn nicht**, und die Notiz in `agents.todo.md`
+  benennt die Folge: die halbwahre Behauptung hat dazu geführt, dass der Wizard **frei tippen
+  ließ** — der E2E-Test dafür hieß *„the wizard says no model catalogue is wired, rather than
+  inventing one"*.
+
+**Was gebaut ist:** `/v1/models`, mit injiziertem `fetch` (`packages/baah-web/src/providers/models.ts`).
+Drei Antwortformen — OpenAI (`{data:[{id,…}]}`), Anthropic (`{data:[{id,display_name,…}],
+has_more, first_id, last_id}`), Google (`{models:[…], nextPageToken}`) — **vollständig
+paginiert und dabei ehrlich**: `complete: false` plus `incompleteReason` bei einem Cap oder
+einem Cursor, der nicht weiterkommt. `display_name` hat Vorrang vor `id`.
+
+**Warum `/v1/models` und nicht der Snapshot** — und das ist **gemessen**, nicht geschätzt
+(§9, `Plan.md:986-990`):
+
+```
+GET  /v1/models             → 401 + access-control-allow-origin: *
+POST /v1/chat/completions   → 401 + (kein ACAO)
+POST /v1/responses          → 401 + (kein ACAO)
+```
+
+`/v1/models` ist der **einzige** Endpunkt, den OpenAI im Browser erlaubt, und er trägt ACAO
+**auch auf dem Fehlerpfad**. Der 6,35-MB-Snapshot (nur per dynamischem `import()` ladbar,
+sonst dominiert er den Bundle) löst also ein Problem, das keines ist — **und ein zweiter
+Katalog wäre eine zweite Wahrheit über dieselbe Sache.**
+
+> **Anthropic paginiert, und das war der Grund für die Regel.** Ein Loader, der nur `data[].id`
+> liest, funktioniert für OpenAI und ist für Anthropic **halb** richtig: ohne `display_name`
+> zeigt der Wizard einem Menschen `claude-haiku-4-5-20251001` statt eines Namens, und
+> `has_more: true` heißt, dass die erste Seite **keine vollständige Liste** ist. **Eine
+> unvollständige Modellliste, die als vollständige dargestellt wird, ist dieselbe Lüge wie die
+> gekappte `grep`-Suche** — nur teurer, weil der Nutzer danach ein Modell wählt, das fehlt.
 
 **Keine offiziellen Chat-Komponenten.** Alles über `message.parts` selbst
 rendern (daisyUI hat passende `chat`/`chat-bubble`-Klassen). `@ai-sdk/rsc` ist
@@ -1507,7 +1540,7 @@ mehrere Punkte ergänzt, die sonst später Zeit gekostet hätten:
 
 | Fund | Konsequenz |
 |---|---|
-| `@opencode-ai/models/snapshot` ist **6,35 MB** statisches ESM | Nur per dynamischem `import()` laden, sonst dominiert es den Bundle. |
+| ~~`@opencode-ai/models/snapshot` ist 6,35 MB statisches ESM~~ | **Überholt 2026-10-02:** die Frage ist erledigt, weil die Dependency **nicht eingezogen** wurde. `/v1/models` ist der einzige Endpunkt mit ACAO und liefert dieselbe Liste ohne Bundle. Die damalige Notiz („nur per dynamischem `import()`") wäre eine **dauerhafte Ausnahme für ein Problem** gewesen, das es nicht gab. |
 | `@ai-sdk/code-mode` ist **Node-only** („not available in browser or edge runtimes") | Unser Code-Mode-Tool ist damit ein Eigenbau — oder gestrichen. |
 | `@ai-sdk/mcp` Haupt-Entry ist browser-safe, **`/mcp-stdio` nicht** | Für die spätere MCP-Phase: nur HTTP/SSE importieren. |
 | **Subagenten haben laut Doku keine Tool-Approvals** | Unser Permission-Modell darf sich nicht darauf verlassen, dass ein Subagent nachfragen kann — die Policy muss **vor** dem Start greifen. |
