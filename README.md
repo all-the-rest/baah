@@ -1,13 +1,89 @@
 # baah — Browser as a Harness
 
+> # 🗄️ Eingestellt am 2026-10-02
+>
+> **Dieses Repo ist archiviert und bleibt so. Es wird nicht weiterentwickelt.**
+>
+> **Der Grund ist eine Anforderung, die die Projektdefinition ausschließt.**
+>
+> Gewollt war: Rust-Projekte mit **echten Dateien und echten Compilern auf der
+> Platte** bearbeiten — `cargo`, `rustc`, `npm install`, Tests ausführen. Das
+> bedeutet: einen nativen Prozess starten, Dateien auf der Festplatte anlegen,
+> Binaries ausführen.
+>
+> **Browser können das nicht.** Nicht „noch nicht implementiert" — **physisch
+> nicht.** Ein Tab läuft in einer Sandbox ohne Syscall-Zugang zum Betriebssystem:
+> kein `fork`, kein Subprozess, kein Ausführen eines Binarys. Der Browser hat
+> keinen Weg, das `rustc` auf deiner Festplatte zu starten, und `AGENTS.md` §2
+> verbietet genau den Server, der es möglich machen würde.
+>
+> **Und die Bedingung, an der das Projekt gescheitert ist, war von Anfang an
+> gesetzt:** „Ein Agent-Loop **inklusive Shell**". Sie ist erfüllbar —
+> `just-bash` ist Apache-2.0 und braucht keine Header. Aber sie ist mit
+> „Compilern auf der Platte" **nicht** erfüllbar, und die zweite Anforderung hat
+> Vorrang.
+>
+> ### Was der Stand trotzdem ist
+>
+> Der Code ist **vollständig, grün und benutzbar** — er wurde nur nie dem
+> entscheidenden Test unterzogen, dem Test *gegen das Ziel*:
+>
+> ```
+> pnpm check          rc=0   2010 Unit-Tests, 0 Typfehler
+> pnpm e2e            rc=0   63/63 Playwright
+> pnpm build          rc=0
+> check:browser-only  rc=0   5/5 Browser-Fähigkeiten
+> ```
+>
+> 10 Tool-Pakete (`read` · `write` · `edit` · `list` · `glob` · `grep` · `patch` ·
+> `todo` · `question` · `webfetch`), SQLite-WASM-Persistenz in OPFS, installierbare
+> PWA mit Service Worker, echter Multi-Provider-Support inkl. Anthropic-Dialekt und
+> Modelliste. **„Kommandos ausführt" in der Beschreibung unten ist übrigens die
+> eine Behauptung, die nicht eingelöst wurde** — `shell`, `git`, `task` und
+> `skill` sind als offene Punkte in [`agents.todo.md`](agents.todo.md) verzeichnet,
+> und genau daran ist das Projekt gescheitert.
+>
+> ### Was die Recherche kostenlos geklärt hat
+>
+> [`Plan.md`](Plan.md) §14.5 ist **abgeschlossen** und beantwortet die Frage, an
+> der das Projekt endete — mit Messungen statt Vermutungen:
+>
+> | Fähigkeit | Im Browser? | Paket |
+> |---|---|---|
+> | Bash-Interpreter | ✅ **ohne Header** | `just-bash` (Apache-2.0) |
+> | `git` serverfrei | ✅ | `isomorphic-git` (braucht Binär-I/O) |
+> | `npm install` / `node` | ⚠️ nur WebContainers | MIT, **kommerziell kostenpflichtig**, COOP/COEP, **nicht offline** |
+> | **Playwright** | ❌ **physisch unmöglich** | braucht einen Browser-Binary als Subprozess |
+> | **Compiler auf der Platte** | ❌ **physisch unmöglich** | dasselbe |
+>
+> **Der Kernbefund:** Die Frage war nie „läuft es?", sondern „welche Lizenz- und
+> Header-Zahlung trägst du?" — und **Playwright sowie alles Compiler-artige sind
+> keine Frage der Lizenz**, sondern der Plattform. Ein Test-Runner, der keinen
+> Browser starten kann, ist kein Test-Runner.
+>
+> ### Warum kein Archivieren im Warehouse, sondern `ARCHIVED`?
+>
+> Das Repo bleibt vollständig: **77 Commits**, Spec, Messungen und die Liste aller
+> Fehler, die wir unterwegs gefunden haben — inklusive der Beweise dafür, dass man
+> ihnen nicht trauen darf. [`agents.todo.md`](agents.todo.md) ist dabei das
+> nützlichste Dokument im Repo: es zählt **13 Verifikationsbefunde** auf, von denen
+> mehrere Behauptungen in Kommentaren als **gemessen** auswiesen, was **falsch**
+> war.
+>
+> Nimm es als Ausgangspunkt, nicht als Endpunkt.
+
+---
+
+## Was dieses Projekt war
+
 Eine **Coding-Harness, die vollständig im Browser läuft.** Kein Server, kein
 Proxy, keine Installation: URL öffnen, Projektordner verbinden, API-Key
 hinterlegen — und man hat einen Agenten, der Dateien liest, schreibt und sucht,
 Kommandos ausführt, Subagenten startet und den Verlauf über Reloads hinweg
 behält.
 
-> **Status:** Fundament + Recherche abgeschlossen, Umsetzung läuft.
-> Siehe [`Plan.md`](Plan.md) für Architektur, Roadmap und die belegte Recherche.
+> **Status:** **Eingestellt 2026-10-02** — vollständig gebaut und grün, aber gegen
+> die Anforderung „Compiler auf der Platte" nicht erfüllbar. Siehe oben.
 
 ---
 

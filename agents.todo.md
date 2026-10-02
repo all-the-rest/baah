@@ -1,5 +1,30 @@
 # agents.todo.md — offene Punkte für `baah`
 
+> # 🗄️ Projekt eingestellt, 2026-10-02
+>
+> **Dieses Repo ist archiviert. Die Liste bleibt als Dokumentation stehen, nicht als
+> Arbeitsauftrag.**
+>
+> **Der Grund:** Gewollt war, Rust-Projekte mit **echten Dateien und echten
+> Compilern auf der Platte** zu bearbeiten. Das braucht einen nativen Prozess, und
+> **Browser können keinen starten** — ein Tab läuft in einer Sandbox ohne
+> Syscall-Zugang zum Betriebssystem. Kein `fork`, kein Subprozess, kein
+> Ausführen eines Binarys.
+>
+> **Die Bedingung, an der es gescheitert ist, stand hier von Anfang an:** die
+> Welle-4-Liste unten (`shell`, `git`, `task`, `skill`) war nicht umsetzbar, und
+> `shell` stand dort als **„🔒 Phase 4"** markiert — als wäre es eine Frage des
+> Aufwands. **Es war eine Frage der Plattform, und das steht jetzt im README.**
+>
+> ⚠️ **Ich habe diese Grenze zu spät erkannt.** `Plan.md` §14.5 hatte sie bereits
+> **abgeschlossen** und gemessen beantwortet — ich habe die Datei erst gelesen,
+> nachdem der Nutzer nach der Shell gefragt hatte, und bis dahin „Browser-only" als
+> **geprüfte Randbedingung** behandelt statt als **unverhandelbare Grenze, die
+> die Produktidee selbst definiert**. Das war der teuerste Fehler dieser Sitzung,
+> und er war keiner der Agenten: **die Antwort stand die ganze Zeit im Spec.**
+
+# agents.todo.md — offene Punkte für `baah`
+
 **So wird diese Datei benutzt**
 
 - Jeder Punkt ist **konkret**: wo, was, und **woran** erkennbar ist, dass er fertig
