@@ -245,6 +245,86 @@ konsumieren. Block A fixt es.
 - [x] **Streaming-Hinweis**, wenn Antworten am Stück ankommen — der `data-baah-inflight`-Marker;
       der eigene Screenshot-State `chat-streaming` hält ihn mit dem Pacer offen.
 
+## Welle A — Verify: 13 Befunde, davon **sechs falsche Behauptungen im neuen Code**
+
+Build-Agent, dann **eigene** Verify-Session (§7.2), dann Fix-Agent. Alle drei Gates grün,
+**CI auf `932b52e` grün.**
+
+**Die Behebung hält.** Unabhängig nachgemessen: Transcript 24 → 145 px (Desktop) / 127 px
+(Mobil), Statusleiste sichtbar, Hit-Test trifft das Badge, Desktop im Leerlauf unverändert.
+
+### Zwei Befunde, die **vor** dem Commit gefixt werden mussten
+
+**Finding 2 — die Config behauptet das Gegenteil über die CI.** Sie sagte, CIs `quality`-Job
+laufe **vor** `e2e`, „also kann ein Typfehler in CI gar keinen Playwright-Lauf erreichen".
+`.github/workflows/ci.yml` hat **kein `needs:`** auf `e2e` — der Job sagt es selbst im
+Kommentar. Die Jobs laufen **nebeneinander**. Jetzt steht das Richtige dort: ein Typfehler kann
+die **Pipeline** nicht grün machen (das `ci`-Aggregat braucht `quality`), **erreicht aber**
+einen Playwright-Lauf.
+
+→ **Vierte Instanz derselben Fehlerklasse in dieser Datei:** ein Kommentar, der das Gegenteil
+des Codes behauptet — diesmal in einem Kommentar, der die **Fehlerbehebung** beschreibt.
+
+**Finding 3 — eine unerklärte Verhaltensänderung.** pnpm hängt Argumente ans **Ende** der
+Script-Kette, also erreichte `--mode e2e` nie das `vite build`:
+
+```
+pnpm build             → e2e.invalid: 0 Treffer   1263676 B   (Produktion)
+pnpm build --mode e2e  → e2e.invalid: 0 Treffer   1263676 B   (identisch)
+vite build --mode e2e  → e2e.invalid: 1 Treffer   1263698 B   (22 B, die Seam-Zeichen)
+```
+
+Die E2E-Suite lief bisher gegen einen **Produktions**-Bundle und läuft jetzt gegen einen
+**e2e**-Bundle. Entscheidung: der e2e-Modus **ist** das Artefakt unter Test; das alte war ein
+Unfall der Argumentweitergabe. Als Verhaltensänderung benannt, nicht stillschweigend.
+
+### Finding 1 — eine Klasse, die einen echten Defekt bewacht, ohne dass jemand zusieht
+
+`min-h-[10rem]` auf der Karte: **alle** Spec-Tests bleiben ohne sie grün. Bei **844×390**
+(querformatiges Telefon — genau der Viewport, den der Kommentar als Grund nennt) misst der
+Verify-Agent:
+
+| | mit der Klasse | ohne sie |
+|---|---|---|
+| Karten-`clientHeight` | 156 | **24** |
+| „Antworten" in der Karte | true | **false** |
+| `elementFromPoint` auf „Antworten" | `button` | **`form[baah-composer]`** |
+
+**Der Antwortknopf liegt unter dem Composer** — ein Klick dort antwortet nichts. Der Kommentar
+nennt den Viewport und misst ihn nicht. Jetzt gibt es einen Test bei 844×390, und er ist
+**rot gesehen** worden.
+
+### Und vier Behauptungen, die schlicht falsch waren
+
+| Behauptung | Gemessen |
+|---|---|
+| „ohne die Kappung stirbt nichts" bzw. „3 von 5 mit jedem einzeln" | einzeln **0 bzw. 1**; **3** nur im **Paar**. Und die Kappung ist tragend — in der **anderen** Richtung: ohne sie frisst die Karte den Transcript (300 → 230 px bei 768×1024). Ein **neuer** Test bei 768×1024 tötet sie jetzt. |
+| „nur der Hit-Test sieht es, eine Box-Prüfung nicht" | **falsch** — vor dem Fix ist die Überlappung real **24 px** an beiden Viewports, eine reine Box-Prüfung **schlägt fehl**. Der Hit-Test bleibt, weil er erfasst, was Arithmetik nicht kann. |
+| „Karte 531 px", „desktop 9 px", „360 px bei 1280×800" | **547 px**, **24 px**, **356 px** — und 360 war `max-height`, also **die Konstante unter Test, als Messung zitiert**. |
+| `shrink-0` auf der Statusleiste: „der Browser würgte sie zuerst" | Eine Flexbox-**Auto-Minimumhöhe** setzt sie bereits auf 41 px; die Klasse ist **nachweislich inert**. Behalten, als Tiefenschutz benannt, der heute nichts misst. |
+
+→ **„360 px" ist derselbe Fehler wie ein Test, der seine Erwartung aus der Konstante liest:**
+eine Zahl, die aussieht wie eine Messung und eine Kopie der Implementierung ist.
+
+### Ein Fehler, den der Fix-Agent **selbst** gemeldet hat
+
+Beim Mutations-Harness hat er `git checkout -- ChatView.tsx` ausgeführt und dabei die
+`shrink-0`-Änderung des Build-Agenten verworfen. **Er hat es sofort gemerkt, wiederhergestellt
+und die eigene Korrektur obendrauf gelegt.** Genau die Offenlegung, die eine Regel wert ist —
+und der Grund, warum §7.2a Commits über explizite Pfade verlangt: **ein Fehler, der eine
+Stufe zurückwirft, ist von außen unsichtbar.**
+
+### ⚠️ Offen aus der Verifikation
+
+- **Touch-Scroll ungeprüft.** Der „mobile"-Viewport ist `devices["Desktop Chrome"]` +
+  `setViewportSize` — **kein** `isMobile`, **kein** `hasTouch`, **kein** `deviceScaleFactor: 2`.
+  „Für einen Nutzer erreichbar" ist damit nur für ein **Mausrad** bewiesen.
+- **Die „unlesbare Fragekarte" wird von keinem Test gerendert** — ihre drei neuen Klassen sind
+  `green but uncovered` **ohne** erreichbaren Fehlerfall heute.
+- **Ein echtes Gerät / installierte PWA** — von hier nicht prüfbar.
+
+---
+
 ## Welle 3 — E2E und Verifikation im Browser
 
 - [x] ~~**GitHub Actions** (Quality + E2E auf jedem Push)~~ — **erledigt, und am 01.10. zum
@@ -300,6 +380,10 @@ Vom Nutzer gefordert. Zwei Punkte, die **ein** Block sind, weil 3 an 1 hängt.
 
 ### Was heute fehlt — und es ist nicht „ein Vendor"
 
+> **Stand 01.10.: erledigt.** `ProviderDialect` (4 Drahtformen) und `ProviderOperator`
+> (wer den Endpunkt betreibt) sind gebaut, `anthropic-compatible:<label>` existiert, und
+> der Wizard kann die ID erzeugen. Die Beschreibung unten ist der **Ausgangszustand**.
+
 `ProviderVendor` hat genau **einen** erweiterbaren Schlitz:
 
 ```ts
@@ -318,17 +402,22 @@ Anthropic-förmiger Dienst auf eigener `baseURL` lässt sich heute **nur** als
 User sieht, sondern ein stilles Scheitern. **Eine Anforderung, die man mit dem vorhandenen
 `baseUrl`-Feld „löst", wäre schlimmer als gar keine — sie sieht gelöst aus.**
 
-- [ ] **P1 — zweiter erweiterbarer *Dialekt*, nicht ein zweiter Vendor.**
-      `anthropic-compatible:<label>` mit eigener `baseUrl` und **eigenem** Fabrikslot.
-      `ProviderVendor` wird **nicht** länger, sondern **Dialekt + Name** — die Form, die
-      zwei Dialekte trägt statt sie zu zählen.
-
-- [ ] **P2 — Required-Header an den *Dialekt*, nicht an `=== "anthropic"`.**
-      Heute: `if (vendor === "anthropic") return { "anthropic-dangerous-…": "true" }`.
-      Für die Erstpartei korrekt; für `anthropic-compatible:<label>` wäre der Header
-      **wirkungslos** — und schlimmer: er ginge an einen **fremden** Dienst und wäre eine
-      Behauptung über dessen Sicherheitsmodell, die nicht stimmt.
-      **Mit Test, der beweist, dass ein `anthropic-compatible`-Eintrag ihn NICHT bekommt.**
+- [x] **P1 — zweiter erweiterbarer *Dialekt*, nicht ein zweiter Vendor.** ✅ `registry.ts:78`
+      `ProviderDialect` (4 Drahtformen), `registry.ts:335` `resolveVendor()` — **eine**
+      Funktion, die eine Vendor-ID in Dialekt / Betreiber / Vorlage / Label zerlegt.
+      `anthropic-compatible:<label>` → Dialekt `messages`, Betreiber `third-party`.
+      ⚠️ **Meine Messung war unvollständig:** ich schrieb, `anthropic-compatible:my-proxy`
+      „parst bereits sauber". Das stimmt — aber `vendorId()` in `onboarding.ts` hängte ein
+      Label **nur** an das Literal `"openai-compatible"` an, der Wizard konnte also **keine
+      benutzbare ID erzeugen**. Der Agent hat `needsEndpoint` statt einer zweiten
+      String-Liste benutzt, wodurch die neue Zeile **konstruktiv** abgedeckt ist.
+- [x] **P2 — Required-Header an den *Betreiber*, nicht an den Dialekt.** ✅ `ProviderOperator`
+      (`registry.ts:150`) — **wer** den Endpunkt betreibt. Nicht der Dialekt (beide Zeilen
+      sprechen `messages`), nicht das Label. ⚠️ **Mein Auftragstitel war falsch** („Header am
+      *Dialekt*") — der Header gehört keinem der beiden, und die Verifikation hat belegt, dass
+      er am **Betreiber** hängt: `anthropic-compatible:anthropic` (ein Label, das *behauptet*,
+      Anthropic zu sein) bekommt ihn **nicht**. Test auf **der Leitung**, nicht nur in der
+      Einheit — `Headers.get() === null` **und** der Key-Listen-Check.
 
 ### Modellliste — und `Plan.md` hat hier schon einmal gelogen
 
@@ -352,7 +441,16 @@ ist damit nicht nur sinnvoll, sie ist die Lösung **ohne** das 6,35-MB-Bundle
 (`@opencode-ai/models/snapshot`, das laut `Plan.md:1510` nur per dynamischem `import()`
 ladbar ist und sonst den Bundle dominiert).
 
-- [ ] **P3 — Modellliste über einen injizierten `fetch`, beide Antwortformen korrekt.**
+- [x] **P3 — Modellliste über einen injizierten `fetch`, beide Antwortformen korrekt.** ✅
+      `providers/models.ts`. **Vollständig paginiert *und* gemeldet**: `complete: false` +
+      `incompleteReason` bei Cap oder einem Cursor, der nicht weiterkommt.
+      **Der Anthropic-Cursor wird wörtlich in der Request-URL geprüft** — ein Loader, der Seite 1
+      nochmal anfragt, terminiert am Cap und meldet dann eine Liste, die vollständig aussieht.
+      ⚠️ **Google ist eine dritte Form**, die in meinem Auftrag nicht stand. Der Agent hat sie
+      hinzugefügt, weil ein Loader, der für eine Katalogzeile „0 Modelle" meldet, genau die Lüge
+      wäre, gegen die P3 steht. Begründung trägt.
+      → **Und hier war die Liste falsch:** sie verlangte „vollständig paginieren **oder** ehrlich
+      als unvollständig markieren". Gebaut ist **beides**.
       Offener Pfad, zwei Formen:
       - **OpenAI**: `{ data: [{ id, … }] }`
       - **Anthropic**: `{ data: [{ id, display_name, … }], has_more, first_id, last_id }`
@@ -408,9 +506,98 @@ ist weg.
 
 ### Aus dem CI-Lauf, gehört hierher
 
-- [ ] **`@opencode-ai/models` als Quelle streichen oder als Fallback begründen.** Die
-      Begründung in §14.4 ist **falsch**; die Korrektur gehört an dieselbe Stelle, und die
-      Frage *„behalten wir es als Fallback für Endpunkte ohne `/v1/models`?"* ist offen.
+- [x] ~~**`@opencode-ai/models` als Quelle streichen oder als Fallback begründen.**~~
+      **BEANTWORTET: streichen.** Block P liest `/v1/models` — von der Quelle injiziert
+      (`providers/models.ts`), **ohne** Bundle. Der Snapshot (6,35 MB) ist damit **nicht**
+      eingezogen.
+      → **Die Frage in §14.4 ist damit sachlich erledigt und ihre Begründung widerlegt:**
+      sie behauptete, „das SDK selbst kann keine Modelle auflisten". Das stimmt für die
+      **Modellfabriken** — es gab nur `model(id)`. Für eine **Liste** war nie das SDK
+      zuständig, sondern `/v1/models`, und genau das ist der einzige Endpunkt, den OpenAI
+      im Browser erlaubt.
+      ⚠️ **`Plan.md` §14.4 ist noch nicht korrigiert.** Bleibt bei mir, im nächsten Doku-Block.
+
+### Block P — Verify: 10 Befunde, davon zwei HIGH
+
+Build-Agent, dann **eigene** Verify-Session (§7.2), dann Fix-Agent.
+
+**Das Urteil der Verifikation war: *nicht committen*.** Und sie hatte recht — zwei davon waren
+schwerwiegender als die ursprüngliche Aufgabe.
+
+#### 🔴 F1 — `bearer` sendete den **rohen** Schlüssel — und ein Test **nagelte den Fehler fest**
+
+`bearer` war `authorization: sk-…` statt `Bearer sk-…`. Zwei Dateien, dieselbe Konstruktion.
+Und der Kommentar **zwei Zeilen darüber** beschrieb das *korrekte* Verhalten.
+
+Gemessene Schädigung, nutzerseitig:
+
+```
+probeConnection({vendor:"openai-compatible:groq", apiKey:"<gültig>"})
+→ "openai-compatible:groq rejected the key (HTTP 401)."
+```
+
+**Alle sechs** §9-gemessenen kompatiblen Anbieter (Groq, xAI, Mistral, Cerebras, Together,
+DeepSeek) senden ACAO auf beiden Pfaden, also bekommt **jeder** ihrer Nutzer zu hören, sein
+Schlüssel sei abgelehnt — während er in Ordnung ist. Genau die Fehldiagnose, die der
+Zwei-Fragen-Entwurf von `probe.ts` verhindern soll. Für die Erstpartei `openai` überlebt es
+**zufällig**: deren Inferenzpfad sendet kein ACAO, also `cors-blocked` unabhängig vom Schlüssel.
+
+⚠️ **Und der Teil, der es schlimmer machte:** `models.test.ts:100` behauptete
+`expect(headers.authorization).toBe(SECRET)` — **der Test pinnte den Defekt fest.** Reparieren
+macht ihn rot. *Das ist schlimmer als ungetestet: die Suite verteidigt den Fehler.*
+
+→ **Und der Build-Agent hatte das gemeldet und trotzdem falsch eingeschätzt:** er schrieb
+„`probe.ts` … das stammt vor diesem Block, ich habe es gelassen". Dieselbe Konstruktion stand im
+**neuen** `models.ts`. „Altlast" machte es harmloser, als es war.
+
+Behoben: **ein** Modul `auth-header.ts` statt zweier Kopien — mit einem `switch`, weil der alte
+Ternär nur dadurch typprüfte, dass die beiden anderen Styles zufällig **wie Header-Namen**
+geschrieben sind. **Diese Koinzidenz war der Bug.** Test jetzt `Bearer ${SECRET}`, **rot
+gesehen**.
+
+#### 🟠 F2 — `complete: false` war ein Rückgabewert, den **niemand rendert**
+
+Das Block-Versprechen lautet: *eine unvollständige Modellliste ist dieselbe Lüge wie eine
+gekappte `grep`-Suche.* Gemessen: **das Löschen des gesamten Unvollständigkeits-Hinweises lässt
+`pnpm check` (486 Tests) *und* `pnpm e2e` (56) grün.**
+
+Und das Schlimmste daran war **nicht** die Lücke, sondern der Grund: `scenarios.e2e.ts:668`
+pinnte die *Abwesenheit* als korrektes Verhalten — **die E2E-Suite schützte die Nichtlieferung.**
+
+#### Und die inhaltliche Frage, die die Verifikation stellte
+
+> **Ist P3 geliefert, wenn der Loader niemand aufrufen kann?**
+
+Die Nutzeranforderung war eine Modellliste. Ein korrekter, getesteter Loader, den niemand
+aufrufen kann, ist ein **Modul**, keine Modelliste. Und: `toRuntimeError` hatte keinen Fall für
+`ModelListError` — die **sechs** Fehlercodes aus `models.ts`' eigener Doku fielen alle in einen
+Satz, und der Wizard rendert `error.name`, also hätte der Nutzer wörtlich **„RuntimeError"
+gelesen**.
+
+**Urteil: nicht geliefert.** Nicht wegen der fehlenden Zeile — die ist mechanisch. Sondern
+weil die fehlende Zeile **das ist, was die Ehrlichkeitsregel braucht**.
+
+#### Sechs überlebende Mutationen
+
+| | Mutation | vorher | nachher |
+|---|---|---|---|
+| m9 | Pagination nach `vendor` statt nach `page.shape` | **überlebt** | 3 Tests |
+| m12 | `modelsBodyFor` fest auf OpenAI-Form | **überlebt, e2e 56/56** | `model-list.e2e.ts` |
+| m13 | 4. Form in `TEMPLATE_VENDORS` | **überlebt, core 615/615** | siehe unten |
+| m14 | `corsVerdict`-Labelzweig löschen | **überlebt** | 1 Test |
+| m15 | `vendorId` zurück auf die Literal-Liste | nur e2e | **vitest** ×2 |
+| m17 | Unvollständigkeits-Hinweis löschen | **überlebt check *und* e2e** | e2e |
+
+⚠️ **m13 wurde *nicht* getötet — und das ist die ehrlichste Antwort im ganzen Block.** Der Agent
+hat gemessen, dass ein 4. Template in der fragenden Richtung ein **äquivalenter** Mutant ist:
+`corsVerdict → unmeasured`, `operator → third-party`, `createProviderModel → ProviderError`.
+**Jede** Antwort bleibt auf der sicheren Seite, es gibt keinen Defekt zu töten. Die
+**gefährliche** Richtung — eine nutzergefüllte Form, die durch Aufnahme in `MEASURED_CORS` eine
+§9-Messung erbt — wird von drei Tests getötet.
+
+> **Ein toter Test ist schlecht. Ein Test, von dem man behauptet, er töte etwas, das er nicht
+> tötet, ist schlimmer** — weil er die Lücke als abgedeckt ausweist. Der Agent hat stattdessen
+> gemessen und die Zahl der Tabellen von drei auf zwei gebracht.
 
 ---
 
@@ -675,17 +862,29 @@ gefunden; nur die Frage „wo ist er?" — dieselbe Frage, die den `Plan.md`-Unf
 Diese Punkte stehen hier, weil sie sonst verschwinden. Kein grüner Test im Tool-Paket
 kann sie schließen — sie sind Rendering- und Vertrauensfragen.
 
-- [ ] **`question`: Antworten sind nicht vertrauenswürdig.** Sie landen ungeframed im
-      Modellkontext, während derselbe Page den API-Key hält. Das strukturierte
-      `{answers[][]}` ist **besser** als das Vorbild (das in einen quoted Satz splisset,
-      den ein Anführungszeichen in der Antwort sprengt) — aber Wave 2 **muss** die
-      Antwort eindeutig abgrenzen. Nicht implementiert, nur dokumentiert.
-- [ ] **`todo`: Zeilen haben keine Provenienz.** Ein Angreifer-Text aus einer
-      `README.md` wird zur Sidebar-Zeile mit Status `completed` — das vertrauenswürdigste
-      Element der UI, es liest sich wie bereits erledigte Arbeit. Die Liste fließt beim
-      nächsten `todo`-Aufruf **zurück** in den Modellkontext: klassisches
-      Stored-Persistence-Muster, ein zweiter Biss. Wave 2 muss untrusted content
-      unterscheidbar rendern.
+- [~] **`question`: Antworten sind nicht vertrauenswürdig.** Der Rahmen ist **implementierbar**
+      — `toModelOutput?` existiert als optionales Feld (`baah-core/src/tool.ts:99`) und der
+      Vertrag ist getestet. ⚠️ **Aber er ist nicht verdrahtet:** `question/src/index.ts:359`
+      gibt `{ answers: parsed.data }` zurück, **ohne** `toModelOutput`. Die Antworten gehen
+      unverändert ans Modell.
+
+      ⚠️ **Und meine alte Begründung war die falsche.** Ich notierte, das strukturierte
+      `{answers[][]}` sei besser „weil es keinen Quotes-Satz splisst, den ein Anführungszeichen
+      sprengt". Das ist **gelöst** und war nie der Grund für die offene Markierung. Der
+      eigentliche Grund steht nirgends: der `question`-Pfad ist der **einzige**, in dem
+      **frei getippter Nutzertext** und **Agenten-Text** im selben Prompt landen — und der
+      Tab hält den API-Key. Der Nutzer ist hier der **vertrauenswürdigste** Teil des Systems;
+      das ist Absicht, kein Loch. Die Gefahr ist die andere Richtung: dass eine **Antwort**
+      später als **Anweisung** gelesen wird.
+
+      → **Offen mit richtiger Begründung:** Abgrenzung gegen Prompt-Injektion über den
+      Antwortkanal, nicht gegen Quote-Sprünge.
+- [x] **`todo`: Zeilen haben Provenienz.** `TodoSidebar.tsx:68` rendert
+      `data-baah-provenance="untrusted"` auf der Zeile, mit dem Klartext „vom Agenten behauptet —
+      nicht geprüft". Genau das war die Forderung: **untrusted content unterscheidbar rendern.**
+      Der Kommentar `:19` hält zusätzlich fest, dass eine Zeile **keine** Checkbox bekommt, die
+      der User abhaken könnte — also kann eine erfundene Zeile nicht als erledigt bestätigt
+      werden.
 - [ ] **`todo`-Kosten entscheiden.** **Meine Entscheidung: Vollliste als *Input* bleibt.**
       Der Fix-Agent hat gemessen, wo die Kosten wirklich sitzen: das `todos`-**Input** des
       Modells ist so groß wie das Resultat, und bei einem 20-Schritte-Turn wird die Liste
@@ -729,8 +928,13 @@ Begründung aus **gemessenen** Fakten, nicht aus Prinzip:
 **Bleibt:** die Naht. Wenn ripgrep zurückkommt, dann als **opt-in Accelerator** mit
 Äquivalenztest gegen den JS-Scanner — nicht als unverifizierter Default.
 
-- [ ] **Toten `optimizeDeps.exclude: ["grep-wasm"]` in `vite.config.ts` entfernen.**
-      Datei gehört dem CI-Agenten. **Nach dessen Landung**, nicht vorher.
+- [x] ~~**Toten `optimizeDeps.exclude: ["grep-wasm"]` in `vite.config.ts` entfernen.**~~
+      **ERLEDIGT, 01.10. nachgemessen:** `rg -c 'grep-wasm' vite.config.ts` → **0**.
+      Was dort heute steht, ist `exclude: ["@sqlite.org/sqlite-wasm"]`, und der Verweis
+      `packages/baah-storage/README.md` **existiert** (die Liste behauptete, er zeige auf zwei
+      nicht existierende READMEs — es ist einer, und er da).
+      → **Erledigt heißt hier: die Sache war schon weg.** Die Liste führte einen offenen Punkt,
+      der offen aussah und den niemand mehr tun konnte.
 
 ## Aus der Verifikation `glob`/`grep` — 3 Defekte selbst nachgemessen
 
@@ -784,7 +988,12 @@ Begründung aus **gemessenen** Fakten, nicht aus Prinzip:
 - [ ] **Zwei tote Tests in `glob.test.ts`**: `> is a read-only tool` wiederholt
       `access: "read"` aus der Quelle, `> sorts deterministically` bescheinigt etwas, das
       `src` schon `localeCompare`d.
-- [ ] **Zwei fehlende READMEs**, auf die `vite.config.ts:19` zeigt.
+- [x] ~~**Zwei fehlende READMEs**, auf die `vite.config.ts:19` zeigt.~~ **Falsch gemeldet.**
+      Nachgemessen 01.10.: `packages/baah-storage/README.md` und
+      `packages/baah-tools/grep/README.md` — **beide vorhanden**. `vite.config.ts:45` verweist auf
+      genau eines davon, und das existiert.
+      → **Wieder eine Lücke, die keine war.** Die Fehlerklasse ist damit viermal belegt
+      (U5, U6, P4, jetzt das): *ein offener Punkt, der aussieht wie Arbeit und es nicht ist.*
 
 ## Was der Verifier richtig gemacht hat, das ich notiere
 
@@ -803,10 +1012,10 @@ einen Maintainer".
 Das ist keine Task-Liste, das sind **Schnittstellen**, die in Welle 2 brechen, wenn sie
 niemand liest. Alle aus `ca7c02e`.
 
-- [!] **`ProviderRegistry.resolve` und `fingerprint` sind jetzt `async`.**
-      `AGENTS.md` §2 verlangt `crypto.subtle`, und es gibt kein synchrones WebCrypto.
-      Heute bricht nichts (`baah-web` importiert nur `CORE_PACKAGE`), **Welle 2 muss
-      awaiten.**
+- [x] ~~**`ProviderRegistry.resolve` und `fingerprint` sind jetzt `async`.**~~
+      **ERLEDIGT, 01.10. nachgemessen:** `registry.ts:541` `export async function fingerprint`,
+      `:691` `async resolve`, und `runtime/index.ts` **awaitet** bereits (`await n(...)`).
+      Die Warnung galt für die Zeit vor Welle 2.
 - [!] **Der Store-Vertrag ist gewachsen.** Welle 2 muss bauen:
       1. `tool_invocations.status` — unterscheidet `begun` von `done`. Ohne die Spalte ist
          das Crash-Fenster wieder unsichtbar und `write` haengt ein zweites Mal an.
@@ -814,9 +1023,15 @@ niemand liest. Alle aus `ca7c02e`.
          `{sessionId, attempt, toolCallId, occurrence}`. `session_id` ist als Spalte schon da,
          `attempt` und `occurrence` sind Engine-Buchhaltung.
       3. `listUnfinishedTurns({ sessionId })` — neu, fuer die Reload-Recovery.
-- [ ] **`store.flushDelta` wird vom Loop bis heute nicht aufgerufen.** Wie `onProgress` liegt
-      es an der Naht fuer die **App**, nicht fuer die Engine. Von mir benannt, damit es nicht
-      als tote Methode wiederentdeckt wird. **Gehoert in Block B.**
+- [x] ~~**`store.flushDelta` wird vom Loop bis heute nicht aufgerufen.**~~ **ERLEDIGT.**
+      Nachgemessen 01.10. über **alle drei Ebenen**, nicht nur die Definition:
+      `loop.ts:460` (der Vertrag, mit `flushDelta(input)` und `partType`),
+      `turn-store.ts` in `baah-storage` (der Adapter, mit eigener Doku, warum die Signatur
+      einen ganzen `PartInput` braucht), `worker.ts:434` (`case "flushDelta"`).
+      **Der Adapter liegt in `baah-storage`, wie im W2-A-Block entschieden** — damit bekommt die
+      Engine keinen zweiten Weg in die Datenbank.
+      ⚠️ Die Liste warned an zwei Stellen davor, es werde „als tote Methode wiederentdeckt".
+      Es war **drei** Ebenen tief und jede einzelne sah aus wie eine Definition.
 - [!] **`Workspace.walk` meldet seine eigene Kappung nicht.** Block A fixt es auf
       `{ entries, truncated, visited }` plus exportiertes `DEFAULT_MAX_ENTRIES`; danach
       fallen die **gespiegelten 50 000-Konstanten** in `grep` und `glob` weg. Der jetzige
@@ -831,9 +1046,23 @@ niemand liest. Alle aus `ca7c02e`.
 - [ ] **Neue Verdict-/Event-Typen brauchen UI:** `config-error` mit `missing_api_key` (vorher
       als 20-Sekunden-Stall gemeldet), `tool-outcome-unknown` mit `TurnResult.unknownOutcomes`,
       und `turn-stopped` fuer beide Stop-Pfade.
-- [!] **Der 20-Sekunden-Stall-Watchdog fehlt weiterhin** und ist in `Plan.md` §5.4 als Luecke
-      protokolliert. Er braucht einen Timer auf **Chunk-Ebene** — also dieselbe Ebene, die
-      `ToolLoopAgent` nicht freigibt. Haengt an derselben Entscheidung wie der Roh-Chunk-Zugriff.
+- [x] ~~**Der 20-Sekunden-Stall-Watchdog fehlt weiterhin.**~~ **ERLEDIGT, 01.10. gemessen.**
+      `runtime/watchdog.ts` existiert und ist **kein Timer auf Chunk-Ebene**, sondern einer auf
+      **Event**-Ebene: `DEFAULT_STALL_TIMEOUT_MS`, `#armedAtMs`, `setTimeout`/`clearTimeout`
+      **injizierbar** (`:127`), plus eine Zustandsmaschine mit drei Zuständen — `awaiting-provider`
+      (scharf), `awaiting-human` (entschärft, weil eine Approval oder Frage offen ist) und
+      `idle` (entschärft).
+
+      → **Damit ist die offene Frage aus dieser Liste mit „anders" beantwortet, nicht mit „ja":**
+      der Watchdog braucht **keinen** Chunk-Zugriff, den `ToolLoopAgent` nicht freigibt. Er
+      hängt an `AgentEvent`, **nicht** am rohen Chunk. Die Notiz behauptete eine Abhängigkeit,
+      die der Code nicht hat — dieselbe Fehlerklasse wie Finding 2 in Welle A, nur eine Ebene
+      tiefer: **ein Kommentar, der eine Abhängigkeit behauptet, die es nicht gibt.**
+
+      ⚠️ **Der Preis ist real und in der Datei dokumentiert:** der Watchdog **entschärft sich bei
+      `tool-call` und schärft bei `tool-result`**. Das ist eine bewusste Abwägung gegen einen
+      Fehlalarm, wenn ein Tool lange läuft — und es heißt, dass ein Turn in einem 60-Sekunden-
+      Dateizugriff **keinen** Stall meldet.
 
 ## Lehren aus dem Engine-Fix — vier, die in kuenftige Auftraege gehoeren
 
