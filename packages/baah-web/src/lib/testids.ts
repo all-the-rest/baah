@@ -23,6 +23,21 @@
  */
 
 export const TEST_IDS = {
+  /* ---- the workbench --------------------------------------------- */
+  /**
+   * The chat region: header, transcript, question card and composer as one
+   * element — the thing the sidebar sits next to.
+   *
+   * Named for **what it is**, not where it sits: `baah-chat`, not
+   * `baah-chat-column` and not `baah-left-pane`. The naming rule above is not a
+   * formality — it is the reason a spec survives a Tailwind upgrade — and
+   * `column` is exactly the kind of word that describes a CSS decision
+   * (`flex-row` + `flex-1`) rather than the region. A spec that has to say
+   * "the chat is still beside the sidebar" needs *a* handle on the chat, and
+   * this is the narrowest one that does not encode the layout.
+   */
+  chat: "baah-chat",
+
   /* ---- transcript ------------------------------------------------ */
   /** The scroll container holding every message of the current session. */
   transcript: "baah-transcript",

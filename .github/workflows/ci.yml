@@ -85,6 +85,24 @@ jobs:
     timeout-minutes: 30
     # No `needs:`, no `if:`, no `continue-on-error`. This job runs on every
     # push and on every pull request, and a red e2e job is a red pipeline.
+    #
+    # ⚠️ **The absence of `needs: [quality]` is a measured decision, not an
+    # oversight.** These two jobs run *concurrently*, so a type error in `src/` can and
+    # does reach a Playwright run here: `vite build` strips types without checking them,
+    # so a type error that does not break the bundle lets this job go green while
+    # `quality` goes red. That is acceptable, because the aggregate `ci` job below has
+    # `needs: [quality, e2e]` and fails unless both succeeded — a type error can never
+    # make the *pipeline* green. Adding `needs: [quality]` would serialise the jobs and
+    # roughly double the pipeline's wall clock to prevent a red job whose result is still
+    # trustworthy. The `tsc -p e2e/tsconfig.json` step below is what stops this job when
+    # the **suite** does not typecheck.
+    #
+    # What this job tests: `pnpm e2e` → `playwright.config.ts`'s `webServer.command`,
+    # i.e. `vite build --mode e2e` in `packages/baah-web` — an **e2e-mode** bundle,
+    # because that is the mode whose provider seam this suite intercepts. The `quality`
+    # job's `pnpm build` above produces the *production* bundle that is uploaded as
+    # `baah-web-dist`; that is the artefact a human downloads, and it was never the
+    # artefact this job drove.
     steps:
       - name: Check out
         uses: actions/checkout@v7

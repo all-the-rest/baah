@@ -62,7 +62,48 @@ export function Transcript(props: TranscriptProps) {
   const approval = approvalViewFromState(props.live, props.state);
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col" aria-label="Verlauf">
+    /*
+     * ## The three-way vertical budget of the chat column
+     *
+     * The column is `flex flex-col` and holds the header, this section, the question
+     * card and the composer. Only two of the three scrollable things may shrink at
+     * will, and the budget has to be stated in one place or the third one eats it:
+     *
+     * | element | rule | why |
+     * |---|---|---|
+     * | this section | `min-h-[10.5rem] flex-1` | grows into the slack, never below the floor |
+     * | question card | `max-h-[45vh] min-h-[10rem] shrink overflow-y-auto` (`QuestionCard.tsx`) | scrolls its own content |
+     * | composer | `shrink-0` (`ChatView.tsx`) | the row a user types into; its height is its content |
+     *
+     * `min-h-0` alone is what let the transcript collapse to **24 px** while holding
+     * 159 px of content: `flex-1` sets `flex-basis: 0`, so the transcript is *pure*
+     * slack receiver, and the card — which had `min-height: auto` and therefore
+     * refused to shrink — handed it the whole deficit. Measured on the built app
+     * before this change, both at 1280×800 and at 390×844.
+     *
+     * So the floor is the load-bearing half, and it **replaces** `min-h-0` rather than
+     * being added next to it. Two `min-height` classes on one element is a coin flip:
+     * which one wins is decided by the order the utilities happen to appear in the
+     * stylesheet, not by the order they are written here. `min-h-[10.5rem]` still lets
+     * the section shrink — `flex-1` is `flex: 1 1 0%`, so shrinking is unaffected by
+     * the minimum — it only says where shrinking stops.
+     *
+     * **10.5 rem = 168 px, and the arithmetic behind it was wrong the first time.** The
+     * first cut was 9.5 rem (152 px), reasoned as 120 px of transcript plus "the 24 px
+     * status bar" — and 24 px is the height of the status **badge**, which is what
+     * `elementFromPoint` at the badge's centre returns and therefore what the defect
+     * report quoted. The bar itself measures **41 px** (`py-2` = 16, the badge's line
+     * box 24, plus the 1-px border) at both viewports, so a floor built from the
+     * badge was 17 px short: measured 111 px of transcript at 390×844, and the E2E
+     * spec's 120 px assertion failed against a layout that looked right in a
+     * screenshot. **A height read off a hit test is the badge's, not the box's.** The
+     * number is now 120 + 41 + 2, rounded up to 168.
+     *
+     * The E2E spec (`e2e/question-card-layout.e2e.ts`) asserts its own **independent**
+     * literal of 120 px against `[data-testid="baah-transcript"]`'s `clientHeight` — a
+     * floor only enforced by the same constant that states it is not a floor.
+     */
+    <section className="flex min-h-[10.5rem] flex-1 flex-col" aria-label="Verlauf">
       <TurnStatusBar state={props.state} banner={banner} />
 
       <div
@@ -337,7 +378,28 @@ function IdleOutcome({ role }: { role: string }) {
  */
 function TurnStatusBar({ state, banner }: { state: RuntimeState; banner: TurnBanner }) {
   return (
-    <div className="flex flex-wrap items-center gap-2 border-b border-base-300 px-4 py-2 text-xs">
+    /*
+     * `shrink-0`, and it is **defence in depth, currently inert** — stated here so it
+     * is not mistaken for a rule something depends on.
+     *
+     * ⚠️ **Measured, twice, and the second time it corrected the first.** Removing this
+     * class leaves all seven tests of `e2e/question-card-layout.e2e.ts` green at
+     * 1280×800, 390×844 and 844×390, and it changes **no** measured number at any of
+     * them: the bar measures 41 px (`py-2` 16 + the badge's 24-px line box + a 1-px
+     * border) with and without the class.
+     *
+     * The mechanism an earlier version of this comment gave was wrong. It said the bar
+     * "is the child the browser would squash first" — but a flex item's *automatic
+     * minimum size* is already its content height, so it cannot be squashed below 41 px
+     * in the first place, and no explicit `min-height` is set here to change that. What
+     * `shrink-0` removes is the possibility that something later gives this box a
+     * smaller `min-height`, or adds a row that may collapse; `ChatView.tsx`'s comment on
+     * its own `shrink-0` says the same thing for the same reason.
+     *
+     * The section's `min-h-[10.5rem]` **is** the tested rule, and `READABLE_TRANSCRIPT_PX`
+     * in the E2E spec is what enforces it.
+     */
+    <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-base-300 px-4 py-2 text-xs">
       {/*
        * Two attributes, deliberately. `data-baah-status` mirrors
        * `RuntimeState.status` verbatim — that is the engine's own fact, and a spec

@@ -54,7 +54,32 @@ export function ChatView(props: ChatViewProps) {
   return (
     <form
       data-testid="baah-composer"
-      className="border-t border-base-300 p-3"
+      /*
+       * `shrink-0` is this form's half of the chat column's vertical budget, and the
+       * third row of the table in `Transcript.tsx`'s header.
+       *
+       * It was `min-height: auto` in practice, which happens to be the same thing for a
+       * form — but only because nothing in the form ever needed to be smaller than its
+       * content. Stating it is what keeps the row true when the composer grows: the
+       * measured failure mode of a shrinkable composer at 390×844 is not a shorter
+       * composer, it is a composer pushed out of the viewport with a send button that
+       * cannot be clicked (`e2e/screenshots/manifest.ts`'s `sendViaKeyboard` documents
+       * the sibling failure, a 24-px-wide dead button).
+       *
+       * ⚠️ **Measured: removing this class leaves all seven tests of
+       * `e2e/question-card-layout.e2e.ts` green** at 1280×800, 390×844 and 844×390, and
+       * no measured number changes at any of them. Not because of the mechanism argued
+       * above: a flex item's automatic minimum size already floors it at its content
+       * height, and nothing here sets `min-height` explicitly. So the class is
+       * **defence in depth** for a composer that one day has a row which *can* collapse
+       * (a growing hint, a `textarea` with `resize`), and it is named here rather than
+       * left to look like a tested rule. The floors that *are* tested live in
+       * `Transcript.tsx` (`min-h-[10.5rem]`) and `QuestionCard.tsx` (`min-h-[10rem]`).
+       *
+       * There is no `overflow` here on purpose: a composer that scrolls its own hint
+       * text is a composer whose hint text is unreachable.
+       */
+      className="shrink-0 border-t border-base-300 p-3"
       onSubmit={(event) => {
         event.preventDefault();
         submit();

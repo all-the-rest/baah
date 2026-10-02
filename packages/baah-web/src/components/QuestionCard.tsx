@@ -54,11 +54,17 @@ export function QuestionCard({ state }: QuestionCardProps) {
 
   if (state.unreadable && card !== undefined) {
     return (
+      // The same flex rules as the open card below, and for the same structural
+      // reason: this is a **pinned** child of the chat column, not a child of the
+      // transcript's scroll box, so an unbounded height here would be taken out of the
+      // transcript exactly as it was before. Today's content is short and fixed, so the
+      // cap is never reached — it is here so that a longer explanation added to this
+      // card later cannot silently re-create the defect the open card's rules kill.
       <section
         data-baah-question="unreadable"
         data-baah-question-id={card.id}
         role="alert"
-        className="my-2 rounded-box border-2 border-error/70 bg-error/10 p-3"
+        className="my-2 flex min-h-[10rem] max-h-[45vh] shrink flex-col overflow-y-auto rounded-box border-2 border-error/70 bg-error/10 p-3"
       >
         <h3 className="font-semibold">Fragekarte nicht lesbar</h3>
         <p className="mt-1 text-sm">
@@ -114,8 +120,134 @@ export function QuestionCard({ state }: QuestionCardProps) {
       data-baah-question-id={card.id}
       role="group"
       aria-label="Frage des Agenten"
-      className="my-2 rounded-box border-2 border-info/70 bg-info/10 p-3"
+      className="my-2 flex min-h-[10rem] max-h-[45vh] shrink flex-col overflow-y-auto rounded-box border-2 border-info/70 bg-info/10 p-3"
     >
+      {/*
+       * ## The layout decision, and the measurement that forced it
+       *
+       * This card is **pinned**, deliberately: the approval card has the same intent
+       * (see `e2e/screenshots/ui-screenshots.shot.ts`'s header), so the column is not
+       * made scrollable and the card is not moved into the transcript's scroll
+       * container. The transcript is the conversation, and it has to stay readable
+       * *while* a question is open — that is the whole point of the defect.
+       *
+       * The defect, measured on the built app with an open card (Chromium, the
+       * `QuestionCard` of `HEAD`, before this change). Re-measured while the findings
+       * on this block were being fixed, because three of the figures originally quoted
+       * here did not reproduce:
+       *
+       * ```
+       *                                     desktop 1280×800   mobile 390×844
+       * question card (clientHeight)        547 px             547 px
+       * question card (top edge)            y 49               y 81
+       * baah-transcript viewport            24 px              24 px
+       * …while holding this much content    159 px             159 px
+       * status bar (of which the badge is 24 px)  41 px       41 px
+       * overlap with the badge               24 px              24 px
+       * ```
+       *
+       * The cause was one missing flex rule and it was **viewport-independent**: the
+       * card had no flex class at all, so `min-height: auto` refused to shrink below
+       * its content, and the transcript — the only item that *could* shrink — absorbed
+       * the whole deficit. Desktop and mobile differed only in how much there was to
+       * absorb. The card's **top edge landed exactly on the badge's top edge at both
+       * viewports**, so the whole 24-px badge was painted over and only the bar's first
+       * 8 px survived — „Turn läuft · Versuch 1 von 3 · RÜCKFRAGE" was never visible,
+       * on the phone *and* on the desktop. The first report called it a phone defect
+       * because 24 px is what a phone's transcript was left with; the overlap was the
+       * same 24 px either way.
+       *
+       * The 24 px in the "overlap" row is the status **badge**; the bar is 41 px. See
+       * `Transcript.tsx` — that distinction is 17 px of the transcript floor and is
+       * named there.
+       *
+       * ### Why the fix is two halves and not one
+       *
+       * Both are needed, and neither is sufficient alone:
+       *
+       * - **`max-h-[45vh]` + `overflow-y-auto`** gives the deficit somewhere to go. A
+       *   pinned card of unbounded height cannot coexist with a readable transcript on
+       *   an 844-px phone: 547 + 120 + 229 (the composer, measured) is more than the
+       *   viewport. The card takes at most 45 % of the screen and scrolls its own
+       *   content — it is one question with one to ten sub-questions, so a scroll
+       *   inside it is a cost the user pays once.
+       * - **`min-h-[10rem]`** keeps the card from being squeezed to nothing on a short
+       *   viewport. The floor is what the sticky answer row below needs to exist at
+       *   all, so „the user can always answer" survives a landscape phone.
+       *
+       * ⚠️ **Which of these the E2E suite actually kills, measured by mutation.** Each
+       * row below is one class removed, nothing else changed, `e2e/question-card-layout.e2e.ts`
+       * run on all seven of its tests (Chromium, this host). The list used to claim
+       * "3 of 5 tests die"; the measured truth is:
+       *
+       * | class removed | tests that die |
+       * |---|---|
+       * | the section's `min-h-[10.5rem]` (`Transcript.tsx`) | 1 of 7 — the transcript floor |
+       * | `max-h-[45vh]` | 1 of 7 — the 768×1024 cap test |
+       * | `min-h-[10rem]` | 1 of 7 — the 844×390 answer-row test |
+       * | `sticky bottom-0` | 2 of 7 — the 844×390 and the 390×844 answer-row assertions |
+       * | `overflow-y-auto` | 2 of 7 — the same two |
+       * | `shrink-0` on the status bar | **0 of 7** |
+       * | `shrink-0` on the composer | **0 of 7** |
+       *
+       * Two things in that table are worth reading twice.
+       *
+       * **`max-h-[45vh]` is load-bearing in the *opposite* direction** from how an earlier
+       * version of this comment argued it. Removing it kills nothing at 1280×800 or at
+       * 390×844: at both of those the transcript has already been pushed down to 127 px
+       * by its **own** floor, and `READABLE_TRANSCRIPT_PX = 120` sits below that, so the
+       * assertion cannot see the difference either. What the cap buys is the viewport
+       * where there *is* slack: at 768×1024 the transcript is **300 px** with the cap
+       * and **230 px** without it, and the card is 461 px of 527 px with it and 527 px
+       * of 527 px — its full content height — without. That test was added for this; it
+       * did not exist before.
+       *
+       * **The two `shrink-0` classes are inert.** Measured: removing either leaves all
+       * seven green and changes no measured number, because a flex item's automatic
+       * minimum size already floors it at its content height. They are kept as defence
+       * in depth and are named as untested where they are written
+       * (`Transcript.tsx`, `ChatView.tsx`) — do not read this class list as seven gates.
+       *
+       * The `45vh` is a share of the viewport and not a pixel count, deliberately: a
+       * fixed 380 px is right on exactly one screen and wrong on every other.
+       *
+       * ### What it costs, measured
+       *
+       * After the change, at 390×844 with one question open: card 354 px of a 563-px
+       * content box (63 % visible, the rest one scroll away), transcript viewport
+       * **127 px** against 159 px of content, status bar fully visible, composer 229 px
+       * and fully on screen. At 1280×800: card 356 px of 563 px, transcript 145 px. At
+       * 768×1024: card 461 px of 527 px, transcript 300 px. So the price of the fix is
+       * *a scrollbar inside the card*, and the thing it bought is a conversation that can
+       * still be read while the agent is waiting for an answer.
+       *
+       * The transcript's half of the trade lives in `Transcript.tsx` (`min-h-[10.5rem]`
+       * on the section), and this file's floor of 10 rem and cap of 45 vh together
+       * with it are what the E2E spec `e2e/question-card-layout.e2e.ts` measures — at
+       * 1280×800, 390×844, 844×390 and 768×1024, because the four viewports are what
+       * make each of the four rules visible.
+       *
+       * ### ⚠️ The one consequence nobody asked for, written down on purpose
+       *
+       * `sticky bottom-0` below does what it was put here to do: measured with a **tall**
+       * card (three questions, long descriptions — **1463 px** of content in a 354-px box,
+       * i.e. 1109 px of scrolling) at 390×844, the „Antworten" button is inside the card's
+       * box and is the node `elementFromPoint` returns at its own centre at **every** one
+       * of five scroll positions (0 %, 25 %, 50 %, 75 %, 100 %). That is the feature.
+       *
+       * It also means the button is reachable for questions the user has not read. The
+       * handler is `submitAll`: it submits **every** row of the card, read or not. So a
+       * user who scrolls straight to the pinned button can answer questions 2 and 3
+       * without ever having seen them, and the model gets those answers. That is the
+       * price of „the user can always answer" and it is a deliberate choice — the
+       * alternative, a button below a fold the user has to find, is the failure this
+       * whole block exists to remove. It is recorded here so the next reader knows it
+       * was considered and not overlooked.
+       *
+       * The obvious follow-up, if it is ever wanted, is to make the pinned button submit
+       * only what the user has interacted with and to say so on it. That is a product
+       * decision, not a layout one, and nothing in this file takes it.
+       */}
       <header className="mb-2">
         <h3 className="text-xs font-semibold tracking-wide uppercase opacity-60">Rückfrage</h3>
       </header>
@@ -225,7 +357,33 @@ export function QuestionCard({ state }: QuestionCardProps) {
         </pre>
       </details>
 
-      <div className="mt-3 flex flex-wrap gap-2">
+      {/*
+       * The answers, **pinned to the bottom of the card's own scroll box**.
+       *
+       * The card scrolls now (`max-h-[45vh]` + `overflow-y-auto` above), so without
+       * this the „Antworten" button could sit below the fold *of the card* — a user who
+       * has to discover that they have to scroll a 45 vh card to find out how to
+       * answer a question has been handed a question they cannot answer.
+       *
+       * `sticky bottom-0` is what makes it reachable at every card height.
+       *
+       * ⚠️ **It does cover the content above it**, and `bg-base-100` on the next line is
+       * exactly why that is not a defect: `bg-info/10` is **translucent**, so a sticky
+       * element over it would show the text sliding underneath, and a button whose label
+       * is briefly unreadable while you are reaching for it is the same defect one layer
+       * down. The row is opaque for the whole of the width it covers.
+       *
+       * It is **not** the last flex child of the column — the „Verwerfen ist eine
+       * Entscheidung…" paragraph below it is. That paragraph is deliberately *not*
+       * opaque and does not need to be: it follows the row in the flow, so the row can
+       * only ever lift over the content **above** it, never over what comes after.
+       *
+       * Measured at 844×390, the viewport where the card's floor binds: with `sticky`
+       * the answer row is at 331…363 inside the card's 217…377; without it, at 666…698 —
+       * 289 px below the card's fold, and the hit test at its centre resolves to nothing
+       * at all. Measured at 390×844: card 249…607, answer 718…750 without `sticky`.
+       */}
+      <div className="sticky bottom-0 mt-3 flex flex-wrap gap-2 bg-base-100 pt-1">
         <button type="button" data-baah-question-choice="submit" className="btn btn-primary btn-sm" onClick={submitAll}>
           Antworten
         </button>

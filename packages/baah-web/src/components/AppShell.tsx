@@ -588,7 +588,20 @@ export function AppShell({ app: initialApp, initialScreen }: AppShellProps) {
 
   return (
     <div className="flex h-screen min-h-0">
-      <div className="flex min-w-0 flex-1 flex-col">
+      {/*
+       * `data-testid={TEST_IDS.chat}` — the one handle a spec needs on the chat
+       * region, and it lives in `src/lib/testids.ts` with the rest of the
+       * contract. It is here because `e2e/question-card-layout.e2e.ts` asserts
+       * that the chat and the sidebar are still two columns above 1024 px, and
+       * the only alternative to a testid was a Tailwind class.
+       *
+       * The name is `baah-chat`, deliberately **not** `baah-chat-column`: the
+       * file's naming rule says a testid says what it is, not where it sits, and
+       * "column" is a `flex-row`/`flex-1` decision that may change without
+       * anything breaking. That rule is a contract, so the first writer to need a
+       * handle adds the name there rather than next to the markup.
+       */}
+      <div data-testid={TEST_IDS.chat} className="flex min-w-0 flex-1 flex-col">
         <header className="flex flex-wrap items-center gap-2 border-b border-base-300 px-4 py-2">
           {/*
            * The drawer toggle, and it is **only** rendered below the threshold.
