@@ -533,6 +533,14 @@ Zeile legen.**
   Commits überschreibt, ist nicht rücknehmbar, und die 15 Commits dieser Sitzung sind
   genau die Sorte Historie, die nicht verloren gehen darf.
 
+- **`main` ist bewusst NICHT branch-protected.** Der Nutzer hat das am 2026-10-01
+  entschieden. Die `ci`-Aggregate-Job existiert trotzdem, weil sie einen **abgebrochenen**
+  Lauf nicht als grünen aussehen lässt — aber **kein** Agent trägt den `ci`-Job als
+  Required Check ein, `ruleset` wird nicht gesetzt, und niemand schlägt das als
+  vermeintliche Lücke vor.
+  *„Der Workflow hat eine Tür, die niemand benutzt"* ist kein Defekt, wenn der Nutzer
+  entschieden hat, dass niemand sie benutzt.
+
 ## 9. Umgang mit Unsicherheit
 
 - Nichts erfinden: API-Formen (AI SDK, File System Access API, Provider-CORS)

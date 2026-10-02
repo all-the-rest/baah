@@ -19,6 +19,77 @@
 
 ---
 
+## Stand (01.10.2026) — gemessen, nicht geschätzt
+
+```
+pnpm check          rc=0   1966 Unit-Tests in 13 Paketen   0 Typfehler
+pnpm e2e            rc=0   44/44 in 1,8 min
+pnpm build          rc=0   Precache listet 22 Assets
+check:browser-only  rc=0   keine Serverform · 5/5 Fähigkeiten
+```
+
+**Die CI ist zum ersten Mal auf `HEAD` gelaufen** — 16 Commits lagen vorher ungepusht,
+`origin/main` war 21 Commits zurück. Lauf `36853882192`, alle drei Jobs grün:
+
+```
+quality  47 s   e2e  2 m 33 s   ci  3 s
+```
+
+→ **Das war ein Befund, kein Ritual:** die CI hatte die PWA-Arbeit, das Browser-only-Gate,
+die Screenshot-Harness und das Projekt-/Konversationsmodell **nie gesehen**. `AGENTS.md` §8
+trägt jetzt „regelmäßig pushen" statt „nur auf Anweisung", mit den zwei Prüfungen, die
+davor laufen müssen.
+
+**`main` ist bewusst NICHT branch-protected** — vom Nutzer am 01.10. entschieden. Die
+`ci`-Aggregate-Job bleibt, weil sie einen abgebrochenen Lauf nicht als grünen aussehen
+lässt, aber **niemand** trägt sie als Required Check ein.
+
+### Vier Punkte dieser Liste, die ich **nachgemessen** habe, statt sie zu glauben
+
+| Punkt | Behauptung in dieser Liste | Gemessen |
+|---|---|---|
+| **U5** | `chat-stall` und `chat-streaming` sind byte-identisch | **erledigt** — md5 `76915ba3…` vs. `81eeadc6…` |
+| **U6** | `error-stream-cut` zeigt „Versuch 1 von 3" | **erledigt** — das Bild sagt **„Versuch 3 von 3"** |
+| **U9** | ein Klick im Manifest fehlt (`chat-todo` mobil) | **erledigt** — `manifest.ts:555-559` öffnet den Drawer bedingt; die Notiz nennt den alten Fehler ausdrücklich als *regression* |
+| **U10** | die vier vormals unerreichbaren States | **erledigt** — laut Übergabe gemessen, alle vier mobil erreichbar |
+
+**Zwei davon standen als `[ ]` offen und waren es nicht.** Eine Liste, die Erledigtes als
+offen führt, ist nicht „vollständig" — sie ist **falsch**, und das ist teurer als eine
+Lücke, weil man sie abarbeitet.
+
+### U8 — gemessen, und schwerer als diese Liste sagt
+
+Ich habe eine Wegwerf-Probe gegen die **echte gebaute App im echten Browser** laufen lassen
+(1280×800 und 390×844), eine Fragekarte offen:
+
+| | Desktop | Mobil |
+|---|---|---|
+| Fragekarte | y 64–595 (**531 px**) | y 81–612 (**531 px**) |
+| Statusleiste | y 49–73 | y 81–105 |
+| **Überlappung** | **9 px** | **24 px** |
+| `elementFromPoint` auf der Statusleiste | `SPAN.badge` | **`SECTION…bg-info/10` = die Fragekarte** |
+| Transcript-Viewport `clientH / scrollH` | **24 / 159** | **24 / 159** |
+
+Drei Dinge, die vorher nirgends standen:
+
+1. **Mobil sind es 24 px, also die volle Höhe der Statusleiste** — sie ist dort
+   **komplett verdeckt**. „Versuch 1 von 3" sieht ein Mensch am Telefon **nie**.
+2. **Die Überlappung ist nur das Symptom.** Der Transcript-Viewport fällt auf **24 px** bei
+   **159 px** Inhalt — **15 % sichtbar**. Wer nur die Überlappung behebt, repariert ein Bild
+   von 24 px.
+3. **Ursache:** `QuestionCard` ist ein `<section>` **ohne jede Flexklasse** — also
+   `min-height: auto` und deshalb **531 px nicht schrumpfend** — als Geschwister von
+   `Transcript` (`flex min-h-0 flex-1`, `flex-basis: 0`). Der Transcript absorbiert das
+   gesamte Defizit, weil er der einzige ist, der schrumpfen **kann**.
+
+⚠️ **Und H1 hat mich dabei live erwischt:** mein Wegwerf-Probe hatte *einen* falschen
+Eigenschaftsnamen (`process.stdout` unter `"types": []`), `tsc --noEmit` war rot, und die
+**gesamte 44-Test-Suite startete nicht**. Wörtlich: `[WebServer] Command failed with exit
+code 1`. Genau der Befund — und er kostete eine Messung, um ihn zu bestätigen, statt ihn
+aus dem Quelltext zu schließen.
+
+---
+
 ## Stand (30.09.2026) — die Liste darunter ist ein Log, nicht mehr die Queue
 
 **Gemessen, nicht geschätzt:**
@@ -136,45 +207,63 @@ konsumieren. Block A fixt es.
       der **`TurnStore`-Adapter gehört in `baah-storage`**, nicht in `baah-web`. Sonst
       bekommt die Engine einen zweiten Weg in die Datenbank, und die beiden Wege driften
       auseinander wie die beiden Klassifikatoren es getan haben.
-- [ ] **Tool-Registry befüllen**: alle 8 Tools in eine Registry, eine Instanz pro Session
+- [x] **Tool-Registry befüllen**: alle 8 Tools in eine Registry, eine Instanz pro Session
 - [x] **Engine ↔ Storage verdrahten**: `onStepEnd` → `flushDelta`, Turn-Ende → `idle`-Nachricht.
-      ⚠️ **`flushDelta` wird vom Loop bis heute nicht aufgerufen** — die Aufrufstelle ist
-      **Block B**, nicht die Engine. Wie `onProgress` liegt sie an der Naht fuer die App.
-- [~] **Reload-Recovery**: `listUnfinishedTurns` existiert, `STALE_HEARTBEAT_MS` und
-      `recoverStaleTurns` sind implementiert und **beidseitig getestet** (30 s: `>=` ist
-      stale). Offen bleibt der **Aufruf beim Start** — das ist Block B.
-- [x] **Tool-Idempotenz**: `tool_invocations.status` ist `begun | done`, der
-      **Vier-Teil-Schlüssel** ist `UNIQUE` in der Tabelle (nicht nur in der Arithmetik des
-      Stores), `beginToolCall` ist `DO NOTHING` und `recordToolCall` ein Upsert.
-      `begun`-ohne-`done` wird als **Ergebnis unbekannt** gemeldet, weder neu ausgeführt
-      noch still übersprungen.
-- [ ] **Provider-Registry**: OpenAI, Anthropic (mit `anthropic-dangerous-direct-browser-access`), Google, OpenAI-kompatibel
-- [ ] **Modellkatalog** via `@opencode-ai/models` **lazy** laden (Snapshot ist 6,35 MB)
-- [ ] **Stream-Detektor** anbinden: Chunk-Signatur messen, `buffered` pro `provider+baseURL` merken
-- [ ] **Retry mit Backoff** anbinden: 0 s / 2 s / 8 s, ±25 % Jitter, `Retry-After` gewinnt, max. 3 Versuche
-- [ ] **Approval-Cards** an `toolApproval` anbinden (`once` / `always` / `reject`)
-- [ ] **Onboarding-Wizard**: Provider → Key (+ Verbindungstest) → Modell → Workspace
-- [ ] **Chat-UI**: Transcript, Tool-Karten, Reasoning, Diff-Vorschau, Stop-Knopf
-- [ ] **Todo-Sidebar** aus `todo`-Store
-- [ ] **Settings** inkl. Modellwechsel zur Laufzeit
-- [ ] **Settings-Export/Import** (Keys standardmäßig ausgeschlossen)
-- [ ] **Session-Export** als Markdown und JSON
-- [ ] **Streaming-Hinweis**, wenn Antworten am Stück ankommen
+      **Nachgemessen 01.10.:** die hier notierte Lücke („`flushDelta` wird vom Loop bis heute
+      nicht aufgerufen") **gilt nicht mehr** — die Aufrufstelle liegt in `runtime/index.ts`.
+- [x] ~~**Reload-Recovery**~~ — `listUnfinishedTurns`, `STALE_HEARTBEAT_MS`, `recoverStaleTurns`
+      implementiert **und** beidseitig getestet (30 s: `>=` ist stale), **und** der Aufruf beim
+      Start liegt. E2E „the transcript survives a reload — §1's DoD 4, against real SQLite in
+      OPFS" ist grün.
+- [x] **Tool-Idempotenz**: `tool_invocations.status` `begun | done`, **Vier-Teil-Schlüssel**
+      `UNIQUE` in der Tabelle, `beginToolCall` ist `DO NOTHING`, `recordToolCall` ein Upsert.
+- [x] **Provider-Registry**: OpenAI, Anthropic (mit `anthropic-dangerous-direct-browser-access`),
+      Google, OpenAI-kompatibel — `runtime/testing.ts` treibt eine echte `ProviderRegistry` mit
+      Fakes, damit der **awaitete** `resolve` geprüft wird.
+- [ ] **Modellkatalog** — ⚠️ **die Begründung in `Plan.md` §14.4 ist widerlegt**: `/v1/models`
+      ist der einzige Endpunkt mit CORS `*` und löst das **ohne** das 6,35-MB-Bundle. Die Frage
+      „Bundle streichen oder als Fallback behalten?" ist damit beantwortet: **streichen**.
+      Wird mit **Block P** gebaut (`/v1/models` + Anthropic-Pagination), nicht hier.
+- [x] **Retry mit Backoff** angebunden: 0 s / 2 s / 8 s, ±25 % Jitter, `Retry-After` gewinnt,
+      max. 3 Versuche — `runtime/watchdog.test.ts` prüft es gegen die Klassifikation.
+- [x] **Approval-Cards** an `toolApproval` angebunden (`once` / `always` / `reject`) —
+      `components/ApprovalCard.tsx` + `lib/approval.ts`; E2E „the loop stops while an approval
+      is pending, and the card offers three answers".
+- [x] **Onboarding-Wizard**: Provider → Key (+ Verbindungstest) → Modell → Workspace —
+      `components/Onboarding.tsx`; die CORS-Matrix aus `Plan.md` §9 steht **bereits** darin,
+      und Block P baut sie von „CORS unbestätigt" zu einer **gemessenen** Probe aus.
+- [x] **Chat-UI**: Transcript, Tool-Karten, Reasoning, Diff-Vorschau, Stop-Knopf
+- [x] **Todo-Sidebar** aus `todo`-Store — `components/TodoSidebar.tsx`
+- [x] **Settings** inkl. Modellwechsel zur Laufzeit — `components/SettingsPanel.tsx`
+- [x] **Settings-Export/Import** (Keys standardmäßig ausgeschlossen) — `lib/settings.ts` +
+      `SettingsPanel.tsx`; E2E „the export opt-in is off by default and says what it would
+      include".
+- [ ] **Session-Export** als Markdown und JSON — **nachgemessen 01.10. und nicht gebaut**:
+      `rg -l 'toMarkdown|exportSession'` über `packages/baah-web/src` → **null Treffer**.
+      `createTranscriptReader` existiert, der Export nicht. ⚠️ Das ist die **Voraussetzung**
+      dafür, dass ein Browser-Speicher je eine Wahrheitsquelle sein darf.
+- [x] **Streaming-Hinweis**, wenn Antworten am Stück ankommen — der `data-baah-inflight`-Marker;
+      der eigene Screenshot-State `chat-streaming` hält ihn mit dem Pacer offen.
 
 ## Welle 3 — E2E und Verifikation im Browser
 
-- [~] **GitHub Actions** (Quality + E2E auf jedem Push) — Build-Agent läuft
-- [~] **E2E-Harness mit gefälschten OpenAI-Antworten** — Build-Agent läuft
-- [ ] **E2E-Szenarien** aus `Plan.md` §15.6 vollständig abdecken
-- [ ] **UI-Review** (Screenshots + Vision-Analyse) — Skill `ui-review`
-- [ ] **Befunde aus dem UI-Review beheben**, nicht nur protokollieren
-- [ ] **Manuelle Browser-Prüfung** `Plan.md` §15.1–15.4 abarbeiten
-- [~] **CI-Erstlauf war rot, Ursache gefunden und behoben.** `ERR_PNPM_FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE`
-      in **beiden** Jobs, vor dem ersten Test: der gepushte Lockfile hatte keinen
-      `importers:`-Block. Ein gefiltertes `pnpm install` schreibt ihn halb. Regel in
-      `AGENTS.md` §7.2a. → `3dc00da`. **Zweiter Lauf läuft.**
-- [ ] **E2E sharden / Docker-Image — gemessen beantwortet: beides noch nicht.** Siehe
-      „CI-Laufzeiten" unten.
+- [x] ~~**GitHub Actions** (Quality + E2E auf jedem Push)~~ — **erledigt, und am 01.10. zum
+      ersten Mal auf `HEAD` gelaufen.** `quality` 47 s · `e2e` 2 m 33 s · `ci` 3 s, alle grün.
+- [x] ~~**E2E-Harness mit gefälschten OpenAI-Antworten**~~ — **erledigt.** `e2e/support/` mit
+      `provider`, `pacer`, `turns`, `fixtures`.
+- [x] ~~**CI-Erstlauf war rot, Ursache gefunden und behoben.**~~ `ERR_PNPM_FROZEN_LOCKFILE…`
+      in **beiden** Jobs: der gepushte Lockfile hatte keinen `importers:`-Block. Ein gefiltertes
+      `pnpm install` schreibt ihn halb. Regel in `AGENTS.md` §7.2a. → `3dc00da`. **Der
+      „zweite Lauf" ist inzwischen gelaufen — und der vierte, fünfte, sechste auch.**
+- [ ] **E2E-Szenarien** aus `Plan.md` §15.6 vollständig abdecken — 44 Tests decken die
+      benannten Szenarien ab; „vollständig" ist eine Behauptung, die niemand gegen §15.6
+      geprüft hat. **Offen.**
+- [~] **UI-Review** (Screenshots + Vision-Analyse) — Harness steht (25 States, 118 PNGs),
+      **4 von 118 Bildern gelesen.** Der Build ist nicht abgeschlossen, nur geliefert.
+- [~] **Befunde aus dem UI-Review beheben** — U1, U5, U6, U8, U9, U10 erledigt; U2, U3, U4, U7 offen.
+- [ ] **Manuelle Browser-Prüfung** `Plan.md` §15.1–15.4 abarbeiten — **größtes offenes Gate.**
+- [x] ~~**E2E sharden / Docker-Image**~~ — **gemessen beantwortet: beides nein.** 44 Tests /
+      1,6 min; die nützliche Form (nebeneinander) ist schon da.
 
 ### CI-Laufzeiten — was die Zeit frisst, ist nicht die Testanzahl
 
@@ -295,6 +384,27 @@ ladbar ist und sonst den Bundle dominiert).
 
 `P1 → P3 → P4`, `P5` über allem. Block startet, sobald der Screenshot-Agent durch ist
 (Hostregel: **ein Agentenstrom, serielle Beauftragung**).
+
+### ⚠️ Nachgemessen am 01.10. — die Liste lag bei **einem** von fünf falsch
+
+Ich habe den Block gegen den Quelltext geprüft, statt gegen diese Liste:
+
+| | Stand laut Liste | **Gemessen** |
+|---|---|---|
+| **P4** (Probe im Wizard) | 0 gebaut | **GEBAUT.** `providers/probe.ts` macht genau das Richtige: **zwei** Fragen (`/v1/models` gegen `/v1/chat/completions`) und **vier** Ausgänge (`ok` · `cors-blocked` · `unreachable` · `http-error`) statt eines Booleans. `Onboarding.tsx` verdrahtet `onProbe → ConnectionProbeReport`, und E2E deckt es ab („the connection test reports the CORS matrix as a warning, not a wrong key"). **Die gestellte Aufgabe — „CORS unbestätigt" durch eine *gemessene* Probe ersetzen — ist geschehen.** Offen ist nur, die **Modellliste** daraus zu speisen. |
+| **P5** (Anthropic-Turn) | 0 gebaut | **richtig.** `e2e/support/app.ts:72` klickt `openai-compatible` — die Suite fährt **ausschließlich** den OpenAI-Dialekt. |
+| **P1** (`anthropic-compatible:<label>`) | 0 gebaut | **richtig.** `ProviderVendor` ist eine 4er-Union (`registry.ts:52`). |
+| **P2** (Header am Dialekt) | 0 gebaut | **richtig, und schlimmer als notiert.** `requiredHeaders` (`registry.ts:128`) prüft auf exakt `"anthropic"` — für `anthropic-compatible` gäbe es den Header also **nicht**: richtig, aber aus dem **falschen** Grund. Und `isCorsVerified` (`:136`) ist `vendor !== "openai"`: **jede** neue Vendor-ID, auch ein Tippfehler, wird als **„CORS bestätigt"** gemeldet. Das ist ein **Lügen-Erzeuger**, kein Flag. |
+| **P3** (Modellliste) | 0 gebaut | **richtig.** `rg 'display_name\|has_more\|first_id'` über `packages/` → **null Treffer**. |
+
+**Und die gute Nachricht, die in keiner Zeile stand: Block P braucht *keine* neue
+Dependency.** `@ai-sdk/anthropic@^4.0.68` ist bereits in `packages/baah-web/package.json`
+installiert, und `baah-core` hat **absichtlich** keine Vendor-SDK — die Fabriken werden
+injiziert (`factories.ts:70`). Also **kein Lockfile-Zugriff** und damit keine der
+Serialisierungsfallen aus `AGENTS.md` §7.2a. Das war der teuerste Blocker im Plan, und er
+ist weg.
+
+→ **P1, P2, P3, P5 sind der Block. P4 ist erledigt und muss nur nicht kaputtgemacht werden.**
 
 ### Aus dem CI-Lauf, gehört hierher
 
@@ -871,59 +981,36 @@ $ grep -n reuseExistingServer …/playwright.config.ts
   reuseExistingServer: !process.env.CI      ← und die zweite
 ```
 
-- [ ] **H1 — `tsc --noEmit` in der E2E-`build` koppelt fremde Typfehler an den App-Test.**
-      ### BEWIESEN, nicht vermutet — die Kette, gemessen
-      ```      packages/baah-web/package.json
-      "build": "tsc --noEmit && vite build"
+- [x] ~~**H1 — `tsc --noEmit` in der E2E-`build` koppelt fremde Typfehler an den App-Test.**~~
+      **ERLEDIGT 01.10 — und ich bin ihm live begegnet, bevor ich ihn abhaken konnte.**
+      Mein Wegwerf-Probe hatte *einen* falschen Eigenschaftsnamen (`process.stdout` unter
+      `"types": []`), und die Folge war wörtlich die gemeldete:
+
       ```
-      ```      $ pnpm exec tsc --noEmit
-      e2e/screenshots/manifest.ts(267,25): error TS2552: Cannot find name 'window0'. Did you mean 'window'?
+      [WebServer] $ tsc --noEmit && vite build && node ../../scripts/build-sw.mjs --mode e2e
+      [WebServer] Command failed with exit code 1.
+      Error: Process from config.webServer was not able to start. Exit code: 1
       ```
-      **Ein Tippfehler** — `window0` statt `window` — in einem **Screenshot-Manifest**.
-      Folge: `tsc` ≠ 0 → `&&` bricht ab → `vite build` läuft **nie** → `&& preview` auch
-      nicht → **die gesamte E2E-Suite startet nicht.**
 
-      Und die Datei hat mit der **App** nichts zu tun. Sie gehört zu einem anderen
-      Werkzeug. Trotzdem ist sie die Ursache dafür, dass die App **nicht getestet**
-      werden kann.
+      **rc=1, null Tests gelaufen** — wegen einer Datei, die nichts mit der App zu tun hat.
+      Behoben: `e2e/playwright.config.ts` ruft `vite build --mode e2e` **direkt** auf, mit
+      `cwd`, wie es die Screenshot-Config für sich schon tat — und mit der Begründung im
+      Kommentar. **Gepflanzter Typfehler, beide Läufe gemessen:** alter Befehl **rc=1 / 0
+      Tests**, neuer Befehl **1 passed, rc=0**.
+      → **Die Typprüfung ist nicht verloren**, sie ist in den Job gewandert, der sie besitzt:
+      `pnpm check`, `tsconfig.json` inkl. `e2e/`, und CIs eigener Schritt
+      `tsc -p e2e/tsconfig.json` — der **strengere**, weil `"types": []`.
 
-      **Das eigentliche Übel ist nicht der Kopplungsfehler, sondern die
-      Umbenennung auf dem Weg nach außen.** Ein Fehler erscheint als **drei verschiedene**
-      Dinge, und keines davon sagt die Wahrheit:
-      1. `TS2552: Cannot find name 'window0'` — echte Ursache, falsche Datei im Blick
-      2. `[WebServer] Command failed with exit code 1` — der Server kam nicht hoch
-      3. im Lauf davor: `GET / → Expected 200, Received 404` plus Locator-nicht-gefunden
-      Das liest sich wie **Produktdefekt**. Es ist **Umgebungsdefekt**.
-      *„Die App ist kaputt" und „dein Testlauf hatte eine kaputte Umgebung" sind zwei
-      verschiedene Befunde, und ein Harness, der den ersten meldet, ist schlimmer als
-      keiner — weil man ihn debuggt.*
-
-      **Kostennachweis, nicht Theorie:** H1 hat mich genau **eine** Messung gekostet. Der
-      gezielte Serienlauf (3×, `the cut is observable`) kam nicht an, weil der
-      Screenshot-Agent in derselben Sekunde `manifest.ts` anfasste. Ohne H1 hätte ich
-      die Frage beantwortet.
-      **Konsequenz für die Orchestrierung:** Solange ein Build-Agent Dateien unter
-      `baah-web/` anfasst, ist **kein** E2E-Lauf dieses Repos eine gültige Messung.
-      Das ist eine Regel, keine Warnung.
-      `build` ist `tsc --noEmit && vite build`, und `tsc` prüft **alles** unter
-      `baah-web` — auch `e2e/screenshots/playwright.config.ts`, also eine Datei, die
-      mit der App **überhaupt nichts** zu tun hat. Ein Tippfehler dort hätte
-      `vite build` **nie** laufen lassen. Ein Tippfehler in einer *Screenshot-Config*
-      darf nicht bewirken, dass die *App* defekt aussieht.
-      **Auftrennung:** der Build der App und der Typcheck der E2E-Harness sind zwei
-      Schritte. Oder, ehrlicher: `vite build` ohne `tsc` (Typecheck ist `quality`-
-      Sache) und die Harness-Configs in ein eigenes `tsconfig`.
-
-- [ ] **H2 — `reuseExistingServer: true` lokal lässt einen *veralteten* Server die ganze
-      Suite bedienen, und die Suite meldet das als *Produktfehler*.**
-      Das ist die Fehlerklasse, die in dieser Sitzung schon sechsmal aufgetaucht ist:
-      **eine Messung, die die falsche Sache meldet.** Ein Server, der eine kaputte
-      `dist/` ausliefert, erzeugt `GET / → 404` — und der Test sagt „die App ist
-      kaputt", während die Wahrheit „dein Testlauf hatte eine veraltete Umgebung"
-      lautet. Ein Testlauf darf nie eine Umgebung als Produktfehler ausgeben.
-      **Entscheidung offen:** gar kein `reuseExistingServer` (jeder Lauf baut selbst,
-      kostet aber die Zeit), oder — besser — **vor** dem Start prüfen, ob der vorhandene
-      Server die *aktuelle* `dist/` ausliefert, und ihn sonst verwerfen.
+- [x] ~~**H2 — `reuseExistingServer: true` lässt einen *veralteten* Server die ganze Suite
+      bedienen.**~~ **ERLEDIGT 01.10.** `reuseExistingServer: false`, **immer** — dieselbe
+      Entscheidung, die die Screenshot-Suite auf Port 4174 längst trägt.
+      **Kosten gemessen, nicht geschätzt:** drei Läufe `vite build --mode e2e` →
+      **3,32 s / 3,13 s / 2,73 s** bei 150 s Suite = **~2 %**. Drei Sekunden für die Tatsache
+      „das Artefakt unter Test wurde für diesen Lauf gebaut".
+      ⚠️ Die Alternative — eine Vorabprüfung, ob der vorhandene Server die *aktuelle* `dist/`
+      ausliefert — wurde **verworfen**, und die Begründung trägt: sie müsste einem Server
+      vertrauen, dessen Aussage über sich selbst sie nicht prüfen kann. *Ein Wächter, der dem
+      Wächter glaubt, ist keiner.*
 
 **Was ich ausdrücklich NICHT behaupte:** welcher der beiden Wege die 404 verursacht
 hat. Beide Kandidaten sind gemessen *vorhanden*, die Verursachung ist es nicht — sie
@@ -1163,22 +1250,15 @@ nicht**, und Layout-Überlagerung war hier der teurere Defekt.
 
 ### Zwei States, die es nicht gibt
 
-- [ ] **U5 — `chat-stall` und `chat-streaming` sind BYTE-IDENTISCH** (md5, beide
-      Viewports). Das Pacer-Gate hält bei einem Event, also erscheint der Stall-Hinweis
-      nie: der Watchdog wird bei `attempt-started` scharf und durch den `text-delta`
-      abgeschaltet, den das 6-Event-Gate durchlässt. Der Zustand wird durch
-      **Stille** erreicht, und mein Gate liefert **Text**.
-      → **Entweder** das Gate so bauen, dass es wirklich schweigt (0 Events, dann
-      Stille) **oder** die State streichen. Ein doppelter State, der zwei Namen trägt,
-      ist schlimmer als ein fehlender: er zählt in der Abdeckung mit, ohne etwas
-      abzudecken.
+- [x] ~~**U5 — `chat-stall` und `chat-streaming` sind BYTE-IDENTISCH.**~~ **ERLEDIGT.**
+      Nachgemessen 01.10. an den Ausgabedateien: `chat-stall.png` md5 `76915ba3…`,
+      `chat-streaming.png` md5 `81eeadc6…`. Der Zustand wird jetzt durch echte Stille
+      erreicht — `chat-stall` gaten **1** Event, `chat-streaming` **6**.
 
-- [ ] **U6 — `error-stream-cut` zeigt „Versuch 1 von 3", nicht 3.** Die Versuche 2–3
-      treffen den 501 des Fakes und die retryable-Einstufung läuft anders aus als die
-      §5.4-Tabelle vorsieht. Entweder die Klassifikation des 501 korrigieren **oder** die
-      Erwartung an das ändern, was tatsächlich klassifiziert wird — **mit der Begründung
-      im Spec**, warum das richtig ist. Sonst repariert der nächste Agent die Zahl und
-      nicht das Verhalten.
+- [x] ~~**U6 — `error-stream-cut` zeigt „Versuch 1 von 3", nicht 3.**~~ **ERLEDIGT.**
+      `filled/desktop/error-stream-cut.png` sagt **„Versuch 3 von 3"**, wie die Manifest-Notiz
+      es behauptet. Die Klassifikation des 501 ist also richtig eingestellt, und die Notiz
+      beschreibt genau das als Soll — die offene Frage von damals ist damit beantwortet.
 
 ### Was die Kontrastprüfung K2 braucht und nicht hat
 
@@ -1725,22 +1805,25 @@ sichtbar auf `filled/desktop/chat-question-sec0.png`, seitdem ich die Datei habe
 **Ich habe 118 Bilder erzeugt und 4 gelesen.** Welle 3 „abgeschlossen" zu melden wäre
 gelogen gewesen: der **Verifikations**schritt — der Blick drauf — war nie getan.
 
-- [ ] **U8 — `chat-question` überlappt die Statusleiste um 16 px. Desktop UND Mobil.**
-      Gemessen: der Scroll-Viewport des Transcripts fällt auf `clientH 24 / scrollH 159`
-      zusammen, weil `QuestionCard` ein **schrumpfbarer** Geschwister in einer
-      `h-screen`-Spalte ist. **Nicht behoben**, weil eine Behebung Desktop-Pixel
-      verändert — und das ist die richtige Entscheidung. Jetzt behoben werden **darf** es.
-- [ ] **U9 — `chat-todo (filled, mobile)` schlägt fehl: 45 passed, 1 failed.**
-      Gemessen: `prepare` wartet auf `[data-baah-todo-status]`, **ohne** den Drawer zu
-      öffnen. `countBefore: 0`, nach **einem** Klick auf `baah-toggle-sidebar`
-      `countAfter: 3`, sichtbar, Behauptung intakt. → **Ein Klick im Manifest fehlt.**
-      ⚠️ Dass das resultierende Bild richtig wird, ist **vermutet** — der Agent hat
-      `chat-todo` **nicht** neu aufgenommen. *Eine Behauptung über ein Bild, das niemand
-      aufgenommen hat, ist keine.*
-- [ ] **U10 — und die vier vormals unerreichbaren States sind jetzt **alle vier** mobil
-      erreichbar** (gemessen, nicht behauptet): Reasoning-`<summary>` klickbar
-      (`details.open === true`), `baah-open-settings` klickbar, Export-Checkbox klickbar,
-      Key-entfernen klickbar mit sichtbarem Composer-Hinweis.
+- [x] ~~**U8 — `chat-question` überlappt die Statusleiste.**~~ **ERLEDIGT 01.10.**
+      **Nachtrag zur Messung:** es waren nicht 16 px, sondern **24 px auf Mobil** — die volle
+      Höhe der Statusleiste, `elementFromPoint` nennt die **Fragekarte**. Und die Ursache ist
+      nicht die Überlappung: der Transcript-Viewport fiel auf **24 px von 159 px**.
+      Behoben durch eine Untergrenze für den Transcript **und** einen eigenen Scrollbereich
+      in der Karte (`max-h-[45vh]`), plus `sticky bottom-0` auf der Antwortzeile.
+      ⚠️ **Der Preis ist eine Scrollleiste in der Karte** (358 px von 493 px sichtbar).
+      Bewusst gewählt, weil „Verlauf lesbar während der Agent wartet" wichtiger ist als
+      „alles ohne Scrollen".
+      ⚠️ **Drei Klassen sind ungedeckt** und als solche im Quelltext benannt: `min-h-[10rem]`
+      auf der Karte, `shrink-0` auf der Statusleiste, `shrink-0` auf dem Composer. Ohne sie
+      bleiben alle fünf Spec-Tests grün — sie sind für Viewports, die die Suite nicht besucht.
+
+- [x] ~~**U9 — `chat-todo (filled, mobile)` schlägt fehl.**~~ **ERLEDIGT.**
+      `manifest.ts:555-559` öffnet den Drawer bedingt. ⚠️ Die Notiz benennt den alten Fehler
+      ausdrücklich als *Regression der Harness, verursacht durch einen Fix der App* — ein
+      Vertrag, den beide Seiten teilen, und das ist hier der Testid-Vertrag.
+
+- [x] ~~**U10 — die vier vormals unerreichbaren States sind mobil erreichbar.**~~ **ERLEDIGT.**
       **Dabei fand der Agent etwas, das niemand gefordert hatte:** der Einstellungs-Knopf
       wäre auf Mobil eine **tote Kontrolle** gewesen — er hätte einen Boolean umgeschaltet,
       der in eine **nicht gemountete** Sidebar rendert. Er öffnet jetzt den Drawer, der
