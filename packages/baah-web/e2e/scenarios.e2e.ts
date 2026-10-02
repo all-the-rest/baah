@@ -665,14 +665,29 @@ test.describe("§15.6 — Abbruch mitten im Stream", () => {
 /* ------------------------------------------------------------------ */
 
 test.describe("the app the scenarios run against", () => {
-  test("the wizard says no model catalogue is wired, rather than inventing one", async ({ app }) => {
-    // `Plan.md` §8.1 step 4 asks for a catalogue with context length and price. It is
-    // not wired in this build, and a hard-coded model list would be a list that goes
-    // stale silently and then gets blamed for a provider error.
+  test("the wizard reads the provider's own model list, not a bundled table", async ({ app }) => {
+    // `Plan.md` §8.1 step 4 asks for a catalogue. It is wired now: the wizard calls
+    // the provider's own `/models` (`providers/models.ts`), which §9 measured as the
+    // one browser-callable endpoint, and a hard-coded table would be a second truth
+    // about something that already has a first one.
+    //
+    // **This case used to assert the opposite** — that the wizard *says* no
+    // catalogue is wired — and it was correct when written. The loader existed and
+    // was fully unit-tested while `onListModels` was passed by nobody, so the
+    // "absence" it pinned was the absence of a *call*, not the absence of a feature.
+    // Leaving it would have made a delivered feature fail its own test.
+    //
+    // The rendering — the list, the provider's `display_name`, and the incomplete
+    // notice — is in `e2e/model-list.e2e.ts`. This stays as the cheap check that
+    // the step offers the loader at all, on a fresh install.
     await app.goto("/");
     await waitForApp(app);
     await app.locator('[data-testid="baah-wizard-next-provider"]').click();
-    await expect(app.locator('[data-baah-model-catalog="absent"]')).toBeVisible();
+    await expect(app.locator(`[data-testid="${TEST_IDS.modelListLoad}"]`)).toBeVisible();
+    // …and the paragraph that used to say the opposite must be **gone**: a wizard
+    // offering "Modelle laden" above „Es ist kein Modellkatalog eingebunden" tells
+    // the user two contradictory things about the same screen.
+    await expect(app.locator('[data-baah-model-catalog="absent"]')).toHaveCount(0);
   });
 
   test("the connection test reports the CORS matrix as a warning, not a wrong key", async ({ app, provider }) => {

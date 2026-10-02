@@ -56,6 +56,15 @@ export async function waitForApp(app: Page): Promise<void> {
  * `@ai-sdk/openai-compatible@3` sets `raw: choice.finish_reason`, so the check
  * passes — and that is the path `turns.ts` was built for in the first place.
  *
+ * ## `vendor` exists for the Messages row, and it is the same fake
+ *
+ * `anthropic-compatible` is the other shape this fake can be, and it matters that
+ * it needs **no new origin**: the E2E base URL is `https://e2e.invalid/v1`, so
+ * `buildRequestUrl` produces `https://e2e.invalid/v1/messages`, which this
+ * module already intercepts. The Anthropic turn therefore runs against the same
+ * deny-by-default fake as every other scenario, and its assertion about the
+ * browser header is made on a request the app really made.
+ *
  * Every value is a **fake**: the key is not a credential, the base URL is the E2E
  * origin (`vite.config.ts` defines it only under `--mode e2e`, and
  * `support/provider.ts` intercepts it), and the workspace is the in-memory one. No
@@ -64,14 +73,25 @@ export async function waitForApp(app: Page): Promise<void> {
  */
 export async function completeWizard(
   app: Page,
-  options: { readonly model?: string; readonly probe?: boolean } = {},
+  options: {
+    readonly model?: string;
+    readonly probe?: boolean;
+    /** Which catalog row to select. Defaults to the OpenAI-compatible one. */
+    readonly vendor?: string;
+  } = {},
 ): Promise<void> {
+  const vendor = options.vendor ?? "openai-compatible";
   // provider → model → key → workspace. The order is the wizard's, not §8.1's
   // letter-for-letter: the connection test addresses a model, so asking for the
   // key first would make the probe impossible on a first run. See `WIZARD_STEPS`.
-  await app.locator('[data-testid="baah-wizard-provider-openai-compatible"]').click();
-  await app.locator('[data-testid="baah-wizard-provider-label"]').fill("e2e");
-  await app.locator('[data-testid="baah-wizard-provider-baseurl"]').fill(PROVIDER_BASE_URL);
+  await app.locator(`[data-testid="baah-wizard-provider-${vendor}"]`).click();
+  // Only the two template rows render these fields, and every row that needs an
+  // endpoint needs both: the label names the entry (and its key slot), the URL is
+  // the only thing that decides where requests go.
+  if (await app.locator('[data-testid="baah-wizard-provider-label"]').count() > 0) {
+    await app.locator('[data-testid="baah-wizard-provider-label"]').fill("e2e");
+    await app.locator('[data-testid="baah-wizard-provider-baseurl"]').fill(PROVIDER_BASE_URL);
+  }
   await app.locator('[data-testid="baah-wizard-next-provider"]').click();
 
   await app.locator('[data-testid="baah-wizard-model"]').fill(options.model ?? "gpt-fake");
@@ -95,7 +115,7 @@ export async function completeWizard(
 /** Boot and configure in one step. */
 export async function openConfiguredApp(
   app: Page,
-  options: { readonly model?: string; readonly probe?: boolean } = {},
+  options: { readonly model?: string; readonly probe?: boolean; readonly vendor?: string } = {},
 ): Promise<void> {
   await app.goto("/");
   await waitForApp(app);

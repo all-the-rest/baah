@@ -57,7 +57,7 @@
  * Preflight 404, error path without ACAO, "nicht darum herum designen").
  */
 import type { ConnectionProbeReport, ProbeOutcome, ProbeVerdict } from "../../providers/probe.ts";
-import { PROVIDER_CATALOG, type ProviderEntry } from "../../providers/catalog.ts";
+import { PROVIDER_CATALOG, findProvider, type ProviderEntry } from "../../providers/catalog.ts";
 
 /** The wizard's steps. */
 export type WizardStep = "provider" | "model" | "key" | "workspace" | "done";
@@ -248,13 +248,36 @@ export function defaultBaseUrl(entry: ProviderEntry): string {
 /**
  * Build the stored `vendor` id from the wizard's inputs.
  *
- * `apiKeySlot` splits on the **first** colon, so an `openai-compatible` entry is
- * `openai-compatible:<label>` and the label is a *label* — it never becomes part
- * of a URL (`ids.ts` documents the round trip, and `factories.ts` documents that
- * the name is not a URL).
+ * `apiKeySlot` splits on the **first** colon, so a custom entry is
+ * `openai-compatible:<label>` or `anthropic-compatible:<label>` and the label is
+ * a *label* — it never becomes part of a URL (`ids.ts` documents the round trip,
+ * and `factories.ts` documents that the name is not a URL).
+ *
+ * ## The test is `entry.needsEndpoint`, not the vendor's name
+ *
+ * It used to be `if (base !== "openai-compatible") return base;` — a hardcoded
+ * list of one. The second shape, `anthropic-compatible`, arrived and the same
+ * question had to be asked about it: *is this a row the user fills in, or a
+ * vendor with its own endpoint?* That is exactly what `needsEndpoint` means in
+ * the catalog, and it is now the test.
+ *
+ * ⚠️ **What this does NOT fix, named rather than implied.** A template row whose
+ * label is blank still comes out of here as the **bare** id —
+ * `vendorId("anthropic-compatible", "  ") === "anthropic-compatible"` — and
+ * `createProviderModel` refuses a shape with no label (`missing_name`). So the
+ * wizard's `Weiter` can still write a configuration the app then rejects, with no
+ * field on screen explaining why.
+ *
+ * That is **pre-existing and identical for both templates**, so it is not a
+ * regression and this block did not make it worse. It is also **not fixed here**:
+ * refusing to advance, or synthesising a label, would be a product decision about
+ * the wizard's flow, and a half-made one is worse than a stated gap. The gap is
+ * pinned by `onboarding.test.ts` › "a blank label produces a bare template id, for
+ * both rows alike" so the next reader finds it in a test rather than having to
+ * re-derive it from a comment that used to imply it was closed.
  */
 export function vendorId(base: string, label: string | undefined): string {
-  if (base !== "openai-compatible") return base;
+  if (findProvider(base)?.needsEndpoint !== true) return base;
   const trimmed = (label ?? "").trim();
   return trimmed === "" ? base : `${base}:${trimmed}`;
 }

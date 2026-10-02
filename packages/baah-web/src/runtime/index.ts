@@ -209,6 +209,13 @@ import { createObservable, type Observable } from "../lib/observable.ts";
 import { apiKeySlot, newId } from "../lib/ids.ts";
 import { PROVIDER_CATALOG, parseCatalogId, type ProviderEntry } from "../providers/catalog.ts";
 import {
+  ModelListError,
+  listModelsFromSettings,
+  type ModelList,
+  type ModelListErrorCode,
+  type ModelListOptions,
+} from "../providers/models.ts";
+import {
   ConnectionProbeError,
   probeFromSettings,
   type ConnectionProbeOptions,
@@ -394,6 +401,22 @@ export interface BaahRuntime {
   /** The §8.1 connection test. Never throws for a provider problem. */
   probe(options?: ConnectionProbeOptions): Promise<ConnectionProbeReport>;
 
+  /**
+   * `Plan.md` §8.1 step 4's model list, read from the provider's own `/models`.
+   *
+   * **This is what makes the loader reachable at all.** The loader itself was
+   * correct and fully unit-tested while nothing in the app could call it, and
+   * `ModelList.complete` — the field whose entire reason for existing is "an
+   * incomplete list must not look like a complete one" — was a return value no
+   * screen ever rendered.
+   *
+   * The key is read out of the store here for the same reason `probe` does it: a
+   * component holding a key can render it, log it and put it in a dependency
+   * array. Rejects with a `RuntimeError` carrying **the loader's own code**, so
+   * `state.lastError.code` says which of the six failures happened.
+   */
+  listModels(options?: ModelListOptions): Promise<ModelList>;
+
   /** §8.2 export. Keys are excluded unless `options.includeApiKeys` says so. */
   exportSettings(options?: SettingsExportOptions): SettingsExportFile;
   /** §8.2 import, validated. Returns the diff; applies nothing. */
@@ -456,6 +479,24 @@ const FALLBACK_MESSAGE: Readonly<Record<ErrorOrigin, string>> = {
 };
 
 /**
+ * `ModelListError`'s six codes → this layer's own, **one for one**.
+ *
+ * A `Record` rather than six `if`s so that a **seventh** code added to
+ * `ModelListError` is a type error *here* — the compiler lists the members that are
+ * missing, at the one place the mapping lives. A chain of string comparisons would
+ * accept a new code silently and fall through to the generic branch, which is the
+ * defect this mapping exists to fix.
+ */
+const MODEL_LIST_CODES: Readonly<Record<ModelListErrorCode, RuntimeErrorCode>> = {
+  unknown_provider: "model-list-unknown-provider",
+  missing_endpoint: "model-list-missing-endpoint",
+  missing_api_key: "model-list-missing-api-key",
+  http_error: "model-list-http-error",
+  unreachable: "model-list-unreachable",
+  malformed_response: "model-list-malformed-response",
+};
+
+/**
  * Why a transcript read was refused, in words a user can act on.
  *
  * The store's **`code`** is preferred over its message, and the reason is the
@@ -493,6 +534,27 @@ function toRuntimeError(error: unknown, origin: ErrorOrigin): RuntimeError {
   }
   if (error instanceof ConnectionProbeError) {
     return new RuntimeError("probe-failed", `${error.code}: ${error.message}`);
+  }
+  if (error instanceof ModelListError) {
+    /**
+     * The model list, and the reason this is **not** `probe-failed`.
+     *
+     * It had no case here at all, so every `ModelListError` fell through to the
+     * generic branch and arrived as
+     * `RuntimeError("provider-unresolved", "ModelListError: the provider could not
+     * be reached")` — while `Onboarding.runModelList` renders `error.name`, so the
+     * user literally read **„RuntimeError"**. All six of `ModelListError`'s codes
+     * became one sentence, which is the exact collapse the six exist to prevent:
+     * `models.ts`'s own doc table promises the wizard "reacts differently to each".
+     *
+     * The mapping is **one for one** rather than a single `model-list-failed`, so
+     * `runtime-error-code` on the status bar — and any future branch in the wizard —
+     * can tell "the provider answered 401" from "we could not parse what it
+     * answered". The message keeps the class's own `code` as a prefix for the same
+     * reason `ProviderError`'s does: the union member says which subsystem, and the
+     * prefix says which of its six codes.
+     */
+    return new RuntimeError(MODEL_LIST_CODES[error.code], `${error.code}: ${error.message}`);
   }
   /**
    * The redaction, unchanged and deliberate.
@@ -1053,6 +1115,19 @@ export function createRuntime(dependencies: RuntimeDependencies): BaahRuntime {
         // Provider, same as the resolve above: the probe is the other way of
         // asking "can this provider be reached", and §8.1's wizard has to be able
         // to say which subsystem to look at.
+        throw fail(error, "provider");
+      }
+    },
+
+    async listModels(modelOptions = {}): Promise<ModelList> {
+      try {
+        return await listModelsFromSettings(settings.get(), modelOptions);
+      } catch (error) {
+        // **Provider, and specifically the reason the mapping above exists.** A
+        // `ModelListError` with no case here became a generic `provider-unresolved`
+        // whose `name` the wizard rendered verbatim — so the user read
+        // „RuntimeError" instead of whether to fill in a base URL, save a key, or
+        // read a status code. `MODEL_LIST_CODES` keeps all six apart.
         throw fail(error, "provider");
       }
     },

@@ -30,15 +30,46 @@ describe("WIZARD_STEPS", () => {
 });
 
 describe("the vendor id", () => {
-  it("appends a label only for `openai-compatible`", () => {
-    // The label exists so a second OpenAI-compatible provider can have its own key
-    // slot; for every other vendor there is exactly one endpoint and a label would be
+  it("appends a label to BOTH template rows, and to no other", () => {
+    // The label exists so a second user-filled provider can have its own key slot;
+    // for every row with a known endpoint there is exactly one and a label would be
     // a second name for the same thing.
+    //
+    // **Both templates, not just `openai-compatible`.** The test was titled
+    // "appends a label only for `openai-compatible`" and had no
+    // `anthropic-compatible` case at all — so mutation m15 (the hardcoded
+    // `base !== "openai-compatible"` that this function replaced) survived the
+    // whole suite, because every assertion in it happened to be about the row that
+    // the mutation still handled correctly. A title that names one shape is a test
+    // that checks one shape.
     expect(vendorId("openai-compatible", "e2e")).toBe("openai-compatible:e2e");
+    expect(vendorId("anthropic-compatible", "e2e")).toBe("anthropic-compatible:e2e");
+    // A label the user typed as the vendor's own name is still just a label.
+    expect(vendorId("anthropic-compatible", "anthropic")).toBe("anthropic-compatible:anthropic");
+
+    // …and no other row grows one.
+    for (const firstParty of ["openai", "anthropic", "google"]) {
+      expect(vendorId(firstParty, "e2e"), firstParty).toBe(firstParty);
+    }
+  });
+
+  it("a blank label produces a bare template id, for both rows alike", () => {
+    // A whitespace-only label is the same as none. **The consequence is that
+    // `createProviderModel` refuses it with `missing_name`** — a template row with
+    // no label is not a usable configuration, and the wizard's `Weiter` writes it
+    // anyway. That is pre-existing and identical for both rows (F10, LOW: not a
+    // regression), and it is asserted here rather than left for a reader to
+    // discover: a test that only asserted the bare id would pass against a
+    // `vendorId` that had stopped trimming.
     expect(vendorId("openai-compatible", "  ")).toBe("openai-compatible");
+    expect(vendorId("anthropic-compatible", "  ")).toBe("anthropic-compatible");
     expect(vendorId("openai-compatible", undefined)).toBe("openai-compatible");
-    expect(vendorId("openai", "e2e")).toBe("openai");
-    expect(vendorId("anthropic", "e2e")).toBe("anthropic");
+    expect(vendorId("anthropic-compatible", undefined)).toBe("anthropic-compatible");
+    // A label with whitespace *around* it is trimmed rather than stored verbatim —
+    // otherwise the key slot becomes `"openai-compatible: groq"` and a stored key
+    // under the untrimmed name is orphaned.
+    expect(vendorId("openai-compatible", "  groq  ")).toBe("openai-compatible:groq");
+    expect(vendorId("anthropic-compatible", "  groq  ")).toBe("anthropic-compatible:groq");
   });
 
   it("round-trips through `splitVendor`", () => {

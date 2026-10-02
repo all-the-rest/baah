@@ -46,6 +46,7 @@ import { createMemoryBackend, type KeyValueBackend } from "../lib/storage.ts";
 import type { SettingsSnapshot } from "../lib/settings.ts";
 
 import { failureView } from "../components/lib/turn.ts";
+import { ModelListError } from "../providers/models.ts";
 import { createRuntime, RuntimeError } from "./index.ts";
 import type { RuntimeEvent } from "./events.ts";
 import * as guard from "./guard.ts";
@@ -440,6 +441,104 @@ describe("each origin reports its own code", () => {
     // collapsing the two is the bug the per-origin tests exist to prevent.
     expect(turnOrigin.outcome).toBe("failed");
     expect(turnOrigin.classification).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The model list's own six codes                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ## Why this block is here at all
+ *
+ * `toRuntimeError` had a case for `RuntimeError`, `ProviderError`,
+ * `SettingsStorageError` and `ConnectionProbeError` — and **none for
+ * `ModelListError`**. Every one of the loader's six codes therefore fell through to
+ * the generic branch and became
+ * `RuntimeError("provider-unresolved", "ModelListError: the provider could not be
+ * reached")`, while `Onboarding.runModelList` renders `error.name`. **The user
+ * literally read „RuntimeError."**
+ *
+ * That is the collapse `ModelListError`'s own doc table is written against: it
+ * promises six codes that are "each reachable and says something different, because
+ * the wizard reacts differently to each", and all six arrived as one sentence.
+ */
+describe("a model-list failure keeps its own code", () => {
+  /**
+   * The six, in the order the loader's type declares them — and the six is the
+   * assertion. A single test with one code would pass against a mapping that kept
+   * one of them; six separate ones cannot.
+   */
+  const codes = [
+    "unknown_provider",
+    "missing_endpoint",
+    "missing_api_key",
+    "http_error",
+    "unreachable",
+    "malformed_response",
+  ] as const;
+
+  /**
+   * A runtime whose model list fails with the loader's own error class.
+   *
+   * Through the **injected `fetch`**, not through the store: the store is not on
+   * this path, and a `fetch` that rejects is the real shape of every one of the six
+   * codes — `fetchPage` re-throws a `ModelListError` unchanged, so what reaches
+   * `toRuntimeError` is exactly the object constructed here.
+   */
+  function failing(code: (typeof codes)[number], message: string) {
+    const { runtime } = harness();
+    const thrown = runtime
+      .listModels({ fetch: () => Promise.reject(new ModelListError(code, message)) })
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    return { runtime, thrown };
+  }
+
+  for (const code of codes) {
+    it(`names \`${code}\` as a model-list failure and not a provider one`, async () => {
+      const { runtime, thrown } = failing(code, "x");
+      const error = await thrown;
+
+      // The mapping is **one for one**, not one `model-list-failed` for all six.
+      expect(error).toBeInstanceOf(RuntimeError);
+      expect((error as RuntimeError).code).toBe(`model-list-${code.replaceAll("_", "-")}`);
+      // Not the generic provider code a `ModelListError` used to land on, because
+      // "the provider could not be reached" is what the user was told before and it
+      // is actionable in none of the six cases.
+      expect((error as RuntimeError).code).not.toBe("provider-unresolved");
+      // …and the snapshot the status bar renders agrees with the rejection.
+      expect(runtime.getState().lastError).toMatchObject({
+        code: `model-list-${code.replaceAll("_", "-")}`,
+      });
+    });
+  }
+
+  it("keeps the loader's own code and message, not the generic fallback sentence", async () => {
+    // The generic branch produces `ModelListError: the provider could not be
+    // reached` — the class name plus a sentence that is wrong for five of the six
+    // codes. Asserting the **absence** of that string is what makes "it took its
+    // own branch" observable rather than inferred from the code alone; without it a
+    // mapping that produced the right `code` and the wrong text would pass.
+    const { thrown } = failing("missing_endpoint", "fill in the base URL first");
+    const error = (await thrown) as RuntimeError;
+
+    expect(error.message).toBe("missing_endpoint: fill in the base URL first");
+    expect(error.message).not.toContain("the provider could not be reached");
+  });
+
+  it("keeps the key out of a model-list failure, like every other origin", async () => {
+    // The redaction half, on the new branch. `fetchPage`'s messages are literals
+    // that interpolate only a status number, so this is a property of the branch
+    // rather than of the loader: a `ModelListError` reaching the generic fallback
+    // would have contributed its class name and the origin sentence, and this
+    // asserts the other path keeps it out.
+    const { thrown } = failing("http_error", "The provider answered the model list with HTTP 401.");
+    const error = (await thrown) as RuntimeError;
+
+    expect(error.message).not.toContain(KEY);
   });
 });
 

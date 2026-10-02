@@ -221,7 +221,9 @@ describe("the barrel re-exports the engine", () => {
       "ProviderError",
       "requiredHeaders",
       "isCorsVerified",
+      "corsVerdict",
       "parseVendorId",
+      "resolveVendor",
       "fingerprint",
     ] as const) {
       expect((barrel as unknown as Record<string, unknown>)[name], name).toBeDefined();

@@ -1,19 +1,13 @@
 /**
- * OpenAI-compatible chunk builders — one function per scenario in Plan.md §15.6.
+ * OpenAI-compatible **and** Anthropic Messages chunk builders — one function per
+ * scenario in Plan.md §15.6.
  *
- * The shapes come from `@ai-sdk/openai@4.0.80`, the provider version `ai@7.0.122`
- * pins in its own devDependencies, read out of `dist/index.js`:
- *
- * - `openaiChatChunkSchema` (the union arm that is not `openaiErrorDataSchema`):
- *   `{ id?, created?, model?, choices: [{ index, delta?: { role?, content?,
- *   tool_calls?: [{ index, id?, type?, function: { name?, arguments? } }] },
- *   logprobs?, finish_reason? }], usage? }`.
- * - `openaiResponsesChunkSchema`: a union of `response.created`,
- *   `response.in_progress`, `response.output_text.delta`
- *   (`{ item_id, output_index?, delta, logprobs? }`), `response.output_item.added`
- *   / `.done` (item `{ type: "message" | "function_call", ... }`),
- *   `response.function_call_arguments.delta` / `.done`, `response.completed` /
- *   `response.incomplete`, `response.failed` and `{ type: "error" }`.
+ * The shapes come from the provider packages `ai@7.0.122` pins:
+ * `@ai-sdk/openai@4.0.80` (`openaiChatChunkSchema` and
+ * `openaiResponsesChunkSchema`, read out of `dist/index.js`) and
+ * `@ai-sdk/anthropic@4.0.68` (`anthropicChunkSchema`,
+ * `src/anthropic-api.ts:1121`). Both are named here because a fake written from
+ * a blog post is a fake that cannot fail.
  *
  * Every builder returns a complete turn. The agent loop asks the provider for
  * one step per request, so a tool call is a complete, terminal turn of its own;
@@ -250,6 +244,170 @@ export function uiMessageStreamTurn(text: string): Turn {
     ],
     noTools,
   );
+}
+
+// --------------------------------------------------------------------------
+// Anthropic Messages — POST {baseURL}/messages
+// --------------------------------------------------------------------------
+
+/**
+ * A complete text turn in Anthropic's Messages SSE.
+ *
+ * ## Where every field comes from
+ *
+ * **The shape is `anthropicChunkSchema`**, read out of
+ * `@ai-sdk/anthropic@4.0.68/src/anthropic-api.ts:1121` — a
+ * `discriminatedUnion("type", …)` over exactly seven event types. A builder
+ * that emitted a ninth would be caught by the SDK's `safeParseJSON` and the
+ * turn would die as an `InvalidResponseDataError`.
+ *
+ * **The order and the `event:` names are the API's**, from
+ * `platform.claude.com/docs/en/build-with-claude/streaming`:
+ * `message_start` → (`content_block_start` → `content_block_delta`* →
+ * `content_block_stop`)* → `message_delta` → `message_stop`, with `ping`
+ * allowed anywhere.
+ *
+ * ## The two fields this turn cannot omit, and why
+ *
+ * 1. **`message_delta.delta.stop_reason`.** `Plan.md` §5.4's terminal-event check
+ *    is `rawFinishReason !== undefined`, and the Anthropic SDK fills `raw` from
+ *    exactly this field (`anthropic-language-model.ts:2972`,
+ *    `raw: value.delta.stop_reason ?? undefined`). Omit it and a perfectly good
+ *    answer reads as a truncated stream — the same defect the OpenAI Responses
+ *    path has (`scenarios.e2e.ts` documents it). This is the one field a
+ *    hand-written fake is most likely to leave out and most likely to hide.
+ * 2. **`message_delta.usage.output_tokens`.** The schema types it as
+ *    `z.number()`, **not** nullish — a missing usage object fails the parse.
+ *
+ * ## No `data: [DONE]`
+ *
+ * Anthropic does not send one; `parseJsonEventStream` swallows it if it
+ * arrives (`@ai-sdk/provider-utils`), so emitting one would be a fabrication
+ * that happens to be harmless. `isCleanlyTerminated()` in `sse.ts` checks for
+ * it and therefore does **not** apply to this body — the Messages stream ends at
+ * `message_stop`.
+ */
+export function anthropicTextTurn(text: string): Turn {
+  const messageId = "msg_e2e";
+  return {
+    body: frameSse([
+      {
+        kind: "data",
+        event: "message_start",
+        value: {
+          type: "message_start",
+          message: {
+            id: messageId,
+            type: "message",
+            role: "assistant",
+            model: "claude-fake",
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            // `input_tokens` is `z.number()` (not nullish) in the schema.
+            usage: { input_tokens: 7, output_tokens: 1 },
+          },
+        },
+      },
+      {
+        kind: "data",
+        event: "content_block_start",
+        value: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      },
+      // A real `ping` between the block start and the first delta, because the
+      // docs show one there and a fake that omits every incidental event is a
+      // fake that cannot catch a parser which mishandles them.
+      { kind: "data", event: "ping", value: { type: "ping" } },
+      ...text
+        .split(" ")
+        .map((word) => ({
+          kind: "data" as const,
+          event: "content_block_delta",
+          value: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `${word} ` } },
+        })),
+      { kind: "data", event: "content_block_stop", value: { type: "content_block_stop", index: 0 } },
+      {
+        kind: "data",
+        event: "message_delta",
+        // `stop_reason` is what the engine's terminal-event check reads, and
+        // `usage.output_tokens` is required by the schema. Both are load-bearing;
+        // see the block comment above.
+        value: { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 11 } },
+      },
+      { kind: "data", event: "message_stop", value: { type: "message_stop" } },
+    ]),
+    toolCallIds: [],
+    toolNames: [],
+  };
+}
+
+/**
+ * A Messages turn that calls one tool and stops.
+ *
+ * Present so the Anthropic path is not only ever exercised on the easiest shape:
+ * `content_block_start` with `content_block.type: "tool_use"` and
+ * `input_json_delta` fragments is a different branch through
+ * `anthropic-language-model.ts` than `text_delta`, and it is the branch that
+ * produces the `finishReason: "tool-calls"` the engine treats as "keep going".
+ *
+ * `stop_reason: "tool_use"` is the terminal event for a tool call — `"end_turn"`
+ * here would end the turn with an unanswered tool call.
+ */
+export function anthropicToolCallTurn(options: {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly input: unknown;
+}): Turn {
+  const fragments = fragmentJson(options.input);
+  return {
+    body: frameSse([
+      {
+        kind: "data",
+        event: "message_start",
+        value: {
+          type: "message_start",
+          message: {
+            id: "msg_e2e",
+            type: "message",
+            role: "assistant",
+            model: "claude-fake",
+            content: [],
+            stop_reason: null,
+            usage: { input_tokens: 7, output_tokens: 1 },
+          },
+        },
+      },
+      {
+        kind: "data",
+        event: "content_block_start",
+        value: {
+          type: "content_block_start",
+          index: 0,
+          // `input` is optional in the schema; the real API sends `{}` here and
+          // fills it from the deltas that follow.
+          content_block: { type: "tool_use", id: options.toolCallId, name: options.toolName, input: {} },
+        },
+      },
+      ...fragments.map((fragment) => ({
+        kind: "data" as const,
+        event: "content_block_delta",
+        value: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: fragment } },
+      })),
+      { kind: "data", event: "content_block_stop", value: { type: "content_block_stop", index: 0 } },
+      {
+        kind: "data",
+        event: "message_delta",
+        value: {
+          type: "message_delta",
+          delta: { stop_reason: "tool_use", stop_sequence: null },
+          usage: { output_tokens: 13 },
+        },
+      },
+      { kind: "data", event: "message_stop", value: { type: "message_stop" } },
+    ]),
+    toolCallIds: [options.toolCallId],
+    toolNames: [options.toolName],
+  };
 }
 
 // --------------------------------------------------------------------------

@@ -21,6 +21,7 @@ import { describe, expect, it } from "vitest";
 import type { LanguageModel } from "ai";
 import {
   createProviderModel,
+  corsVerdict,
   defineProviderFactory,
   fingerprint as registryFingerprint,
   isCorsVerified,
@@ -28,6 +29,7 @@ import {
   ProviderError,
   ProviderRegistry,
   requiredHeaders,
+  resolveVendor,
   type ProviderFactory,
   type ProviderSettings,
 } from "../../src/provider/registry.ts";
@@ -134,6 +136,144 @@ describe("the Anthropic browser header", () => {
     expect(requiredHeaders("openai")).toEqual({});
     expect(requiredHeaders("google")).toEqual({});
     expect(requiredHeaders("openai-compatible")).toEqual({});
+  });
+
+  it("FIXED: an `anthropic-compatible:<label>` entry gets NO browser header", () => {
+    // **The negative, asserted as a negative.** `anthropic-compatible:my-proxy`
+    // is a third party speaking Anthropic's dialect. Sending the header there
+    // makes a claim about someone else's security model that is not true, and
+    // tells a service that has no business knowing that this app talks to
+    // Anthropic at all.
+    //
+    // The three spellings are all exercised deliberately: the bare shape, the
+    // shape with a label, and a label that is literally the word "anthropic" —
+    // because "does the string contain anthropic" is the mutation this is here
+    // to kill, and a user can type that label.
+    for (const id of ["anthropic-compatible", "anthropic-compatible:my-proxy", "anthropic-compatible:anthropic"]) {
+      expect(requiredHeaders(id), id).toEqual({});
+      expect(Object.keys(requiredHeaders(id)), id).not.toContain("anthropic-dangerous-direct-browser-access");
+    }
+  });
+
+  it("and the absence survives the whole chain into a factory, not just the pure function", () => {
+    // The pure function is where the decision is made; this is the place where a
+    // later edit could add the header back — in `createProviderModel`, in the
+    // merge order, or in `defineProviderFactory`. Both directions, on the wire.
+    const factory = fakeFactory("anthropic-compatible");
+    createProviderModel({
+      settings: settings({
+        vendor: "anthropic-compatible:my-proxy",
+        baseUrl: "https://proxy.example.invalid/v1",
+      }),
+      factories: [factory],
+    });
+    expect(factory.calls[0]?.headers).toEqual({});
+    expect(factory.calls[0]?.headers).not.toHaveProperty("anthropic-dangerous-direct-browser-access");
+    expect(factory.calls[0]?.baseUrl).toBe("https://proxy.example.invalid/v1");
+
+    // …and the first-party entry through the same factory-free path still has it.
+    const firstParty = fakeFactory("anthropic");
+    createProviderModel({ settings: settings(), factories: [firstParty] });
+    expect(firstParty.calls[0]?.headers["anthropic-dangerous-direct-browser-access"]).toBe("true");
+  });
+
+  it("does not leak onto an id that merely *starts with* anthropic", () => {
+    // A `startsWith` mutation passes both of the tests above for
+    // `anthropic-compatible:…` only if the label is not also part of the string
+    // under test. These are the ids a substring check would get wrong.
+    for (const id of ["anthropic-compatible", "anthropic-2", "anthropicx", "xanthropic"]) {
+      expect(requiredHeaders(id), id).toEqual({});
+    }
+    expect(requiredHeaders("anthropic")).not.toEqual({});
+  });
+
+  it("DECIDED: a first-party `anthropic` with a FOREIGN `baseUrl` still sends it", () => {
+    // **The policy, pinned — because it is a policy and not an accident.**
+    //
+    // This was left undecided and untested: `vendor: "anthropic"` with
+    // `baseUrl: "https://proxy.example.invalid/v1"` sends
+    // `anthropic-dangerous-direct-browser-access: true` to a host that is not
+    // Anthropic, which is the same third-party disclosure the
+    // `anthropic-compatible` row exists to prevent. It is reachable without the
+    // wizard: `baseUrl` is a bare `z.string().optional()` in the §8.2 import
+    // schema, so an imported settings file can do it.
+    //
+    // **The decision is: allow it.** The user selected the Anthropic row and typed
+    // that address; that *is* the identity claim, and a proxy in front of Anthropic
+    // genuinely needs the header forwarded. The row for "this is not Anthropic" is
+    // `anthropic-compatible:<label>`, and it exists precisely so the negative claim
+    // can be made.
+    //
+    // The rejected alternative was keying off the **hostname**: it would make a
+    // guess about a host the arbiter of a security claim, and `proxy.example.invalid`
+    // and `api.anthropic.com` are the same deployment in every case that matters.
+    // That is strictly worse than a decision the user made, so it was not taken.
+    //
+    // Asserted on the **factory's outgoing headers**, not on `requiredHeaders` alone:
+    // a refusal implemented anywhere else in the chain would pass the pure function.
+    const factory = fakeFactory("anthropic");
+    createProviderModel({
+      settings: settings({ vendor: "anthropic", baseUrl: "https://proxy.example.invalid/v1" }),
+      factories: [factory],
+    });
+
+    expect(factory.calls[0]?.baseUrl).toBe("https://proxy.example.invalid/v1");
+    expect(factory.calls[0]?.headers["anthropic-dangerous-direct-browser-access"]).toBe("true");
+
+    // …and the *labelled* third party, through the same factory, in the same test
+    // file, gets nothing. The two are one decision and are asserted together on
+    // purpose: an asymmetry between them is the bug this block's negative is for.
+    const thirdParty = fakeFactory("anthropic-compatible");
+    createProviderModel({
+      settings: settings({ vendor: "anthropic-compatible:my-proxy", baseUrl: "https://proxy.example.invalid/v1" }),
+      factories: [thirdParty],
+    });
+    expect(thirdParty.calls[0]?.baseUrl).toBe("https://proxy.example.invalid/v1");
+    expect(thirdParty.calls[0]?.headers).toEqual({});
+  });
+
+  it("the operator is derived from the parse, and the two agree on every id", () => {
+    // The claim being corrected, **measured**: over the adversarial ids below,
+    // `operator === "anthropic"` and `parseVendorId(id).vendor === "anthropic"`
+    // have 0 mismatches. They are the same predicate, and the doc comment above
+    // used to claim an independence the code does not have.
+    //
+    // So this test does two things. It **pins the parity** — because the parity is
+    // what the code actually does and a future edit that breaks it would otherwise
+    // be invisible. And it **enumerates the class the parse closes**: every one of
+    // these is an id where a `startsWith` or a raw-string check would give a
+    // different answer than the first-colon split.
+    const ids = [
+      "anthropic",
+      "anthropic:eu",
+      "anthropic:",
+      "anthropicx",
+      "anthropic-2",
+      "xanthropic",
+      "anthropic-compatible",
+      "anthropic-compatible:anthropic",
+      "Anthropic",
+      "ANTHROPIC",
+      " anthropic",
+      "anthropic ",
+      "openai",
+      "google",
+      "",
+      ":",
+    ] as const;
+    for (const id of ids) {
+      const resolved = resolveVendor(id);
+      expect(resolved.operator === "anthropic", id).toBe(resolved.vendor === "anthropic");
+    }
+
+    // The specific pairs, named — so a reader can see what the parity is *for*.
+    // Case matters: `Anthropic` is not the Anthropic row, and a `toLowerCase()`
+    // "fix" would send a credential-bearing claim to a host the user mistyped.
+    expect(resolveVendor("Anthropic").operator).toBe("third-party");
+    expect(resolveVendor("ANTHROPIC").operator).toBe("third-party");
+    // A label is not the vendor, however it is spelled.
+    expect(resolveVendor("anthropic:eu").operator).toBe("anthropic");
+    expect(resolveVendor("anthropic-compatible:anthropic").operator).toBe("third-party");
   });
 
   it("reaches the factory on every construction, not just the first", () => {
@@ -346,6 +486,34 @@ describe("parseVendorId", () => {
     expect(factory.calls[0]?.baseUrl).toBeUndefined();
   });
 
+  it("requires a name for `anthropic-compatible` too — the same rule, one implementation", () => {
+    // This is why the check keys off `resolveVendor().template` instead of
+    // `vendor === "openai-compatible"`: the new shape has to be covered, and a
+    // second string comparison is how it would have been forgotten.
+    const factory = fakeFactory("anthropic-compatible");
+    try {
+      createProviderModel({
+        settings: settings({ vendor: "anthropic-compatible", baseUrl: "https://proxy.example.invalid/v1" }),
+        factories: [factory],
+      });
+      expect.unreachable();
+    } catch (error) {
+      expect((error as ProviderError).code).toBe("missing_name");
+      expect((error as Error).message).toContain("anthropic-compatible:groq");
+    }
+    // With a label it builds, at the user's URL, and with no header.
+    createProviderModel({
+      settings: settings({
+        vendor: "anthropic-compatible:my-proxy",
+        baseUrl: "https://proxy.example.invalid/v1",
+      }),
+      factories: [factory],
+    });
+    expect(factory.calls).toHaveLength(1);
+    expect(factory.calls[0]?.baseUrl).toBe("https://proxy.example.invalid/v1");
+    expect(factory.calls[0]?.headers).not.toHaveProperty("anthropic-dangerous-direct-browser-access");
+  });
+
   it("FIXED: `settings.name` is a real part of the identity, not a presence flag", async () => {
     // It used to decide whether the call succeeded and then be thrown away: the
     // check read `name ?? settings.name` while everything after read the id
@@ -488,11 +656,194 @@ describe("the fingerprint memo", () => {
 /* ------------------------------------------------------------------ */
 
 describe("isCorsVerified", () => {
-  it("marks only openai unverified", () => {
-    expect(isCorsVerified("openai")).toBe(false);
+  it("marks only the three first-party operators verified", () => {
+    // §9's table, read off the page rather than off the implementation. The
+    // expectations are literals on purpose: `entry.id !== "openai"` inside the
+    // expectation would be the old bug wearing the test's clothes.
+    expect(corsVerdict("anthropic")).toBe("verified");
+    expect(corsVerdict("google")).toBe("verified");
+    // §9 measured OpenAI and the measurement does not establish it: only
+    // `/v1/models` sends ACAO, the inference endpoints do not on the error path,
+    // and the success path needs a real key — which does not live in this repo.
+    expect(corsVerdict("openai")).toBe("unconfirmed");
+
     expect(isCorsVerified("anthropic")).toBe(true);
     expect(isCorsVerified("google")).toBe(true);
-    expect(isCorsVerified("openai-compatible")).toBe(true);
+    expect(isCorsVerified("openai")).toBe(false);
+  });
+
+  it("FIXED: an unmeasured endpoint is `unmeasured`, not `true`", () => {
+    // `return vendor !== "openai"` reported every one of these as verified. The
+    // wizard renders this as „CORS bestätigt" (`Onboarding.tsx`), so the string
+    // comparison was the badge.
+    const unmeasured = [
+      "openai-compatible",
+      "openai-compatible:groq",
+      "openai-compatible:my-vllm",
+      "anthropic-compatible",
+      "anthropic-compatible:my-proxy",
+      // A typo, and a vendor id added tomorrow.
+      "openaai",
+      "anthropicc",
+      "cohere",
+      "",
+    ];
+    for (const id of unmeasured) {
+      expect(corsVerdict(id), id).toBe("unmeasured");
+      expect(isCorsVerified(id), id).toBe(false);
+    }
+  });
+
+  it("a self-chosen label cannot vouch for an endpoint", () => {
+    // §9 measured six named OpenAI-compatible operators, and the app has no id
+    // for any of them — the label is free text. So `…:groq` is *not* a claim
+    // that this is Groq, and must not be scored as one; the connection test is
+    // what settles it (`probe.ts`), which is what the wizard already says.
+    expect(corsVerdict("openai-compatible:groq")).toBe(corsVerdict("openai-compatible:not-a-real-provider"));
+    // Same for the operator: the *shape* is third-party whatever it is called.
+    expect(corsVerdict("anthropic-compatible:anthropic")).toBe("unmeasured");
+  });
+
+  it("`isCorsVerified` is the strict narrowing, and says so by existing", () => {
+    // Two booleans cannot carry three states. The pair has to agree, and the
+    // wrapper must be the `=== "verified"` one rather than a second opinion.
+    for (const id of ["anthropic", "google", "openai", "openai-compatible:groq", "nope"]) {
+      expect(isCorsVerified(id), id).toBe(corsVerdict(id) === "verified");
+    }
+  });
+
+  it("a LABELLED first-party id is `unmeasured`, and that branch is the point", () => {
+    // **Mutation m14 survived the whole suite by deleting this branch.** Nothing
+    // asserted `corsVerdict` for any labelled first-party id, so
+    // `corsVerdict("anthropic:eu")` could report `"verified"` with everything else
+    // green — and a badge reading „CORS bestätigt" on a **region nobody measured**
+    // is exactly the claim this function exists to refuse.
+    //
+    // The two first-party rows that *can* be labelled, both ways, plus the boundary
+    // case the parser produces: `anthropic:` has an **empty** label, and
+    // `parseVendorId` normalises that to `name: undefined` — so it is the bare id
+    // and keeps the measurement. Asserting it makes the normalisation visible
+    // rather than incidental.
+    for (const id of ["anthropic:eu", "anthropic:us", "anthropic:x", "anthropic:0"]) {
+      expect(corsVerdict(id), id).toBe("unmeasured");
+      expect(isCorsVerified(id), id).toBe(false);
+    }
+    for (const id of ["openai:eu", "google:eu"]) {
+      expect(corsVerdict(id), id).toBe("unmeasured");
+    }
+    // The measured bare ids keep their verdicts, so the branch narrows and does not
+    // simply turn everything into "unmeasured".
+    expect(corsVerdict("anthropic")).toBe("verified");
+    expect(corsVerdict("google")).toBe("verified");
+    expect(corsVerdict("openai")).toBe("unconfirmed");
+    // An empty label is no label: `parseVendorId` says so, and the branch follows
+    // the parse rather than the character.
+    expect(corsVerdict("anthropic:")).toBe("verified");
+  });
+
+  it("m13: a template is unmeasured in BOTH places, from ONE set", () => {
+    // **Mutation m13 survived 615/615: a fourth shape added to `TEMPLATE_VENDORS`
+    // alone.** `TEMPLATE_VENDORS` and `MEASURED_CORS` are two tables, and the
+    // registry's comment claimed "one function, on purpose" against a drift that
+    // was still reachable — a shape in one and not the other compiles and is wrong
+    // in the other. There is no fourth table to collapse it into (the wire format
+    // moved to the factory array), so the agreement is **asserted from outside**.
+    //
+    // This is the property that survives the mutation: whatever a new shape's row
+    // says in `MEASURED_CORS`, a template must never be `verified`, because §9
+    // measured **no** endpoint behind a template — the whole class is user-supplied.
+    for (const template of ["openai-compatible", "anthropic-compatible"]) {
+      // The set says it is a template…
+      expect(resolveVendor(template).template, template).toBe(true);
+      // …and the CORS table must agree, in both directions.
+      expect(corsVerdict(template), template).toBe("unmeasured");
+      expect(isCorsVerified(template), template).toBe(false);
+      // …and the label must not change that, however it is spelled.
+      expect(corsVerdict(`${template}:groq`), template).toBe("unmeasured");
+      expect(corsVerdict(`${template}:groq`), template).toBe(corsVerdict(`${template}:anything-else`));
+    }
+  });
+
+  it("a first-party row is in `MEASURED_CORS` and is not a template — both ways", () => {
+    // The same agreement from the other side, and the half that catches a shape
+    // added to `MEASURED_CORS` but not to `TEMPLATE_VENDORS`: that mutation would
+    // give a new user-filled row a `verified` badge, which is the lie this function
+    // was written to remove.
+    const measured = ["anthropic", "google", "openai"] as const;
+    for (const vendor of measured) {
+      expect(resolveVendor(vendor).template, vendor).toBe(false);
+      expect(corsVerdict(vendor), vendor).not.toBe("unmeasured");
+    }
+    // And the two sets partition the app's own ids exactly: a vendor is either
+    // something §9 measured at a known endpoint, or a shape the user fills in.
+    // Nothing is both, and nothing is neither.
+    const templates = ["openai-compatible", "anthropic-compatible"];
+    for (const vendor of [...measured, ...templates]) {
+      const isTemplate = resolveVendor(vendor).template;
+      expect(corsVerdict(vendor) === "unmeasured", vendor).toBe(isTemplate);
+    }
+  });
+});
+
+describe("resolveVendor — an operator and a label", () => {
+  it("gives `anthropic-compatible` the third-party operator without a new vendor", () => {
+    // P1's acceptance criterion 1: same wire format as first-party, different
+    // operator. The **wire format** half is asserted where the routing lives — in
+    // `baah-web/src/providers/factories.test.ts`, against the real SDK calls —
+    // because the `dialect` field that used to carry it here had no production
+    // reader and was deleted (`AGENTS.md` §5; the module header says why).
+    //
+    // What is left on this side is the **claim**, and that is what this asserts.
+    const thirdParty = resolveVendor("anthropic-compatible:my-proxy");
+    expect(thirdParty.operator).toBe("third-party");
+    expect(thirdParty.name).toBe("my-proxy");
+    expect(thirdParty.template).toBe(true);
+
+    expect(resolveVendor("anthropic").operator).toBe("anthropic");
+    expect(resolveVendor("anthropic").template).toBe(false);
+  });
+
+  it("splits on the first colon, so a label may contain one", () => {
+    // A label containing a colon must still never become a URL — this is the
+    // shape of the old `https://groq/…` bug, one syntax level over.
+    const resolved = resolveVendor("anthropic-compatible:my:proxy:8080");
+    expect(resolved.vendor).toBe("anthropic-compatible");
+    expect(resolved.name).toBe("my:proxy:8080");
+
+    const factory = fakeFactory("anthropic-compatible");
+    createProviderModel({
+      settings: settings({ vendor: "anthropic-compatible:my:proxy:8080" }),
+      factories: [factory],
+    });
+    expect(factory.calls[0]?.baseUrl).toBeUndefined();
+  });
+
+  it("refuses an id it does not know by name, rather than building one", () => {
+    // The wire format for an unknown id is not "guessed at `chat-completions`" —
+    // no factory is registered for it, so `createProviderModel` names the gap.
+    // Asserted here because the *refusal* is this layer's, and because the deleted
+    // `dialect: undefined` used to be the mechanism a reader was told to look for.
+    //
+    // The factory list holds a **different** vendor on purpose: registering a
+    // `cohere` factory and then expecting a refusal would assert the opposite of
+    // what the code does, and would pass for the wrong reason.
+    const known = fakeFactory("anthropic");
+    expect(() => createProviderModel({ settings: settings({ vendor: "cohere" }), factories: [known] })).toThrow(
+      /No provider factory registered for "cohere"/,
+    );
+    expect(known.calls).toHaveLength(0);
+
+    // And an empty id resolves to the safe default rather than to a request.
+    expect(resolveVendor("").operator).toBe("third-party");
+    expect(resolveVendor("").template).toBe(false);
+    expect(resolveVendor("anthropic-compatible:my-proxy").operator).toBe("third-party");
+  });
+
+  it("tolerates the bare vendor half as well as the full id", () => {
+    // Every caller in the app has a full id; the pure function must not be the
+    // one place that breaks if someone hands it the half.
+    expect(resolveVendor("openai-compatible").name).toBeUndefined();
+    expect(resolveVendor("openai-compatible").template).toBe(true);
   });
 });
 

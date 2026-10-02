@@ -1,21 +1,22 @@
 /**
- * The provider layer: which vendors exist, how to build them, how to test one.
+ * The provider layer: which vendors exist, how to build them, how to test one,
+ * and what models they offer.
  *
- * Three modules, one per question:
+ * Four modules, one per question:
  *
  * | module       | question                                          |
  * | ------------ | ------------------------------------------------- |
  * | `catalog.ts` | which providers may this app offer? (`Plan.md` §9) |
  * | `factories.ts` | how is a vendor id turned into a `LanguageModel`? |
  * | `probe.ts`   | what happened when we called it?                   |
+ * | `models.ts`  | what models does the endpoint actually serve?      |
  *
- * All three sit above `@all-the.rest/baah-core`'s registry and below the
+ * All four sit above `@all-the.rest/baah-core`'s registry and below the
  * composition root; none of them knows about a turn, a session or the UI.
  */
 
 export {
   PROVIDER_CATALOG,
-  corsVerified,
   findProvider,
   isKnownProvider,
   parseCatalogId,
@@ -43,3 +44,15 @@ export {
   type ProbeRequestInit,
   type ProbeVerdict,
 } from "./probe.ts";
+
+export {
+  ModelListError,
+  listModels,
+  listModelsFromSettings,
+  type ModelInfo,
+  type ModelList,
+  type ModelListFetch,
+  type ModelListOptions,
+  type ModelListRequest,
+  type ModelRequestInit,
+} from "./models.ts";

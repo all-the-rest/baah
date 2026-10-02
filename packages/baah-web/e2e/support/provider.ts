@@ -53,6 +53,19 @@ export const CHAT_COMPLETIONS_PATH = "/chat/completions";
 /** The Responses API path suffix. */
 export const RESPONSES_PATH = "/responses";
 
+/** The Anthropic Messages path suffix — `POST {baseURL}/messages`. */
+export const MESSAGES_PATH = "/messages";
+
+/**
+ * The Messages dialect's own version parameter — a request parameter of the
+ * **dialect**, so `models.ts` sends it for the `anthropic-compatible` row too.
+ *
+ * The lowercase spelling is the one on the wire: Playwright lowercases header names
+ * in `request.headers()`, and a fixture that looked for the camelCase spelling
+ * would never match and would silently serve the OpenAI body to a Messages client.
+ */
+export const MESSAGES_VERSION_HEADER = "anthropic-version";
+
 /** A recorded intercepted request. */
 export type ProviderRequest = {
   readonly url: string;
@@ -161,11 +174,54 @@ async function fulfillSse(route: Route, body: string): Promise<void> {
   });
 }
 
-/** A minimal, obviously-fake model catalogue for `GET /v1/models`. */
-const MODELS_BODY = JSON.stringify({
+/**
+ * The default `GET /models` body for an OpenAI-shaped endpoint.
+ *
+ * Exported because a spec that needs a **different** `/models` answer scripts one
+ * (`{ path: "/models", reply: { kind: "json", … } }`) rather than editing this
+ * constant — see the queue order in {@link installProvider}.
+ */
+export const MODELS_BODY = JSON.stringify({
   object: "list",
   data: [{ id: "gpt-fake", object: "model", owned_by: "e2e" }],
 });
+
+/**
+ * The Anthropic-shaped list: the same envelope, plus `display_name` and the cursor
+ * fields, which is what `GET /models` returns on a Messages endpoint.
+ *
+ * **Exercised by `e2e/model-list.e2e.ts`**, which drives the wizard's loader on the
+ * `anthropic-compatible` row and asserts the option is labelled `Claude Fake` and
+ * not `claude-fake`. That is what the branch is for: `models.test.ts` proves the
+ * parser in isolation, and this proves the **display name survives the whole path**
+ * — a loader that read only `data[].id` would pass every unit test and show the raw
+ * id to the user.
+ */
+export const ANTHROPIC_MODELS_BODY = JSON.stringify({
+  data: [
+    { type: "model", id: "claude-fake", display_name: "Claude Fake", created_at: "2026-01-01T00:00:00Z" },
+  ],
+  has_more: false,
+  first_id: "claude-fake",
+  last_id: "claude-fake",
+});
+
+/**
+ * Which list shape an endpoint gets.
+ *
+ * **Decided by the request, not by a script flag.** A Messages client is one that
+ * sends `anthropic-version` — which `models.ts` sets for **both** the `anthropic`
+ * and the `anthropic-compatible` row, because the version is a parameter of the
+ * dialect and a Messages server needs it whoever runs it. (The earlier version of
+ * this function also matched on the URL containing `/messages`, which is the
+ * *inference* path; the model list is a `GET …/models` and never contains it. The
+ * header is the real evidence, and the comment claimed a rule the code did not
+ * implement.)
+ */
+function modelsBodyFor(headers: Readonly<Record<string, string>>): string {
+  return headers[MESSAGES_VERSION_HEADER] !== undefined ? ANTHROPIC_MODELS_BODY : MODELS_BODY;
+}
+
 
 /**
  * Install the fake on a context. Registered on the context, not the page, so a
@@ -192,20 +248,34 @@ export async function installProvider(
         headers: request.headers(),
       });
 
-      if (request.method() === "GET" && url.endsWith("/models")) {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          headers: headers({}),
-          body: MODELS_BODY,
-        });
-        return;
-      }
-
+      /**
+       * The queue is consulted **first**, so a spec can script the model list.
+       *
+       * The `/models` route used to be answered before the queue, so no scenario
+       * could produce a list the app had to treat as **incomplete** — and the
+       * incomplete notice is the whole point of `ModelList.complete`. A spec that
+       * cannot reach a state cannot assert that the state is rendered, and the
+       * `data-baah-model-list-incomplete` node was therefore deletable with the
+       * whole suite green.
+       *
+       * The default below still answers every unscripted `/models`, so the other 56
+       * scenarios are unaffected: the probe asks for `/models` and needs an
+       * answer whether or not a spec thought about it.
+       */
+      const isModelsGet = request.method() === "GET" && url.endsWith("/models");
       const index = queue.findIndex(
         (step) => step.path === undefined || url.endsWith(step.path),
       );
       if (index === -1) {
+        if (isModelsGet) {
+          await route.fulfill({
+            status: 200,
+            contentType: "application/json",
+            headers: headers({}),
+            body: modelsBodyFor(request.headers()),
+          });
+          return;
+        }
         unscripted.push(url);
         await route.fulfill({
           status: 501,

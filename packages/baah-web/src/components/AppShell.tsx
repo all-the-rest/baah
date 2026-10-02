@@ -580,6 +580,23 @@ export function AppShell({ app: initialApp, initialScreen }: AppShellProps) {
           }
         }}
         onProbe={() => runtime.probe()}
+        /**
+         * The model list, from the provider's own `/models`.
+         *
+         * **This line is the whole of the wiring**, and its absence was a HIGH
+         * finding rather than a cosmetic one: the loader was correct and fully
+         * unit-tested, and `ModelList.complete` — the field whose entire reason for
+         * existing is "an incomplete list must not look like a complete one" — was
+         * returned to a caller nobody had. The running app told every user
+         * „Es ist kein Modellkatalog eingebunden" while a tested, §9-justified
+         * loader sat next to it.
+         *
+         * A callback rather than a prop holding a list, and the key is not in it:
+         * `runtime.listModels` reads the key out of the store at the moment of the
+         * call (`providers/models.ts` says why, and `probe` has done it the same way
+         * since before this line existed). The wizard never holds a credential.
+         */
+        onListModels={() => runtime.listModels()}
         onFinish={() => setScreen("workbench")}
         onSkip={() => setScreen("workbench")}
       />

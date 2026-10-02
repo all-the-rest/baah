@@ -26,6 +26,11 @@ import {
 } from "./probe.ts";
 import { defaultSettings } from "../lib/settings.ts";
 import { PROVIDER_CATALOG, findProvider, isKnownProvider } from "./catalog.ts";
+// **Core's function, imported directly.** A re-export through `catalog.ts` would
+// let the two statements be compared through a name that both share, and the
+// comparison would go green if the catalogue were rewritten to agree with core
+// by construction — which is the failure this test exists to prevent.
+import { corsVerdict, type CorsVerdict } from "@all-the.rest/baah-core";
 
 const SECRET = "sk-probe-DO-NOT-LEAK-abcdefghijklmno";
 
@@ -238,6 +243,90 @@ describe("probeConnection — the Anthropic header", () => {
   });
 });
 
+/**
+ * ## The auth header, and the misdiagnosis it caused
+ *
+ * The Anthropic test above asserts `authorization` is **`undefined`** for the
+ * Messages row — which says nothing about what a `bearer` row sends. There was no
+ * assertion anywhere on the OpenAI row's actual header value, and it was wrong: the
+ * raw key went into `authorization` with no `Bearer ` scheme.
+ *
+ * The damage is not a rejected request, it is a **wrong sentence on the screen**.
+ * §9 measured all six OpenAI-compatible operators (Groq, xAI, Mistral, Cerebras,
+ * Together, DeepSeek) as sending ACAO on **both** paths, so a 401 from either is
+ * *readable* — and `verdictFor` turns a 401 into `key-rejected`. The user is told
+ * their working key was rejected. That is precisely the misdiagnosis this module's
+ * two-request design exists to prevent, arrived at from the other direction.
+ *
+ * (First-party `openai` survived it **by luck**: its inference path sends no ACAO,
+ * so the outcome is `cors-blocked` regardless of what the header said.)
+ */
+describe("probeConnection — how the key travels", () => {
+  it("sends `Authorization: Bearer <key>` to every bearer endpoint", async () => {
+    // RFC 6750 §2.1: the scheme is part of the credential. Literal, with the space.
+    for (const [vendor, baseUrl] of [
+      ["openai", undefined],
+      ["openai-compatible:groq", "https://api.groq.com/openai/v1"],
+    ] as const) {
+      const { fetch, calls } = scriptedFetch({
+        "/models": () => Promise.resolve(jsonResponse({}, { headers: { "access-control-allow-origin": "*" } })),
+        "/chat/completions": () => Promise.resolve(jsonResponse({}, { headers: { "access-control-allow-origin": "*" } })),
+      });
+
+      await probeConnection(request({ vendor, ...(baseUrl === undefined ? {} : { baseUrl }) }), { fetch });
+
+      for (const call of calls) {
+        expect(call.init.headers.authorization).toBe(`Bearer ${SECRET}`);
+        expect(Object.keys(call.init.headers)).not.toContain("x-api-key");
+      }
+    }
+  });
+
+  it("sends the two KEYED styles raw, and never an `authorization` at all", async () => {
+    // The opposite case. Anthropic and Google document the **bare** key in their own
+    // header, so prefixing it would be a second bug of the same shape — and the
+    // absence of `authorization` is asserted because a loader that sent both headers
+    // would be sending the credential twice.
+    const anthropic = scriptedFetch({
+      "/models": () => Promise.resolve(jsonResponse({}, { headers: { "access-control-allow-origin": "*" } })),
+      "/messages": () => Promise.resolve(jsonResponse({}, { headers: { "access-control-allow-origin": "*" } })),
+    });
+    await probeConnection(request({ vendor: "anthropic", model: "claude-haiku-4-5" }), { fetch: anthropic.fetch });
+    for (const call of anthropic.calls) {
+      expect(call.init.headers["x-api-key"]).toBe(SECRET);
+      expect(Object.keys(call.init.headers)).not.toContain("authorization");
+    }
+
+    const google = scriptedFetch({
+      "/models": () => Promise.resolve(jsonResponse({}, { headers: { "access-control-allow-origin": "*" } })),
+      "/models/gemini-2.0-flash:generateContent": () =>
+        Promise.resolve(jsonResponse({}, { headers: { "access-control-allow-origin": "*" } })),
+    });
+    await probeConnection(request({ vendor: "google", model: "gemini-2.0-flash" }), { fetch: google.fetch });
+    for (const call of google.calls) {
+      expect(call.init.headers["x-goog-api-key"]).toBe(SECRET);
+      expect(Object.keys(call.init.headers)).not.toContain("authorization");
+    }
+  });
+
+  it("keeps the prefixed key out of every URL", async () => {
+    // `Bearer ` must not become a query parameter either. A URL is the most
+    // loggable string on the path, and this one would now carry a credential
+    // *and* the word that says so.
+    const { fetch, calls } = scriptedFetch({
+      "/models": () => Promise.resolve(jsonResponse({}, { headers: { "access-control-allow-origin": "*" } })),
+      "/chat/completions": () => Promise.resolve(jsonResponse({}, { headers: { "access-control-allow-origin": "*" } })),
+    });
+
+    await probeConnection(request({ vendor: "openai-compatible:groq", baseUrl: "https://api.groq.com/openai/v1" }), { fetch });
+
+    for (const call of calls) {
+      expect(call.url).not.toContain(SECRET);
+      expect(call.url).not.toContain("Bearer");
+    }
+  });
+});
+
 describe("probeConnection — secrets and shapes", () => {
   it("never puts the key in a URL", async () => {
     const { fetch, calls } = scriptedFetch({
@@ -440,11 +529,12 @@ describe("the catalog (Plan.md §9)", () => {
     expect(isKnownProvider("opencode-zen")).toBe(false);
   });
 
-  it("marks OpenAI as unverified, which is what §9 measured", () => {
+  it("marks OpenAI as unconfirmed, which is what §9 measured", () => {
     const openai = findProvider("openai");
 
     // Only `/v1/models` sends ACAO; the inference endpoints do not on the error
     // path, so §9's row reads "unbestätigt" and the UI must not promise otherwise.
+    expect(openai?.cors).toBe("unconfirmed");
     expect(openai?.corsVerified).toBe(false);
     expect(openai?.note).toContain("/v1/models");
   });
@@ -453,18 +543,61 @@ describe("the catalog (Plan.md §9)", () => {
     const anthropic = findProvider("anthropic");
 
     expect(anthropic?.requiresBrowserHeader).toBe(true);
-    expect(anthropic?.corsVerified).toBe(true);
+    expect(anthropic?.cors).toBe("verified");
   });
 
-  it("agrees with core's isCorsVerified for every entry", () => {
-    // Two statements of one measurement in two packages; if they diverge, one is
-    // lying to the wizard.
+  it("agrees with core's corsVerdict for every entry — from literals, not from core", () => {
+    // Two statements of one measurement in two packages. The expectation is a
+    // **table written out here**, one row per catalog entry, and NOT
+    // `coreSomething(entry.id)`: the previous version of this test compared
+    // `entry.corsVerified` against `entry.id !== "openai"`, which is the old bug
+    // restated — it would have gone green against a catalog that lied in the
+    // same direction.
+    //
+    // `openai-compatible` and `anthropic-compatible` read "unmeasured" because
+    // §9's rows are "beliebige … zur Laufzeit prüfen" and "no Messages-compatible
+    // third party was measured at all". The six named OpenAI-compatible
+    // operators were measured; this row is the *shape* a user fills in, and the
+    // app has no id for any of the six.
+    const expected: Readonly<Record<string, CorsVerdict>> = {
+      openai: "unconfirmed",
+      anthropic: "verified",
+      google: "verified",
+      "openai-compatible": "unmeasured",
+      "anthropic-compatible": "unmeasured",
+    };
+
+    expect(PROVIDER_CATALOG.map((entry) => entry.id)).toEqual(Object.keys(expected));
+
     for (const entry of PROVIDER_CATALOG) {
-      expect({ id: entry.id, verified: entry.corsVerified }).toEqual({
-        id: entry.id,
-        verified: entry.id !== "openai",
-      });
+      expect({ id: entry.id, cors: entry.cors }, entry.id).toEqual({ id: entry.id, cors: expected[entry.id] });
+      // …and the boolean the wizard badge is rendered from is the strict
+      // narrowing of the same row, not a second opinion.
+      expect(entry.corsVerified, entry.id).toBe(entry.cors === "verified");
+      // …and the two packages still agree, which is what this test is for.
+      expect(corsVerdict(entry.id), entry.id).toBe(expected[entry.id]);
     }
+  });
+
+  it("claims the Anthropic browser header on exactly one row", () => {
+    // The negative, per row. `requiresBrowserHeader` is what the wizard shows as
+    // "Sonderheader nötig", and it is the row-level face of the operator
+    // decision core makes in `requiredHeaders`.
+    expect(findProvider("anthropic")?.requiresBrowserHeader).toBe(true);
+    for (const id of ["openai", "google", "openai-compatible", "anthropic-compatible"]) {
+      expect(findProvider(id)?.requiresBrowserHeader, id).toBe(false);
+    }
+  });
+
+  it("offers the anthropic-compatible shape, needing an endpoint and no header", () => {
+    const row = findProvider("anthropic-compatible");
+
+    expect(row?.needsEndpoint).toBe(true);
+    expect(row?.baseUrl).toBeUndefined();
+    // Spoken by `isKnownProvider` for the *composite* id too, so a stored
+    // `anthropic-compatible:my-proxy` finds its row.
+    expect(isKnownProvider("anthropic-compatible:my-proxy")).toBe(true);
+    expect(findProvider("anthropic-compatible:my-proxy")?.id).toBe("anthropic-compatible");
   });
 
   it("requires an endpoint for the OpenAI-compatible row", () => {

@@ -54,7 +54,29 @@ export type RuntimeErrorCode =
   | "settings-unavailable"
   | "settings-import-rejected"
   | "settings-corrupt"
-  | "probe-failed";
+  | "probe-failed"
+  /**
+   * `ModelListError`'s six codes, **one for one**.
+   *
+   * They are separate members rather than one `model-list-failed` because the whole
+   * point of the six is that they are different facts with different next steps — see
+   * the table on `ModelListError`. Collapsing them here, at the boundary, would put
+   * the wizard in the position the type was written to avoid: one sentence for "fill
+   * in the base URL" and "the provider refused you". A generic branch here is what
+   * made the user read „RuntimeError" instead of the code.
+   *
+   * The `model-list-` prefix is a **disambiguation**, not decoration: the probe's own
+   * codes (`missing_model`, `missing_api_key`, …) are the same words for the same
+   * reasons, and this union is rendered verbatim in the status bar
+   * (`AppShell`: `{lastError.code}: {lastError.message}`), where two bare
+   * `missing_api_key`s from two subsystems would be indistinguishable.
+   */
+  | "model-list-unknown-provider"
+  | "model-list-missing-endpoint"
+  | "model-list-missing-api-key"
+  | "model-list-http-error"
+  | "model-list-unreachable"
+  | "model-list-malformed-response";
 
 export interface RuntimeErrorInfo {
   readonly code: RuntimeErrorCode;

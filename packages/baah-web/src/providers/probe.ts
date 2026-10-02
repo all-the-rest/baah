@@ -53,6 +53,7 @@
 import { requiredHeaders } from "@all-the.rest/baah-core";
 import { apiKeySlot } from "../lib/ids.ts";
 import type { SettingsSnapshot } from "../lib/settings.ts";
+import { authHeaderName, authHeaderValue, type AuthStyle } from "./auth-header.ts";
 import { findProvider, isKnownProvider, parseCatalogId } from "./catalog.ts";
 
 /* ------------------------------------------------------------------ */
@@ -149,9 +150,6 @@ export class ConnectionProbeError extends Error {
 /* Per-vendor endpoints                                                */
 /* ------------------------------------------------------------------ */
 
-/** How a vendor authenticates. Never a query parameter (§ above). */
-type AuthStyle = "bearer" | "x-api-key" | "x-goog-api-key";
-
 interface VendorProbe {
   readonly auth: AuthStyle;
   readonly headers: Record<string, string>;
@@ -197,6 +195,17 @@ function vendorProbe(vendor: string): VendorProbe {
         inferenceBody: BODIES.chat,
       };
     case "anthropic":
+    case "anthropic-compatible":
+      // **The same two questions, asked of a different endpoint.** The shape is
+      // Anthropic's dialect, so the inference call is `/messages` with an
+      // `x-api-key` and `anthropic-version` — those are parameters of the
+      // dialect and belong here, and they go out to **both** rows because a
+      // Messages server needs them whoever runs it.
+      //
+      // The browser-access header does **not** belong here and is not set here: it
+      // is `requiredHeaders`' decision, keyed off the *operator*, so the
+      // first-party `anthropic` row gets it and the `anthropic-compatible` row does
+      // not. This function only describes the request shape.
       return {
         auth: "x-api-key",
         headers: { "anthropic-version": ANTHROPIC_VERSION },
@@ -255,19 +264,34 @@ export async function probeConnection(
   const entry = findProvider(request.vendor);
   const probe = vendorProbe(vendor);
 
-  const baseUrl = resolveBaseUrl(request.baseUrl, entry?.baseUrl, vendor);
+  const baseUrl = resolveBaseUrl(request.baseUrl, entry?.baseUrl, vendor, entry?.needsEndpoint === true);
   const now = options.now ?? Date.now;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const doFetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
 
   // Required headers **last**, for the same security reason as in the registry:
   // the Anthropic header has to survive anything the caller put in its way.
+  //
+  // **The full `request.vendor`, not the parsed half.** The required header is a
+  // property of the *operator*, and an `anthropic-compatible:<label>` endpoint
+  // must not get it — so the decision needs the whole id, which is what
+  // `requiredHeaders` parses. Passing the half worked by accident (no shape
+  // exists whose operator depends on the label) and would have been wrong the
+  // moment one did.
   const headers: Record<string, string> = {
     "content-type": "application/json",
     accept: "application/json",
-    [probe.auth === "bearer" ? "authorization" : probe.auth]: request.apiKey,
+    // `authHeaderName` / `authHeaderValue` live in `auth-header.ts` because
+    // `models.ts` needs the identical answer and the identical ternary was wrong in
+    // both: it put the **raw** key in `authorization`. RFC 6750 §2.1 makes the
+    // scheme part of the credential, and a bare token gets a `401` from every one of
+    // the six §9-measured OpenAI-compatible operators — which `verdictFor` then
+    // reads as `key-rejected`. The wizard would tell a user with a working key that
+    // their key was rejected, which is the misdiagnosis this module's two-request
+    // design exists to prevent.
+    [authHeaderName(probe.auth)]: authHeaderValue(probe.auth, request.apiKey),
     ...probe.headers,
-    ...requiredHeaders(vendor),
+    ...requiredHeaders(request.vendor),
   };
 
   const models = await observe({
@@ -492,13 +516,18 @@ function detailFor(outcome: ProbeOutcome, vendor: string, note: string): string 
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-function resolveBaseUrl(explicit: string | undefined, fromCatalog: string | undefined, vendor: string): string {
+function resolveBaseUrl(
+  explicit: string | undefined,
+  fromCatalog: string | undefined,
+  vendor: string,
+  needsEndpoint: boolean,
+): string {
   const base = explicit ?? fromCatalog;
   if (base === undefined || base.trim() === "") {
     throw new ConnectionProbeError(
       "missing_endpoint",
-      vendor === "openai-compatible"
-        ? "An OpenAI-compatible provider needs its base URL, e.g. https://api.groq.com/openai/v1."
+      needsEndpoint
+        ? `An ${vendor} entry needs the base URL of the server it addresses, e.g. https://api.groq.com/openai/v1.`
         : `No base URL is known for "${vendor}".`,
     );
   }

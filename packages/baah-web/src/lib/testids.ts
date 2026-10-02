@@ -98,6 +98,19 @@ export const TEST_IDS = {
   providerProbeResult: "baah-provider-probe-result",
   providerProbeDetail: "baah-provider-probe-detail",
 
+  /* ---- the provider's model list (§8.1 step 4) -------------------- */
+  /**
+   * "Modelle laden" on the model step. Reads the **provider's own** `/models`
+   * (`providers/models.ts`); a spec should never expect this on a build whose
+   * wizard is not wired to a loader, because the prop is required and there is no
+   * such build left.
+   */
+  modelListLoad: "baah-model-list-load",
+  /** The list itself. `data-baah-model-list` is `complete|incomplete|empty`. */
+  modelListPanel: "baah-model-list",
+  /** The `<select>`, labelled with the provider's own `display_name`. */
+  modelListSelect: "baah-model-list-select",
+
   /* ---- settings --------------------------------------------------- */
   /** The §8.2 opt-in. Off by default; the export stays key-free without it. */
   settingsExportIncludeKeys: "baah-settings-export-include-keys",

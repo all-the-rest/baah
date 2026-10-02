@@ -44,15 +44,144 @@
  * passes the real factories in. That keeps this file free of vendor imports,
  * makes the CORS/key rules testable without a network, and means adding a vendor
  * is a one-line change at the composition root.
+ *
+ * ## A vendor id is a **label for an endpoint**, not a vendor
+ *
+ * The string before the first colon (`parseVendorId`) used to be the whole of a
+ * provider's identity, which conflated two different things. This file now
+ * separates them, and each one is named because each one answers a different
+ * question:
+ *
+ * | concept | question | wrong answer costs |
+ * |---|---|---|
+ * | {@link ProviderOperator} — who **runs** the endpoint | which headers may we claim? | asserting Anthropic's browser-access policy to a third party |
+ * | the **label** after the colon | which of this user's entries is it? | `https://groq/…`, a URL nobody chose |
+ *
+ * `anthropic-compatible:<label>` is the case that forced the split: it speaks the
+ * Messages dialect, and it is *not* Anthropic. It is therefore a fifth **catalog
+ * row**, not a fifth member of {@link ProviderVendor} — a vendor is a company,
+ * and adding a member per dialect would count dialects as vendors.
+ *
+ * ### The wire format is a third question, and it is answered **where it is used**
+ *
+ * "Which request shape goes out?" is real — a `chat/completions` POST to a
+ * `/messages` server fails *silently* — and it used to be a `ProviderDialect` field
+ * on {@link ResolvedVendor}. **It was deleted**, and the reason is measured rather
+ * than stylistic: `rg '\.dialect'` over every `src/` in the workspace found zero
+ * readers outside this file and its own test. The routing that actually decides the
+ * request is the factory array in `baah-web/src/providers/factories.ts`, and it
+ * cannot read a field from here without becoming the place where a dialect is
+ * declared *and* the place where a factory is written — two lists that would drift
+ * exactly the way this file's header is about.
+ *
+ * `AGENTS.md` §5: no speculative abstractions. A well-documented field with no
+ * production reader is one, and a comment explaining why it is valuable is not an
+ * argument for keeping it — it is the thing the next reader has to un-believe.
+ * The distinction itself survives where it is load-bearing: {@link TEMPLATE_VENDORS}
+ * names the two shapes, and the note on {@link ProviderOperator} says why they
+ * cannot be decided by wire format.
  */
 
 import type { LanguageModel } from "ai";
 
-/** Vendors with a measured CORS story (Plan.md §9). */
+/**
+ * Vendors this app can address at a known, measured endpoint.
+ *
+ * **Not "every vendor id there is".** `openai-compatible` and
+ * `anthropic-compatible` are *shapes* a user fills in, so their CORS story is
+ * whatever the connection test finds and nothing else — see
+ * {@link corsVerdict}. `ProviderSettings.vendor` accepts them anyway, through the
+ * `(string & {})` escape hatch.
+ */
 export type ProviderVendor = "openai" | "anthropic" | "google" | "openai-compatible";
 
+/**
+ * Who **runs** the endpoint this vendor id names.
+ *
+ * ## Why this is a concept and not a `vendor === "anthropic"` test
+ *
+ * `anthropic-dangerous-direct-browser-access: true` is not a formatting hint. It
+ * is a statement the client makes **about the security model of the machine on
+ * the other end**: "I am a browser, my key is exposed to the page, I accept
+ * that." `Plan.md` §9 measured it against `api.anthropic.com` and nowhere else.
+ *
+ * So it cannot key off the **wire format**: `anthropic` and `anthropic-compatible`
+ * both speak the Messages API, and sending the header to the second one would tell a
+ * third party a true-sounding claim about a security model that is not theirs —
+ * while also revealing that this app talks to Anthropic at all.
+ *
+ * ## What the operator *is* — and what it is not, measured
+ *
+ * **An earlier version of this comment claimed the operator is decided
+ * independently of the string** ("the operator *is* the identity claim; the string
+ * is only how the user typed it"). Measured over 16 adversarial ids — `anthropic:eu`,
+ * `Anthropic`, `" anthropic"`, `anthropic-compatible:anthropic`, `""`, `":"`, … —
+ * `operator === "anthropic"` and `parseVendorId(id).vendor === "anthropic"` had
+ * **0 mismatches**. They are the same predicate, because
+ * {@link resolveVendor} computes one and derives the other from it.
+ *
+ * So the independence is not there, and a comment claiming it is worse than a
+ * comment that names the mechanism: a reader who trusts it looks for a claim
+ * registry, does not find one, and has to re-derive the actual rule.
+ *
+ * **What the parse does buy, and it is not nothing:**
+ *
+ * 1. It closes the `startsWith` class. `"anthropic-compatible:x".startsWith("anthropic")`
+ *    is `true`; a first-colon split is not fooled by it. The distinction between
+ *    "a name" and "a name and a label" is what makes `anthropic-compatible` a
+ *    separate row possible at all.
+ * 2. {@link TEMPLATE_VENDORS} is **one shared set**, so the second template cannot be
+ *    added to one switch and forgotten in another. See the note on
+ *    {@link resolveVendor}.
+ * 3. The *claim* is now a named value in {@link ResolvedVendor} rather than a
+ *    comparison a reader has to spot — so the next vendor id added anywhere has to
+ *    decide it, rather than inheriting "not Anthropic" by accident.
+ *
+ * That is the real property, and it is worth having. It is just not
+ * independence, and the difference is the whole reason this paragraph was rewritten.
+ *
+ * ## Why `baseUrl` does not decide it — a decision, not an accident
+ *
+ * `vendor: "anthropic"` with a `baseUrl` of `https://proxy.example` sends the
+ * header there, and **that is deliberate**: the user selected the **Anthropic**
+ * row and typed that address, which is a claim that the endpoint *is* Anthropic,
+ * reached by a route. A proxy in front of Anthropic genuinely needs the header
+ * forwarded, and refusing it would break a deployment that works. The row that
+ * says "this is **not** Anthropic" is `anthropic-compatible:<label>`, and it
+ * exists precisely so that claim can be made. `routing` and `identity` are
+ * different questions; only the second one licenses a header.
+ *
+ * ⚠️ **The route this leaves open, named rather than hidden.** `baseUrl` is
+ * reachable without the wizard: it is a bare `z.string().optional()` in the §8.2
+ * import schema (`baah-web/src/lib/settings.ts`), so an imported settings file can
+ * put a foreign `baseUrl` on the `anthropic` row. That is the **same** third-party
+ * disclosure the `anthropic-compatible` row exists to prevent, reached by a
+ * different route, and the policy above accepts it on purpose: an operator who
+ * imports a configuration has stated the same claim the wizard would have.
+ * `verify-provider-registry.test.ts` pins the behaviour so it is a **decision with
+ * a test** rather than an accident, and the alternative — keying the header off
+ * the hostname — was not taken because it would make a *guess about a host* the
+ * arbiter of a security claim, which is strictly worse.
+ *
+ * **Deny by default.** Anything not measured as Anthropic-operated is
+ * `third-party`, including a typo and including a vendor id added tomorrow.
+ */
+export type ProviderOperator = "anthropic" | "third-party";
+
 export interface ProviderSettings {
-  /** `openai`, `anthropic`, `google`, or a custom name for `openai-compatible`. */
+  /**
+   * The vendor id: `openai`, `anthropic`, `google`, `openai-compatible:<label>`
+   * or `anthropic-compatible:<label>`.
+   *
+   * A **full** id, label included — that is what the wizard stores, what
+   * {@link parseVendorId} splits, and what {@link fingerprint} compares. An
+   * entry that needs a label and has none is refused by name rather than
+   * silently addressed at a default.
+   *
+   * `anthropic-compatible:<label>` is a *shape*, not a vendor: it speaks the
+   * Messages dialect at somebody else's address, which is why it is not a member
+   * of {@link ProviderVendor}. See the module header.
+   */
   vendor: ProviderVendor | (string & {});
   /** Model id passed to the vendor, e.g. `gpt-4o`, `claude-haiku-4-5`. */
   model: string;
@@ -67,14 +196,16 @@ export interface ProviderSettings {
    */
   baseUrl?: string | undefined;
   /**
-   * Name of a custom `openai-compatible` entry; a fallback when the vendor id
-   * carries no suffix.
+   * Name of a custom `openai-compatible` / `anthropic-compatible` entry; a
+   * fallback when the vendor id carries no suffix.
    *
    * A **label, and only a label.** It is never used as a base URL: a name is
    * something the user typed, and putting it in front of a request produced
    * `https://groq/…` — a URL that cannot resolve, for a reason no error message
    * would explain. `baseUrl` is the one field that decides where requests go,
-   * and it is the user's to set.
+   * and it is the user's to set. The same is true **because** the label cannot
+   * reach {@link corsVerdict}: an operator claim is made by the *shape*, never
+   * by what the user typed after the colon.
    */
   name?: string | undefined;
   /**
@@ -116,6 +247,14 @@ export interface ProviderFactory {
  * header is set — the SDK does not add it, so it has to be added here or the
  * browser reports a wrong key as a network failure.
  *
+ * **The parameter is the vendor id, and it is parsed before anything else.**
+ * `requiredHeaders("anthropic")` and `requiredHeaders("anthropic-compatible:my-proxy")`
+ * are different answers, and the second one is the whole reason this function
+ * goes through {@link resolveVendor} rather than comparing the raw string: the
+ * raw string `anthropic` is a prefix of a string that must **not** get the
+ * header, so an equality test on the unparsed id is one careless refactor away
+ * from `startsWith`-style leakage.
+ *
  * These are merged **last** in {@link createProviderModel}, and the reason is a
  * security one rather than a tidiness one: Anthropic without this header turns a
  * wrong key into an opaque `TypeError: Failed to fetch`, and a settings object
@@ -124,17 +263,107 @@ export interface ProviderFactory {
  * so "last" is what wins — the earlier arrangement merged required headers
  * *first* and the caller's value silently overwrote them, which is the exact
  * opposite of what the comment beside it claimed.
+ *
+ * Note the asymmetry with `anthropic-version`, which the SDK sets itself and
+ * which therefore goes out to `anthropic-compatible` as well: **one header is a
+ * request parameter of the dialect, the other is a claim about the operator.**
  */
 export function requiredHeaders(vendor: string): Record<string, string> {
-  if (vendor === "anthropic") {
+  if (resolveVendor(vendor).operator === "anthropic") {
     return { "anthropic-dangerous-direct-browser-access": "true" };
   }
   return {};
 }
 
-/** Does the browser-direct path have a measured CORS story? (Plan.md §9) */
+/**
+ * How much is known about a vendor id's browser-direct story (Plan.md §9).
+ *
+ * Three states, because two states cannot say what has to be said:
+ *
+ * | state | meaning |
+ * |---|---|
+ * | `"verified"` | measured to work from a browser (`*`, or an origin echo) |
+ * | `"unconfirmed"` | measured, and the measurement does **not** establish it — OpenAI's inference endpoints send no ACAO on the error path |
+ * | `"unmeasured"` | nobody looked, or what was looked at is not this endpoint |
+ */
+export type CorsVerdict = "verified" | "unconfirmed" | "unmeasured";
+
+/**
+ * §9's first-party rows, read off the table rather than inferred.
+ *
+ * An explicit table, not a default and not a comparison — the failure mode this
+ * whole function exists to remove is a *default* answering for an endpoint nobody
+ * measured, so the absence of a row is the meaningful case and it has to be
+ * legible as such.
+ *
+ * `openai` is `"unconfirmed"`, not `"verified"`: `/v1/models` sends ACAO but the
+ * inference endpoints send none on the error path, and whether the success path
+ * sends one needs a real key, which does not live in this repo (§9).
+ */
+const MEASURED_CORS: Readonly<Record<string, CorsVerdict>> = Object.freeze({
+  anthropic: "verified",
+  google: "verified",
+  openai: "unconfirmed",
+});
+
+/**
+ * What §9 actually established for this endpoint.
+ *
+ * ## The bug this replaces, measured
+ *
+ * `return vendor !== "openai"` is a lie generator. It was `true` for
+ * `anthropic-compatible:anything`, for `google`, and — because `!==` matches
+ * every string that is not literally `"openai"` — for `"openaai"`, for `""`, for
+ * any typo and for any vendor id added next month. A user who mistyped one got
+ * a wizard badge reading „CORS bestätigt" (`Onboarding.tsx` renders it from this
+ * value) on the strength of a string comparison that measured nothing.
+ *
+ * `openai-compatible` is the case that makes the third state unavoidable rather
+ * than theoretical. §9's row is "beliebige OpenAI-kompatible `baseURL`:
+ * **zur Laufzeit prüfen**" — and the row covers *six named* operators, none of
+ * which the app knows about by id. `openai-compatible` is a **template** for a
+ * user-supplied endpoint, and the endpoint named `openai-compatible:my-vllm` has
+ * never been measured by anyone. Reporting `"verified"` for it because the vendor
+ * half is a known one is precisely the truncation this function exists to stop
+ * reporting.
+ *
+ * So: the measured set is the three first-party operators, and a vendor id that
+ * is only a *shape* is `"unmeasured"` — the connection test (`probe.ts`) is what
+ * settles it, which is what the wizard already tells the user to do.
+ *
+ * **Separate from {@link ProviderOperator}, deliberately.** Google is
+ * `"verified"` and is not Anthropic-operated, and Anthropic is `"verified"` and
+ * is. Deriving one from the other would have made Google's row wrong the moment
+ * the two functions were written, which is the argument for both being derived
+ * once in {@link resolveVendor} and neither being derived from the other.
+ */
+export function corsVerdict(vendor: string): CorsVerdict {
+  const resolved = resolveVendor(vendor);
+  // A first-party vendor id *with* a label suffix is not the plain endpoint any
+  // more (`anthropic:eu` is a claim about a region nobody measured), so the
+  // measurement only holds for the bare id.
+  if (resolved.name !== undefined) return "unmeasured";
+  // **The absence from {@link MEASURED_CORS} is the mechanism, not an oversight.**
+  // `openai-compatible` and `anthropic-compatible` are deliberately *not* in that
+  // table, which is why a bare `openai-compatible` — a template, no label, no
+  // operator claim — still lands on `"unmeasured". An earlier draft also tested
+  // `resolved.template` here; that was redundant with the fallback below, and a
+  // redundant branch with a comment saying it was load-bearing is worse than no
+  // branch, because the next reader counts on it and stops looking at the table.
+  return MEASURED_CORS[resolved.vendor] ?? "unmeasured";
+}
+
+/**
+ * Does the browser-direct path have a measured CORS story? (Plan.md §9)
+ *
+ * **A strict "yes", and the narrowing is the point.** `false` now means *either*
+ * "measured, and no" *or* "not measured" — so a caller that needs the
+ * difference must call {@link corsVerdict}. This wrapper exists so the common
+ * question ("can I show the green badge") has one name, and it exists next to
+ * the three-state function so the loss is visible at the call site.
+ */
 export function isCorsVerified(vendor: string): boolean {
-  return vendor !== "openai";
+  return corsVerdict(vendor) === "verified";
 }
 
 export class ProviderError extends Error {
@@ -169,6 +398,98 @@ export function parseVendorId(value: string): { vendor: string; name: string | u
   const vendor = value.slice(0, separator);
   const name = value.slice(separator + 1);
   return name === "" ? { vendor, name: undefined } : { vendor, name };
+}
+
+/**
+ * The vendor-id **shapes** that stand for an endpoint nobody here has measured.
+ *
+ * `openai-compatible` and `anthropic-compatible` are not vendors, and the
+ * distinction is load-bearing in two places:
+ *
+ * - **the wire format** — they are the *same dialect* as their first-party
+ *   namesake (`anthropic-compatible` speaks the Messages API), which is what makes
+ *   a third-party Messages endpoint expressible without a fifth member of
+ *   {@link ProviderVendor}. That mapping lives where it is used — the factory array
+ *   in `baah-web/src/providers/factories.ts` — and a `ProviderDialect` field here
+ *   was deleted for having no production reader (see the module header);
+ * - {@link corsVerdict} — they are *unmeasured*, always. §9 measured six named
+ *   OpenAI-compatible operators (Groq, xAI, Mistral, Cerebras, Together,
+ *   DeepSeek) and no `anthropic-compatible` endpoint at all, and the app has no
+ *   id for any of them: the label is free text, so nothing downstream can tell
+ *   `openai-compatible:groq` from `openai-compatible:my-vllm`.
+ *
+ * **Not derived from the presence of a label.** `openai-compatible` *without* a
+ * label is the same template — the wizard renders it, it is still a row the user
+ * fills in — and `resolveVendor` therefore keys on the vendor half alone. Keying
+ * on "has a label" instead would make `openai-compatible` the one shape whose
+ * verdict changes when the user leaves a field empty, which is not a fact about
+ * the endpoint.
+ *
+ * ### The one set, and why the drift it prevents is now tested
+ *
+ * The doc above used to claim "one function, on purpose" against a drift that was
+ * still reachable: the shapes were derived in **three** places — this set,
+ * `corsVerdict`'s table, and (then) a dialect switch — and a fourth shape added to
+ * one of them would compile and be wrong in the others. The set is now the single
+ * source for "is this a template", and
+ * `verify-provider-registry.test.ts` › "every template resolves to one dialect and
+ * one CORS verdict" asserts the agreement from the outside, so adding a shape
+ * alone fails a test rather than passing quietly.
+ */
+const TEMPLATE_VENDORS: ReadonlySet<string> = new Set(["openai-compatible", "anthropic-compatible"]);
+
+/**
+ * A vendor id, resolved into the things it conflates.
+ *
+ * **One function, on purpose.** The operator and the template flag are answers to
+ * two different questions about the same string, and deriving them in two places is
+ * how they drift. Every caller here reads this one.
+ */
+export interface ResolvedVendor {
+  /** The vendor half, before the first colon. */
+  readonly vendor: string;
+  /** The label after the first colon. Never a URL. */
+  readonly name: string | undefined;
+  /** Who runs the endpoint — the thing the required header is a claim about. */
+  readonly operator: ProviderOperator;
+  /** A shape the user fills in, rather than a vendor with its own endpoint. */
+  readonly template: boolean;
+}
+
+/**
+ * Split a vendor id into {@link ResolvedVendor}.
+ *
+ * Accepts the **full id**, label included — `resolveVendor("openai-compatible:groq")`
+ * — because every caller in the app has a full id (it is what
+ * {@link ProviderSettings.vendor} holds) and a function that only accepted the
+ * vendor half would be one more thing to get wrong at each call site. It
+ * tolerates the bare half too, since {@link parseVendorId} on a bare vendor
+ * returns `name: undefined`.
+ *
+ * **`anthropic-compatible` resolves to `operator: "third-party"` because the
+ * operator is decided by the *shape the user picked*, not by the word
+ * "anthropic" appearing in it.** `anthropic-compatible:anthropic` is still not
+ * Anthropic, and this is the property that keeps {@link requiredHeaders} from
+ * becoming a substring test.
+ *
+ * An **unknown** id resolves without error: `operator: "third-party"`,
+ * `template: false`. It is a claim nobody made, which is the safe default, and
+ * {@link createProviderModel} refuses it by name on the missing factory rather
+ * than on anything this function decides.
+ */
+export function resolveVendor(value: string): ResolvedVendor {
+  const { vendor, name } = parseVendorId(value);
+  const template = TEMPLATE_VENDORS.has(vendor);
+  const firstParty = !template && vendor === "anthropic";
+  return {
+    vendor,
+    name,
+    // **Only the first-party shape.** `anthropic` is the one id in this app that
+    // means "Anthropic's own endpoint"; every other id, including an unknown one,
+    // is somebody else's server and gets no claim made about its security model.
+    operator: firstParty ? "anthropic" : "third-party",
+    template,
+  };
 }
 
 /**
@@ -243,7 +564,8 @@ export interface ProviderRegistryOptions {
  */
 export function createProviderModel(options: ProviderRegistryOptions): LanguageModel {
   const { settings, factories } = options;
-  const { vendor, name: nameFromId } = parseVendorId(settings.vendor);
+  const resolved = resolveVendor(settings.vendor);
+  const { vendor, template } = resolved;
   /**
    * One label, resolved once, from the id suffix or the field.
    *
@@ -260,7 +582,7 @@ export function createProviderModel(options: ProviderRegistryOptions): LanguageM
    * id is the more specific of the two and the direction should not depend on
    * which line a later edit happens to touch.
    */
-  const name = nameFromId ?? settings.name;
+  const name = resolved.name ?? settings.name;
 
   if (settings.model.trim() === "") {
     throw new ProviderError("A model must be selected", "missing_model");
@@ -273,9 +595,16 @@ export function createProviderModel(options: ProviderRegistryOptions): LanguageM
       "missing_api_key",
     );
   }
-  if (vendor === "openai-compatible" && name === undefined) {
+  if (template && name === undefined) {
+    // **Both** templates, keyed off `resolveVendor` rather than a second
+    // `=== "openai-compatible"` string. `anthropic-compatible` is the new shape
+    // and the check has to cover it, and a check that is written once here is
+    // the only way the two shapes cannot drift apart.
+    //
+    // The example in the message is OpenAI-shaped because it is the one a user
+    // is most likely to be reproducing; the requirement is the same either way.
     throw new ProviderError(
-      'An openai-compatible entry needs a name, e.g. vendor `openai-compatible:groq` with ' +
+      `An ${vendor} entry needs a name, e.g. vendor \`${vendor}:groq\` with ` +
         'baseUrl "https://api.groq.com/openai/v1". The name is a label; only `baseUrl` decides ' +
         "where requests go.",
       "missing_name",
@@ -295,7 +624,13 @@ export function createProviderModel(options: ProviderRegistryOptions): LanguageM
     // `ProviderSettings.headers`, one right here — described an arrangement that
     // let a caller's `headers` drop `anthropic-dangerous-direct-browser-access`,
     // i.e. turned a working key into an opaque `Failed to fetch`.
-    headers: { ...(settings.headers ?? {}), ...requiredHeaders(vendor) },
+    //
+    // The **full** id goes in, label included: the required header depends on the
+    // operator, and the operator is a property of the whole id. Passing the
+    // vendor half would work today (the label cannot change the operator) and
+    // would be wrong the moment a shape exists whose operator *does* depend on
+    // what the user called it.
+    headers: { ...(settings.headers ?? {}), ...requiredHeaders(settings.vendor) },
     // **Only** the explicit `baseUrl`. The id suffix is a label; feeding it in
     // here is what produced `https://groq/…` for an entry the user had simply
     // not given a URL for.

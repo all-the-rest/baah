@@ -16,8 +16,10 @@
  *   `data: [DONE]` event is swallowed (`if (data === '[DONE]') return`), i.e.
  *   `[DONE]` is a terminator, not a payload.
  * - The schemas the chunks have to satisfy come from the provider the loop will
- *   use, `@ai-sdk/openai@4.0.80` (the version `ai@7.0.122` pins in
- *   devDependencies): `openaiChatChunkSchema` and `openaiResponsesChunkSchema`.
+ *   use: `@ai-sdk/openai@4.0.80` (the version `ai@7.0.122` pins in
+ *   devDependencies) for `openaiChatChunkSchema` / `openaiResponsesChunkSchema`,
+ *   and `@ai-sdk/anthropic@4.0.68` for `anthropicChunkSchema`
+ *   (`packages/baah-web/e2e/support/turns.ts` reads both).
  *
  * Nothing in this file imports a provider, a Node builtin, or Playwright. It is
  * pure data, so it can be unit-asserted from a spec without a browser.
@@ -40,7 +42,7 @@ export const streamMarkerHeader = "x-baa-e2e-stream";
 /** One SSE event's worth of payload, before framing. */
 export type SseEvent =
   /** A JSON payload, serialised into a single `data:` line. */
-  | { readonly kind: "data"; readonly value: unknown }
+  | { readonly kind: "data"; readonly value: unknown; readonly event?: string }
   /** The terminal `data: [DONE]` sentinel. */
   | { readonly kind: "done" }
   /** A zero-length write; used to hold a stream open on purpose. */
@@ -53,14 +55,27 @@ export type SseEvent =
  * that dispatches it in the parser the AI SDK uses. `hold` frames write nothing
  * at all: they exist so a stream can be kept open (or cut off) at a precise
  * point without inventing a payload.
+ *
+ * ## The optional `event:` name is load-bearing for Anthropic
+ *
+ * Anthropic's Messages stream names every event — `event: message_start`,
+ * `event: content_block_delta`, `event: message_stop` — and the docs are explicit
+ * that "each event uses an SSE event name … and includes the matching event
+ * `type` in its data". A fake that emitted only `data:` lines would parse
+ * identically (the AI SDK reads `data`) but would not be the wire format, and the
+ * brief for the Anthropic block is explicit that a fake which only *resembles*
+ * the thing hides exactly the bug it was written to find. `event:` is a legal
+ * field for the parser (it is one of the four), so emitting it is safe.
  */
 export function frameSse(events: readonly SseEvent[]): string {
   let out = "";
   for (const event of events) {
     switch (event.kind) {
-      case "data":
-        out += `data: ${JSON.stringify(event.value)}\n\n`;
+      case "data": {
+        const name = event.event === undefined ? "" : `event: ${event.event}\n`;
+        out += `${name}data: ${JSON.stringify(event.value)}\n\n`;
         break;
+      }
       case "done":
         out += `data: ${SSE_DONE}\n\n`;
         break;

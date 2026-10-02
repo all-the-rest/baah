@@ -14,11 +14,13 @@
  *
  * - **No proxy** (`AGENTS.md` §2). A provider that blocks the browser is not
  *   supported; the wizard says so and does not work around it.
- * - **No model catalogue.** `§8.1` step 4 asks for one and `§9` names
- *   `@opencode-ai/models` as the source, but it is not wired in this build. The
- *   field is a free-text model id and the wizard **says** that a catalogue is
- *   absent — a hard-coded list would be a list that goes stale silently and gets
- *   blamed for a provider error.
+ * - **No bundled model catalogue.** `§8.1` step 4 asks for one and `§9` names
+ *   `@opencode-ai/models` as a source; the wizard reads the **provider's own**
+ *   `/models` instead (`providers/models.ts`), and says why in the panel below. A
+ *   hard-coded table is a second truth about something that already has a first
+ *   one, and it goes stale silently and then gets blamed for a provider error.
+ *   The free-text model-id field stays either way: the provider's list can be
+ *   incomplete, and a user whose model is missing must have somewhere to type it.
  * - **No OpenCode Zen.** Not in `providers/catalog.ts` (`§9`: Preflight 404, no
  *   ACAO, "nicht darum herum designen"), and `catalog.test.ts` asserts the
  *   absence so adding one is a decision somebody makes on purpose.
@@ -36,6 +38,7 @@ import { useState } from "react";
 
 import { PROVIDER_CATALOG, findProvider, type ProviderEntry } from "../providers/catalog.ts";
 import type { ConnectionProbeReport } from "../providers/probe.ts";
+import type { ModelList } from "../providers/models.ts";
 import { TEST_ATTRIBUTES, TEST_IDS } from "../lib/testids.ts";
 import {
   defaultBaseUrl,
@@ -80,6 +83,23 @@ export interface OnboardingProps {
   readonly onPickFolder: () => Promise<boolean>;
   /** §8.1 step 3's connection test. Never throws for a provider problem. */
   readonly onProbe: () => Promise<ConnectionProbeReport>;
+  /**
+   * §8.1 step 4's model list, read from the provider itself.
+   *
+   * **Required, and it was optional for a while the loader was unreachable.** The
+   * prop existed with a "the absence is not an error" contract while
+   * `AppShell` passed nothing — so the wizard rendered the "no catalogue"
+   * paragraph, `ModelList.complete` was a return value no screen read, and the
+   * whole feature was a module. It is wired now, and the optional type and the
+   * paragraph are **gone with it** (`AGENTS.md` §5: a branch no caller can reach
+   * is a second statement of what the product does, and this one was false).
+   *
+   * It is a callback rather than an `apiKey` for the reason `probe.ts` exists: a
+   * component holding the key can render it, log it and put it in a dependency
+   * array. `AppShell` passes `() => runtime.listModels()`, and the key is read out
+   * of the store at the moment of the call.
+   */
+  readonly onListModels: () => Promise<ModelList>;
   readonly onFinish: () => void;
   readonly onSkip: () => void;
 }
@@ -123,6 +143,9 @@ export function Onboarding(props: OnboardingProps) {
   const [saved, setSaved] = useState(props.hasKey);
   /** A folder pick is in flight; the step is held until the browser answers. */
   const [picking, setPicking] = useState(false);
+  const [models, setModels] = useState<ModelList | undefined>();
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [modelListError, setModelListError] = useState<string | undefined>();
 
   const entry = findProvider(vendor);
   const fullVendor = vendorId(vendor, label);
@@ -144,12 +167,47 @@ export function Onboarding(props: OnboardingProps) {
       // The runtime classifies a probe failure itself (`fail(error, "provider")`)
       // and never throws for a provider problem; what reaches here is a request
       // it could not even address — an unknown vendor, a missing endpoint or key.
-      // The class name only: an `Error.message` from a boundary can carry a key.
+      //
+      // The **code**, for the same reason as the model list below: what arrives is
+      // a `RuntimeError`, so `error.name` was the literal string „RuntimeError" and
+      // the `missing_model` / `missing_api_key` distinction the probe's own error
+      // class draws never reached the screen. The message is not shown either — a
+      // boundary's own text is the one shape that can carry a key.
       setProbeError(
-        `Der Verbindungstest konnte nicht durchgeführt werden: ${error instanceof Error ? error.name : "unbekannter Fehler"}.`,
+        `Der Verbindungstest konnte nicht durchgeführt werden: ${errorCode(error) ?? "unbekannter Fehler"}.`,
       );
     } finally {
       setProbing(false);
+    }
+  };
+
+  const runModelList = async (): Promise<void> => {
+    setLoadingModels(true);
+    setModelListError(undefined);
+    try {
+      setModels(await props.onListModels());
+    } catch (error) {
+      // **The `code`, not the class name** — and this is not a style preference.
+      //
+      // `AppShell` wires `runtime.listModels`, and the runtime classifies every
+      // failure: what reaches here is a `RuntimeError`, so `error.name` was the
+      // literal string **„RuntimeError"** on every one of the loader's six codes.
+      // The user was told the class of the app's own wrapper and nothing else.
+      //
+      // `runtime/index.ts` maps each of `ModelListError`'s six codes onto its own
+      // `RuntimeErrorCode`, and those are the words that say what to do next —
+      // `model-list-missing-endpoint` means "fill in the base URL", which is
+      // different from `model-list-http-error` ("the provider refused you") and
+      // from `model-list-unreachable` ("it is blocked or offline").
+      //
+      // The message is deliberately **not** shown: a boundary's own text is the one
+      // shape that can carry a key, and the code plus a fixed German sentence is
+      // what a user can act on.
+      setModelListError(
+        `Die Modellliste konnte nicht geladen werden: ${errorCode(error) ?? "unbekannter Fehler"}.`,
+      );
+    } finally {
+      setLoadingModels(false);
     }
   };
 
@@ -311,19 +369,50 @@ export function Onboarding(props: OnboardingProps) {
       {step === "model" && (
         <section className="flex flex-col gap-3">
           {/*
-           * `§8.1` step 4 asks for a catalogue with context length and price, and
-           * `§9` names `models.dev` as the source. **It is not wired in this
-           * build**, and the wizard says so instead of inventing a list: a
-           * hard-coded model table is a table that goes stale silently, and a
-           * stale table produces a model error the user cannot diagnose.
+           * `§8.1` step 4 asks for a catalogue with context length and price.
            *
-           * This step comes **before** the key — see `WIZARD_STEPS` for why: the
-           * connection test addresses a model, so it cannot run without one.
+           * **The list comes from the provider's own `/models`**
+           * (`providers/models.ts`), not from a table shipped with the app: §9
+           * measured `/v1/models` as the one endpoint that sends ACAO even on a
+           * 401, and a bundled catalogue would be a second truth about something
+           * that already has a first one — one that goes stale silently and then
+           * gets blamed for a provider error.
+           *
+           * It is a **button, not an automatic fetch**. The wizard is skippable
+           * (`§8.1`) and the list is one network call per press; loading it on
+           * arrival would put a provider round trip in front of every user who
+           * only came to look at the workspace. The failure is rendered as its own
+           * line, not as an empty list, and the free-text field below is never
+           * removed: a list the provider reported as **incomplete** is exactly the
+           * case where the user needs to type an id the list did not contain.
+           *
+           * There **was** a second paragraph here — „Es ist kein Modellkatalog
+           * eingebunden" — rendered when no `onListModels` was passed. It was the
+           * truth about the build while the prop had no caller, and a **lie** the
+           * moment `AppShell` started passing one: a user would have been told the
+           * catalogue does not exist while a "Modelle laden" button sat above it.
+           * Both the paragraph and the optional type are gone (§5), and
+           * `e2e/model-list.e2e.ts` asserts `data-baah-model-catalog="absent"` has
+           * **zero** matches, so a reintroduction is a red test rather than a
+           * contradiction two paragraphs down.
            */}
-          <p data-baah-model-catalog="absent" className="rounded-box border border-base-300 p-2 text-sm">
-            Es ist kein Modellkatalog eingebunden. Trage die Modell-ID so ein, wie dein Provider sie
-            anzeigt — die Liste des Providers ist die Quelle, nicht eine hier hinterlegte Tabelle.
-          </p>
+          <button
+            type="button"
+            data-testid={TEST_IDS.modelListLoad}
+            className="btn btn-outline self-start"
+            disabled={loadingModels}
+            onClick={() => {
+              void runModelList();
+            }}
+          >
+            {loadingModels ? "Lade …" : "Modelle laden"}
+          </button>
+          {modelListError !== undefined && (
+            <p data-baah-model-list="error" role="alert" className="rounded-box border border-error/60 p-2 text-sm">
+              {modelListError}
+            </p>
+          )}
+          {models !== undefined && <ModelListPanel list={models} onPick={(id) => setModel(id)} />}
           <label className="form-control">
             <span className="label-text">Modell-ID</span>
             <input
@@ -439,7 +528,133 @@ export function Onboarding(props: OnboardingProps) {
   );
 }
 
-/** One provider row, with §9's note and the `corsVerified` flag stated. */
+/**
+ * The `code` of a classified error, or `undefined` when there is none.
+ *
+ * ## Why this reads `code` and not `name`
+ *
+ * Both callbacks in this component (`runProbe`, `runModelList`) are handed a
+ * promise that goes through `runtime/index.ts`'s `toRuntimeError`, so **every**
+ * failure arrives as a `RuntimeError`. Rendering `error.name` therefore printed the
+ * literal string **„RuntimeError"** — the class of the app's own wrapper, in German,
+ * on a wizard a non-technical user is looking at. The information the boundary
+ * worked to produce was one property away and never read.
+ *
+ * `code` is that property, and it is the one the runtime was careful about:
+ * `MODEL_LIST_CODES` maps each of the loader's six codes to its own
+ * `RuntimeErrorCode` so this can say `model-list-missing-endpoint` rather than
+ * "something went wrong".
+ *
+ * **Never `error.message`.** A provider boundary can quote the key back — Google's
+ * 401 does — and this string is rendered, screenshotted and pasted into issues
+ * (`AGENTS.md` §2). The `code` is drawn from a closed union of literals in this
+ * repo, so it cannot carry a credential.
+ *
+ * Returns `undefined` rather than a name so the caller decides what the fallback
+ * word is: "unbekannter Fehler" is a statement about *our* vocabulary, and a thrown
+ * string or a plain object has none.
+ */
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  const code = (error as { readonly code: unknown }).code;
+  return typeof code === "string" && code !== "" ? code : undefined;
+}
+
+/**
+ * The provider's model list, and what it does not contain.
+ *
+ * ## Why the incomplete notice is not a footnote
+ *
+ * `ModelList.complete` is `false` when the loader stopped before the end of the
+ * provider's pagination — a page cap, or a `has_more: true` with no cursor to
+ * advance by. Showing those models without saying so is the same lie as a
+ * truncated `grep` search: the user picks from a list that is missing entries,
+ * and nothing in the product told them. So the notice is above the `<select>`,
+ * not under it, and `data-baah-model-list="incomplete"` is a node a spec can
+ * assert on.
+ *
+ * The `<select>` labels are the provider's own `display_name` where it sent one
+ * and the raw id where it did not — a `claude-haiku-4-5-20251001` in a dropdown
+ * is a worse answer than the same id plus the name the provider knew.
+ */
+function ModelListPanel({ list, onPick }: { list: ModelList; onPick: (id: string) => void }) {
+  if (list.models.length === 0) {
+    return (
+      <p data-testid={TEST_IDS.modelListPanel} data-baah-model-list="empty" className="text-sm">
+        Der Provider hat unter dieser Adresse keine Modelle gemeldet.
+      </p>
+    );
+  }
+
+  return (
+    <div data-testid={TEST_IDS.modelListPanel} data-baah-model-list={list.complete ? "complete" : "incomplete"}>
+      {list.complete ? (
+        <p className="text-xs opacity-70">
+          {list.models.length} Modelle, aus der Liste des Providers ({list.pages} Seiten).
+        </p>
+      ) : (
+        <p data-baah-model-list-incomplete="true" className="rounded-box border border-warning/60 p-2 text-sm">
+          Unvollständig: {list.incompleteReason} Du siehst {list.models.length} von mindestens so vielen Modellen —
+          ein Modell, das hier fehlt, kann es sehr wohl geben. Trage die ID oben ein, wenn du es nicht findest.
+        </p>
+      )}
+      <label className="form-control">
+        <span className="label-text">Modell aus der Liste des Providers</span>
+        <select
+          data-testid={TEST_IDS.modelListSelect}
+          className="select select-bordered"
+          value=""
+          onChange={(event) => {
+            onPick(event.target.value);
+          }}
+        >
+          <option value="">— Liste wählen —</option>
+          {list.models.map((info) => (
+            <option key={info.id} value={info.id}>
+              {info.displayName} ({info.id})
+            </option>
+          ))}
+        </select>
+      </label>
+    </div>
+  );
+}
+
+/**
+ * The CORS verdict, as words.
+ *
+ * ## Three states, three sentences
+ *
+ * The old badge had two: „CORS bestätigt" and „CORS unbestätigt", and the
+ * second one covered both *measured-and-negative* (OpenAI, §9) and
+ * *never-measured* (every `openai-compatible` entry — §9's own row for an
+ * arbitrary compatible `baseURL` reads "zur Laufzeit prüfen"). Those are
+ * different facts with different next steps, and collapsing them told a user
+ * with an unmeasured endpoint that somebody had already looked and found
+ * nothing good.
+ *
+ * `data-baah-cors-state` carries the state verbatim so a spec asserts the verdict
+ * rather than a colour, and `data-baah-cors-verified` stays for the strict
+ * boolean it has always been — one attribute that lost a distinction, kept
+ * because it is the older contract, not hidden behind the new one.
+ *
+ * **A `switch` and not a lookup table.** A `Record<CorsVerdict, …>` indexed by a
+ * union reads back as `… | undefined` under this repo's compiler settings, so a
+ * fourth state added next month would compile and render `undefined` as a badge.
+ * The switch is total: adding a state without a branch here is a type error at
+ * the one place a user would read it.
+ */
+function corsBadge(cors: ProviderEntry["cors"]): { readonly label: string; readonly className: string } {
+  switch (cors) {
+    case "verified":
+      return { label: "CORS bestätigt", className: "badge-success" };
+    case "unconfirmed":
+      return { label: "CORS unbestätigt", className: "badge-warning" };
+    case "unmeasured":
+      return { label: "CORS ungemessen", className: "badge-ghost" };
+  }
+}
+
 function ProviderRow({
   entry,
   selected,
@@ -449,6 +664,8 @@ function ProviderRow({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const badge = corsBadge(entry.cors);
+
   return (
     <button
       type="button"
@@ -461,16 +678,15 @@ function ProviderRow({
       <span className="flex flex-wrap items-baseline gap-2">
         <span className="font-semibold">{entry.label}</span>
         {/*
-         * The flag, as words. §9's OpenAI row is "unbestätigt aus dem Browser",
+         * The verdict, as words. §9's OpenAI row is "unbestätigt aus dem Browser"
          * and the note under it says a failed test means the *provider* blocks the
          * call, not that the key is wrong. A wizard that hid this would produce
-         * exactly the wrong conclusion the matrix exists to prevent.
+         * exactly the wrong conclusion the matrix exists to prevent — and an
+         * "ungemessen" badge is what stops it happening for an endpoint nobody
+         * has ever called.
          */}
-        <span
-          data-baah-cors-state={entry.corsVerified ? "verified" : "unconfirmed"}
-          className={`badge badge-sm ${entry.corsVerified ? "badge-success" : "badge-warning"}`}
-        >
-          {entry.corsVerified ? "CORS bestätigt" : "CORS unbestätigt"}
+        <span data-baah-cors-state={entry.cors} className={`badge badge-sm ${badge.className}`}>
+          {badge.label}
         </span>
         {entry.requiresBrowserHeader && <span className="badge badge-ghost badge-sm">Sonderheader nötig</span>}
       </span>

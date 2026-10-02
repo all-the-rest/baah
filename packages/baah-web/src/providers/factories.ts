@@ -36,6 +36,21 @@
  *    without a `baseUrl` cannot be built at all, and that is raised here as a
  *    named `ProviderError` instead of reaching the SDK as `baseURL: undefined`.
  *    `catalog.ts` marks the row `needsEndpoint: true` for the same reason.
+ * 3. **`@ai-sdk/anthropic` requires `baseURL` for the `anthropic-compatible`
+ *    row, for the opposite reason.** That SDK *does* have a default —
+ *    `https://api.anthropic.com/v1` — so omitting it would send a third-party
+ *    entry to Anthropic itself, headerless, and produce an unexplained
+ *    `Failed to fetch`. A default is only a feature where the default is the
+ *    right target.
+ *
+ * ## One factory per catalog row, and the fifth one
+ *
+ * `factories.test.ts` asserts `registry.vendors()` equals `catalogVendorIds()`,
+ * so the list below and the catalog cannot disagree about which providers exist.
+ * `anthropic-compatible` is the new row, and it is the only one whose factory
+ * reuses another row's SDK — see its own comment for why the same
+ * `createAnthropic` produces a correct model here and a *different* set of
+ * headers on the wire.
  *
  * ## Versions
  *
@@ -97,6 +112,45 @@ export function createDefaultProviderFactories(): readonly ProviderFactory[] {
         );
       }
       return createOpenAICompatible({ apiKey, baseURL, name: "baah", ...headersOption(headers) });
+    }),
+
+    /**
+     * A Messages-format endpoint at somebody else's address.
+     *
+     * **Same SDK as first-party Anthropic, different row — and the SDK cannot
+     * tell them apart.** `createAnthropic` sends `anthropic-version` to whatever
+     * `baseURL` it is given (verified in
+     * `@ai-sdk/anthropic@4.0.68`: `getHeaders()` sets it from a literal, not from
+     * the host), which is right: the version is a parameter of the **dialect**,
+     * and a Messages server needs it.
+     *
+     * What must *not* go out is
+     * `anthropic-dangerous-direct-browser-access: true`. That one is a claim about
+     * the security model of the machine on the other end, so it is
+     * {@link requiredHeaders}'s business and it keys off the **operator**, not
+     * off this factory. `headers` therefore arrives empty for this row, and
+     * `factories.test.ts` asserts the absence **on the outgoing request** — a
+     * test on `requiredHeaders` alone would pass with a header added here.
+     */
+    defineProviderFactory("anthropic-compatible", ({ apiKey, headers, baseURL }) => {
+      if (baseURL === undefined) {
+        // **Required, and it is a correctness issue, not a nicety.**
+        // `createAnthropic`'s own default is `https://api.anthropic.com/v1`, so an
+        // entry without a base URL would silently address *Anthropic* — without
+        // the browser header, because this row is third-party. The result would be
+        // a 401 with no ACAO, which the browser reports as `TypeError: Failed to
+        // fetch`: an unexplained network failure against a provider the user did
+        // not choose. A named error is the honest outcome.
+        throw new ProviderError(
+          "An anthropic-compatible provider needs the base URL of the server that speaks /v1/messages, " +
+            "e.g. https://my-gateway.example/v1. Without it the request would go to Anthropic itself, " +
+            "which is not what this entry is for.",
+          "missing_name",
+        );
+      }
+      // `name` is deliberately left at Anthropic's default. It appears in the
+      // provider metadata as a provider identifier, and nothing here reads it.
+      return createAnthropic({ apiKey, baseURL, ...headersOption(headers) });
     }),
   ];
 }
